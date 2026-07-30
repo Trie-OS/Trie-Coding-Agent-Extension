@@ -1,0 +1,167 @@
+{
+  "name": "trie-ide",
+  "displayName": "Trie IDE Agent",
+  "description": "Local-first coding agent: run agent loops on GGUF models via the Trie IDE daemon or any OpenAI-compatible server, with optional hybrid frontier-model guidance.",
+  "version": "0.1.0",
+  "publisher": "Trie",
+  "license": "Apache-2.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "local llm",
+    "gguf",
+    "llama.cpp",
+    "offline",
+    "trie-ide"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "trie-ide",
+          "title": "Trie IDE",
+          "icon": "media/trie-ide.svg"
+        }
+      ]
+    },
+    "views": {
+      "trie-ide": [
+        {
+          "type": "webview",
+          "id": "trie-ide.chatView",
+          "name": "Agent",
+          "icon": "media/trie-ide.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "trie-ide.openChat",
+        "title": "Trie IDE: Open Agent Chat"
+      },
+      {
+        "command": "trie-ide.connect",
+        "title": "Trie IDE: Connect & Load Local Model"
+      },
+      {
+        "command": "trie-ide.newSession",
+        "title": "Trie IDE: New Agent Session"
+      },
+      {
+        "command": "trie-ide.stop",
+        "title": "Trie IDE: Stop Generation"
+      }
+    ],
+    "configuration": {
+      "title": "Trie IDE Agent",
+      "properties": {
+        "trie-ide.backend": {
+          "type": "string",
+          "enum": [
+            "daemon",
+            "openai-compatible"
+          ],
+          "default": "daemon",
+          "enumDescriptions": [
+            "Trie IDE daemon (localforged) serving local GGUF models over localhost.",
+            "Any OpenAI-compatible /v1/chat/completions server (llama-server, LM Studio, Ollama, or a cloud API)."
+          ],
+          "description": "Which inference backend drives the agent loop."
+        },
+        "trie-ide.daemon.url": {
+          "type": "string",
+          "default": "http://127.0.0.1:7841",
+          "description": "Base URL of the Trie IDE daemon (localforged)."
+        },
+        "trie-ide.daemon.storePath": {
+          "type": "string",
+          "default": "",
+          "description": "Model store volume path on the daemon host (empty = daemon's home directory)."
+        },
+        "trie-ide.daemon.contextLength": {
+          "type": "number",
+          "default": 8192,
+          "description": "Context length to load local models with."
+        },
+        "trie-ide.api.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8080",
+          "description": "Base URL of the OpenAI-compatible server (llama-server, LM Studio, Ollama, or a cloud endpoint)."
+        },
+        "trie-ide.api.modelName": {
+          "type": "string",
+          "default": "",
+          "description": "Model name sent to the OpenAI-compatible server."
+        },
+        "trie-ide.api.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Bearer token for the OpenAI-compatible server."
+        },
+        "trie-ide.agent.maxToolCalls": {
+          "type": "number",
+          "default": 24,
+          "description": "Maximum tool calls per agent turn before the loop stops."
+        },
+        "trie-ide.agent.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "description": "Sampling temperature for the agent model."
+        },
+        "trie-ide.agent.maxTokens": {
+          "type": "number",
+          "default": 2048,
+          "description": "Max tokens per model response."
+        },
+        "trie-ide.frontierAssist.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Hybrid mode: consult a frontier (cloud) model for advisory guide notes at checkpoints. The frontier model never drives the tool loop and never edits files."
+        },
+        "trie-ide.frontierAssist.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "anthropic"
+          ],
+          "default": "openai",
+          "description": "Frontier assist provider."
+        },
+        "trie-ide.frontierAssist.model": {
+          "type": "string",
+          "default": "",
+          "description": "Frontier assist model (empty = provider default)."
+        },
+        "trie-ide.frontierAssist.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the frontier assist provider."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "npm run typecheck && npm run build && vsce package --no-dependencies --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "~5.9.3"
+  }
+}
