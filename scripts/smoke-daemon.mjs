@@ -1,5 +1,5 @@
 /**
- * Protocol smoke test: run against a live localforged (fake inference is fine):
+ * Protocol smoke test: run against a live trie-daemon (fake inference is fine):
  *   cd ../app && npm run daemon:local
  *   node scripts/smoke-daemon.mjs [port]
  */

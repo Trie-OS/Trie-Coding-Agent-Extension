@@ -74,7 +74,7 @@
           ],
           "default": "daemon",
           "enumDescriptions": [
-            "Trie IDE daemon (localforged) serving local GGUF models over localhost.",
+            "Trie IDE daemon (trie-daemon) serving local GGUF models over localhost.",
             "Any OpenAI-compatible /v1/chat/completions server (llama-server, LM Studio, Ollama, or a cloud API)."
           ],
           "description": "Which inference backend drives the agent loop."
@@ -82,7 +82,7 @@
         "trie-ide.daemon.url": {
           "type": "string",
           "default": "http://127.0.0.1:7841",
-          "description": "Base URL of the Trie IDE daemon (localforged)."
+          "description": "Base URL of the Trie IDE daemon (trie-daemon)."
         },
         "trie-ide.daemon.storePath": {
           "type": "string",

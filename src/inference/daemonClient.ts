@@ -1,5 +1,5 @@
 /**
- * Client for the Trie IDE daemon (`localforged`), speaking the same wire
+ * Client for the Trie IDE daemon (`trie-daemon`), speaking the same wire
  * protocol as app/src/daemon/server.ts:
  *
  *   GET  /v1/handshake                → { version, platform, ramBytes, ... }
