@@ -686,7 +686,7 @@ body.history-open #composer {
   padding: 0;
   background: var(--multitask-card-bg);
   border: 1px solid var(--multitask-card-border);
-  border-radius: 12px;
+  border-radius: 16px;
   box-shadow: 0 2px 8px color-mix(in srgb, var(--foreground) 6%, transparent);
   overflow: hidden;
 }
@@ -695,17 +695,17 @@ body.history-open #composer {
   align-self: flex-start;
   width: fit-content;
   max-width: calc(100% - 20px);
-  border-color: var(--multitask-accent-border);
+  border-color: var(--multitask-card-border);
   border-radius: 999px;
-  background: var(--multitask-accent-soft);
+  background: var(--multitask-card-bg);
   box-shadow: 0 1px 4px color-mix(in srgb, var(--multitask-accent) 12%, transparent);
 }
 
 #queue-card.multitask-card.multitask-mode.collapsed .multitask-card-head {
   gap: 0;
-  padding: 6px 11px;
+  padding: 7px 14px;
   cursor: pointer;
-  color: var(--multitask-accent);
+  color: var(--foreground);
 }
 
 #queue-card.multitask-card.multitask-mode.collapsed .multitask-card-head:hover {
@@ -732,16 +732,31 @@ body.history-open #composer {
 .multitask-pill-dots {
   display: grid;
   flex: none;
-  grid-template-columns: repeat(3, 2px);
-  gap: 1.5px;
+  grid-template-columns: repeat(3, 2.5px);
+  gap: 2px;
   color: var(--multitask-accent);
 }
 
 .multitask-pill-dots i {
-  width: 2px;
-  height: 2px;
+  width: 2.5px;
+  height: 2.5px;
   border-radius: 50%;
   background: currentColor;
+  animation: multitask-dot-wave 1.15s ease-in-out infinite;
+}
+
+.multitask-pill-dots i:nth-child(2),
+.multitask-pill-dots i:nth-child(4) {
+  animation-delay: 0.1s;
+}
+
+.multitask-pill-dots i:nth-child(3),
+.multitask-pill-dots i:nth-child(5) {
+  animation-delay: 0.2s;
+}
+
+.multitask-pill-dots i:nth-child(6) {
+  animation-delay: 0.3s;
 }
 
 .multitask-pill-separator {
@@ -766,9 +781,13 @@ body.history-open #composer {
 }
 
 .multitask-count {
+  min-width: 0;
+  overflow: hidden;
   font-size: 12.5px;
   font-weight: 650;
   color: var(--foreground);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .multitask-send-hint {
@@ -823,10 +842,10 @@ body.history-open #composer {
 .multitask-stop-all {
   flex: none;
   padding: 3px 8px;
-  border: 1px solid color-mix(in srgb, var(--destructive) 38%, transparent);
+  border: 0;
   border-radius: 6px;
-  background: color-mix(in srgb, var(--destructive) 7%, transparent);
-  color: var(--destructive);
+  background: transparent;
+  color: var(--muted-foreground);
   font: inherit;
   font-size: 10.5px;
   font-weight: 600;
@@ -835,8 +854,8 @@ body.history-open #composer {
 }
 
 .multitask-stop-all:hover {
-  border-color: color-mix(in srgb, var(--destructive) 58%, transparent);
-  background: color-mix(in srgb, var(--destructive) 12%, transparent);
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+  color: var(--foreground);
 }
 
 .multitask-stop-all:focus-visible {
@@ -907,16 +926,18 @@ body.history-open #composer {
 .multitask-card-body {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 0 8px 10px;
+  gap: 5px;
+  padding: 0 8px 9px;
 }
 
 .multitask-item {
-  display: flex;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: 8px;
-  padding: 6px 8px;
-  border-radius: 8px;
+  padding: 7px 9px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--foreground) 4%, transparent);
   transition: background 0.15s ease, opacity 0.15s ease;
 }
 
@@ -951,14 +972,59 @@ body.history-open #composer {
   opacity: 0.85;
 }
 
+.multitask-item-dots {
+  display: grid;
+  grid-template-columns: repeat(3, 2.5px);
+  gap: 2px;
+  color: var(--multitask-accent);
+}
+
+.multitask-item-dots i {
+  width: 2.5px;
+  height: 2.5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: multitask-dot-wave 1.15s ease-in-out infinite;
+}
+
+.multitask-item-dots i:nth-child(2),
+.multitask-item-dots i:nth-child(4) {
+  animation-delay: 0.1s;
+}
+
+.multitask-item-dots i:nth-child(3),
+.multitask-item-dots i:nth-child(5) {
+  animation-delay: 0.2s;
+}
+
+.multitask-item-dots i:nth-child(6) {
+  animation-delay: 0.3s;
+}
+
+.multitask-item-copy {
+  display: grid;
+  grid-template-columns: minmax(80px, 0.8fr) minmax(80px, 1.2fr);
+  min-width: 0;
+  gap: 8px;
+  align-items: baseline;
+}
+
 .multitask-item-text {
-  flex: 1;
   min-width: 0;
   font-size: 12.5px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--foreground);
+}
+
+.multitask-item-action {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .multitask-item-status {
@@ -1017,11 +1083,19 @@ button.multitask-steer[hidden] {
   border: none;
   background: none;
   color: var(--muted-foreground);
-  font-size: 12px;
+  font-size: 11px;
+  font-weight: 500;
   cursor: pointer;
   padding: 2px 4px;
-  opacity: 0;
+  opacity: 1;
   transition: opacity 0.12s ease;
+}
+
+@media (max-width: 430px) {
+  .multitask-item-copy {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1px;
+  }
 }
 
 .multitask-item:hover .multitask-item-remove {
@@ -1336,7 +1410,9 @@ button.multitask-steer[hidden] {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .multitask-run-dots i {
+  .multitask-run-dots i,
+  .multitask-pill-dots i,
+  .multitask-item-dots i {
     animation: none;
     opacity: 0.7;
   }

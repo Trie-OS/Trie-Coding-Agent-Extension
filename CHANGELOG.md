@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.70
+
+- **Smart rendered-UI verification:** the agent now distinguishes consequential UI/webview behavior from cosmetic presentation, proactively finds and uses existing visual/e2e/component harnesses, and creates a narrow reusable harness only when rendered behavior cannot otherwise be verified.
+- **Safe harness execution and artifacts:** `run_verification` accepts existing UI, e2e, visual, Playwright, Cypress, Storybook, and harness package scripts while preserving package-script allowlisting; optional workspace artifact paths report screenshots and preview text reports. Later edits still invalidate prior evidence.
+
+## 0.4.69
+
+- **Real coordinated Multitask agents:** prompts that explicitly request multiple agents now launch isolated child `AgentSession`s with distinct roles, serialize inference safely through the provider-owned queue, pass structured sibling findings forward, and finish with a coordinator synthesis.
+- **Cursor-style active agents panel:** the compact floating **N Working** pill expands into one responsive lifecycle row per real child/coordinator, with animated dot-grid activity, collision-proof title/action regions, individual Stop actions, Stop All, and an independent collapse control.
+
+## 0.4.68
+
+- **Restored classic hammer icon:** brought back the recognizable single-color outline hammer/pick geometry from the original 0.4.2 extension instead of the indistinct blob-shaped replacement.
+
+## 0.4.67
+
+- **Complete Multitask experience:** purple styling now spans the inline starting/waiting lifecycle, steering arrow, and compact **N Working** pill with an expandable task panel and **Stop All**. Provider-owned per-chat runtimes preserve navigation, isolate cancellation, and process concurrent prompts FIFO.
+- **Durable activity and subagent results:** persisted chats replay full tool, Hybrid, review, and file-change activity; finished subagents appear in an accordion with their actual results. Older histories cannot recover activity that earlier versions did not persist.
+- **More reliable autonomous work:** hardened `edit_file` matching and pragmatic verification improve completion without brittle ceremony. Audit fixes scope **Stop All** to the active chat, reject stale steering, track `run_command` mutations, resolve package paths safely, and serialize chat-store writes.
+
 ## 0.4.66
 
 - **Purple Multitask styling:** updated the active chip, activity and queue statuses, spinner, running-task accents, and composer placeholder/focus treatment to match Cursor's soft purple Multitask UI while keeping Plan and Ask neutral and preserving Hybrid styling.

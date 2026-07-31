@@ -27,6 +27,39 @@ test('skips pure docs, assets, visual CSS, and low-risk config', () => {
   }
 })
 
+test('requests visual harness verification for webview behavior', () => {
+  const policy = verificationPolicy(
+    'Fix the prompt and status layout collision in the webview',
+    ['media/src/main.ts', 'media/main.css'],
+  )
+  assert.equal(policy.needed, true)
+  assert.equal(policy.useVisualHarness, true)
+  assert.match(verificationReminder(policy), /visual\/e2e\/UI harness/)
+})
+
+test('requests visual verification for consequential layout-only CSS', () => {
+  const policy = verificationPolicy(
+    'Fix responsive overflow and truncation at narrow breakpoints',
+    ['src/styles/chat.css'],
+  )
+  assert.deepEqual(
+    { needed: policy.needed, useVisualHarness: policy.useVisualHarness },
+    { needed: true, useVisualHarness: true },
+  )
+})
+
+test('does not demand a visual harness for trivial cosmetic CSS or assets', () => {
+  const policy = verificationPolicy('Update the icon color', ['media/theme.css', 'media/icon.svg'])
+  assert.equal(policy.needed, false)
+  assert.equal(policy.useVisualHarness, false)
+})
+
+test('uses focused non-visual verification for backend logic', () => {
+  const policy = verificationPolicy('Fix queue cancellation logic', ['src/agent/queue.ts'])
+  assert.equal(policy.needed, true)
+  assert.equal(policy.useVisualHarness, false)
+})
+
 test('risk makes config-only changes worth verifying', () => {
   assert.equal(verificationPolicy('Fix the production build config', ['tsconfig.json']).needed, true)
 })

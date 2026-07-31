@@ -1,8 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-  <!-- Realistic hammer handle with grip texture -->
-  <path d="M12,4 C15,4 17,5 19,7 C21,9 21,11 19,13 C17,15 15,16 12,16 C9,16 7,15 5,13 C3,11 3,9 5,7 C7,5 9,4 12,4 Z" />
-  <!-- Hammer head with more realistic shape -->
-  <path d="M12,6 C10,6 8,7 6,9 C4,11 4,13 6,15 C8,17 10,18 12,18 C14,18 16,17 18,15 C20,13 20,11 18,9 C16,7 14,6 12,6 Z" />
-  <!-- Cheek detail with more curvature -->
-  <path d="M14,10 C16,12 16.5,14 15,16 C13.5,18 12.5,18 11,16 C9.5,14 9,12 10.5,10 C12,8 14,10 14,10 Z" />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="m15 12-8.373 8.373a1 1 0 1 1-3-3L12 9" />
+  <path d="m18 15 4-4" />
+  <path d="m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172V7l-2.26-2.26a6 6 0 0 0-4.202-1.756L9 2.96l.92.82A6.18 6.18 0 0 1 12 8.4V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5" />
 </svg>

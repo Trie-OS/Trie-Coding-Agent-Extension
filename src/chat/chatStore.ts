@@ -6,11 +6,13 @@
 import * as vscode from 'vscode'
 import type { ChatTurn } from '../inference/types'
 
-export interface TranscriptEntry {
-  role: 'user' | 'reply' | 'error'
-  text: string
-  failed?: boolean
-}
+export type TranscriptEntry =
+  | { role: 'user' | 'reply' | 'error'; text: string; failed?: boolean }
+  | {
+      role: 'activity'
+      /** Serializable provider event replayed to reconstruct tool/review UI. */
+      message: { type: string; [key: string]: unknown }
+    }
 
 export interface StoredChat {
   id: string
@@ -34,6 +36,8 @@ const MAX_CHATS = 100
 export class ChatStore {
   private readonly file: vscode.Uri
   private cache: StoredChat[] | null = null
+  /** Serialize writes so an older concurrent save can never win on disk. */
+  private writeChain: Promise<void> = Promise.resolve()
 
   constructor(private readonly storageUri: vscode.Uri) {
     this.file = vscode.Uri.joinPath(storageUri, 'chats.json')
@@ -59,13 +63,13 @@ export class ChatStore {
     // Cap the file: drop the oldest chats beyond the limit.
     chats.sort((a, b) => b.updatedAt - a.updatedAt)
     this.cache = chats.slice(0, MAX_CHATS)
-    await this.persist()
+    await this.enqueuePersist()
   }
 
   async delete(id: string): Promise<void> {
     const chats = await this.load()
     this.cache = chats.filter((c) => c.id !== id)
-    await this.persist()
+    await this.enqueuePersist()
   }
 
   private async load(): Promise<StoredChat[]> {
@@ -80,11 +84,16 @@ export class ChatStore {
     return this.cache
   }
 
-  private async persist(): Promise<void> {
-    await vscode.workspace.fs.createDirectory(this.storageUri)
-    await vscode.workspace.fs.writeFile(
-      this.file,
-      Buffer.from(JSON.stringify(this.cache ?? [], null, 1), 'utf8'),
-    )
+  private enqueuePersist(): Promise<void> {
+    const snapshot = JSON.stringify(this.cache ?? [], null, 1)
+    this.writeChain = this.writeChain
+      .catch(() => {
+        // A failed previous write must not permanently poison later saves.
+      })
+      .then(async () => {
+        await vscode.workspace.fs.createDirectory(this.storageUri)
+        await vscode.workspace.fs.writeFile(this.file, Buffer.from(snapshot, 'utf8'))
+      })
+    return this.writeChain
   }
 }

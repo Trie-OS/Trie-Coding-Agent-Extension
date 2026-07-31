@@ -413,7 +413,10 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
 
       if (call.tool === 'web_search') webSearchUsedThisTurn = true
 
-      if (outcome.ok && (call.tool === 'edit_file' || call.tool === 'write_file')) {
+      if (
+        outcome.ok &&
+        (call.tool === 'edit_file' || call.tool === 'write_file' || call.tool === 'run_command')
+      ) {
         this.mutatedThisTurn = true
         verification.noteMutation()
         const relPath = toolGroupKey(call)

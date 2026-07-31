@@ -77,9 +77,9 @@ export const TOOL_SPECS: ToolSpec[] = [
   {
     name: 'run_verification',
     signature:
-      '{"packagePath"?: string, "script"?: string, "args"?: string[], "skipReason"?: string}',
+      '{"packagePath"?: string, "script"?: string, "args"?: string[], "artifactPaths"?: string[], "skipReason"?: string}',
     description:
-      'Autonomously run one focused test/typecheck/lint/build package script without a shell. The script must exist in package.json and have a verification-like name. Prefer tests/typecheck; use build only for broad or high-risk changes. Instead provide skipReason only when no test infrastructure exists or verification is disproportionate.',
+      'Autonomously run one focused test/typecheck/lint/build or UI/e2e/visual harness package script without a shell. The script must exist in package.json and have a verification-like name. artifactPaths can report generated screenshots/text reports inside the workspace. Prefer the narrowest relevant check; use skipReason only when verification is disproportionate.',
     mutating: true,
   },
   {
@@ -528,9 +528,11 @@ export class WorkspaceTools {
     }
 
     const script = str(args, 'script').trim()
-    if (!/^(?:test(?::[\w.-]+)?|typecheck|check(?::[\w.-]+)?|lint(?::[\w.-]+)?|build)$/.test(script)) {
+    if (
+      !/^(?:test(?::[\w.-]+)?|typecheck|check(?::[\w.-]+)?|lint(?::[\w.-]+)?|build|e2e(?::[\w.-]+)?|visual(?::[\w.-]+)?|ui(?::[\w.-]+)?|harness(?::[\w.-]+)?|playwright|cypress|storybook:test)$/.test(script)
+    ) {
       throw new Error(
-        `Script "${script}" is not an allowed verification script. Use test, test:*, typecheck, check:*, lint:*, or build.`,
+        `Script "${script}" is not an allowed verification script. Use test/test:*, typecheck, check:*, lint:*, build, e2e:*, visual:*, ui:*, harness:*, playwright, cypress, or storybook:test.`,
       )
     }
     const packagePath =
@@ -538,7 +540,15 @@ export class WorkspaceTools {
         ? args['packagePath'].trim()
         : '.'
     const packageRoot = this.resolve(packagePath)
-    const manifestPath = path.join(packageRoot, 'package.json')
+    const [realWorkspaceRoot, realPackageRoot] = await Promise.all([
+      fs.promises.realpath(this.root),
+      fs.promises.realpath(packageRoot),
+    ])
+    const packageRelative = path.relative(realWorkspaceRoot, realPackageRoot)
+    if (packageRelative.startsWith('..') || path.isAbsolute(packageRelative)) {
+      throw new Error('Verification packagePath resolves outside the workspace.')
+    }
+    const manifestPath = path.join(realPackageRoot, 'package.json')
     const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8')) as {
       scripts?: Record<string, unknown>
     }
@@ -555,7 +565,7 @@ export class WorkspaceTools {
       throw new Error('Verification args are too large.')
     }
 
-    const runner = await detectPackageRunner(packageRoot)
+    const runner = await detectPackageRunner(realPackageRoot)
     const runnerArgs =
       runner === 'yarn'
         ? ['run', script, ...scriptArgs]
@@ -563,16 +573,72 @@ export class WorkspaceTools {
           ? ['run', script, ...scriptArgs]
           : ['run', script, ...(scriptArgs.length > 0 ? ['--', ...scriptArgs] : [])]
     const display = `${runner} ${runnerArgs.join(' ')}`
-    const output = await execFileResult(runner, runnerArgs, packageRoot)
+    const output = await execFileResult(runner, runnerArgs, realPackageRoot)
+    const artifactPaths = optionalStringArray(args, 'artifactPaths', 10)
+    const artifacts = await this.describeVerificationArtifacts(artifactPaths)
     return {
       ok: output.ok,
-      result: truncate(`${output.ok ? 'Verification passed' : 'Verification failed'}: ${display}\n${output.text}`),
+      result: truncate(
+        `${output.ok ? 'Verification passed' : 'Verification failed'}: ${display}\n${output.text}` +
+          (artifacts ? `\n\nArtifacts:\n${artifacts}` : ''),
+      ),
       uiSummary: `${output.ok ? 'Passed' : 'Failed'} — ${display}`,
     }
+  }
+
+  private async describeVerificationArtifacts(paths: string[]): Promise<string> {
+    if (paths.length === 0) return ''
+    const descriptions: string[] = []
+    const realWorkspaceRoot = await fs.promises.realpath(this.root)
+    for (const relPath of paths) {
+      const absolute = this.resolve(relPath)
+      try {
+        const realArtifact = await fs.promises.realpath(absolute)
+        const relative = path.relative(realWorkspaceRoot, realArtifact)
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+          descriptions.push(`${relPath}: unavailable (resolves outside the workspace)`)
+          continue
+        }
+        const stat = await fs.promises.stat(realArtifact)
+        if (!stat.isFile()) {
+          descriptions.push(`${relPath}: not a file`)
+          continue
+        }
+        const base = `${relPath}: ${stat.size} bytes`
+        if (/\.(?:txt|log|json|xml|html?|md|csv)$/i.test(relPath) && stat.size <= 128 * 1024) {
+          const preview = (await fs.promises.readFile(realArtifact, 'utf8')).slice(0, 2000)
+          descriptions.push(`${base}\n${preview}`)
+        } else {
+          descriptions.push(base)
+        }
+      } catch (error) {
+        descriptions.push(
+          `${relPath}: unavailable (${error instanceof Error ? error.message : String(error)})`,
+        )
+      }
+    }
+    return descriptions.join('\n')
   }
 }
 
 type PackageRunner = 'npm' | 'pnpm' | 'yarn' | 'bun'
+
+function optionalStringArray(
+  args: Record<string, unknown>,
+  key: string,
+  maxItems: number,
+): string[] {
+  const value = args[key]
+  if (value === undefined) return []
+  if (
+    !Array.isArray(value) ||
+    value.length > maxItems ||
+    value.some((item) => typeof item !== 'string' || !item.trim() || item.length > 240)
+  ) {
+    throw new Error(`\`${key}\` must be an array of at most ${maxItems} non-empty paths.`)
+  }
+  return value as string[]
+}
 
 async function detectPackageRunner(packageRoot: string): Promise<PackageRunner> {
   const candidates: Array<[string, PackageRunner]> = [

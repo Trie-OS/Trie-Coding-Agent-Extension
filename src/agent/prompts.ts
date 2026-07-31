@@ -26,7 +26,10 @@ const MODE_RULES: Record<AgentMode, string[]> = {
     '- Never claim you changed files in step_complete unless edit_file or write_file succeeded this turn.',
     '- For substantive logic or bug fixes, add/update a focused test when feasible. Batch a coherent set of edits, then verify once — not after every edit.',
     '- Before step_complete, use run_verification for the narrowest relevant test or touched-area typecheck. Broaden to build/full suite only for cross-cutting or high-risk work, or when no narrow check exists.',
-    '- Docs/copy/assets/pure visual CSS/config-only edits usually need no check unless risk warrants. If code verification is impossible or disproportionate, call run_verification with an explicit honest skipReason.',
+    '- Rendered UI/webview behavior (layout, interaction, responsive state, focus/accessibility, truncation, lifecycle rendering): search for an existing visual, browser, e2e, component, or UI harness and use/update it. Verify the actual behavior, not only compilation.',
+    '- If a consequential UI behavior has no suitable harness, create or update one narrowly scoped reusable test/harness only when it adds durable value. Prefer assertions against rendered state; capture artifacts when the project supports them. Do not create throwaway previews for every UI edit.',
+    '- Run a UI harness after a coherent edit batch, inspect failures and text artifacts with read_file, and use run_verification artifactPaths to confirm generated screenshots/reports when useful.',
+    '- Non-UI work and trivial copy/color/icon/asset/purely cosmetic CSS changes should use focused tests/typecheck or may skip visual verification when disproportionate. If verification is impossible or disproportionate, call run_verification with an explicit honest skipReason.',
     '- A passing check becomes stale after any later edit; verify the final mutation batch again.',
   ],
   plan: [

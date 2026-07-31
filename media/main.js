@@ -52,15 +52,6 @@
     ["path", { d: "M9 13v2" }]
   ];
 
-  // node_modules/lucide/dist/esm/icons/file-text.js
-  var FileText = [
-    ["path", { d: "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" }],
-    ["path", { d: "M14 2v4a2 2 0 0 0 2 2h4" }],
-    ["path", { d: "M10 9H8" }],
-    ["path", { d: "M16 13H8" }],
-    ["path", { d: "M16 17H8" }]
-  ];
-
   // node_modules/lucide/dist/esm/icons/list-checks.js
   var ListChecks = [
     ["path", { d: "m3 17 2 2 4-4" }],
@@ -1090,8 +1081,8 @@
           multitaskRunRows.set(task.id, row);
         }
         row.className = "multitask-run-row " + task.status;
-        row.querySelector(".multitask-run-title").textContent = truncatePreview(task.text, 64) || "New subagent";
-        row.querySelector(".multitask-run-status").textContent = multitaskRunStatus(task);
+        row.querySelector(".multitask-run-title").textContent = task.name || "New subagent";
+        row.querySelector(".multitask-run-status").textContent = task.currentAction || multitaskRunStatus(task);
         row.querySelector(".multitask-run-prompt").textContent = task.text;
         const steer = row.querySelector(".multitask-steer");
         steer.hidden = task.status !== "waiting" || !multitaskTasks.some((candidate) => candidate.status === "running");
@@ -1172,38 +1163,24 @@
         const dots = document.createElement("span");
         dots.className = "multitask-pill-dots";
         dots.setAttribute("aria-hidden", "true");
-        dots.innerHTML = "<i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>";
-        const separator = document.createElement("span");
-        separator.className = "multitask-pill-separator";
-        separator.textContent = "\xB7";
+        dots.innerHTML = "<i></i><i></i><i></i><i></i><i></i><i></i>";
         left.appendChild(dots);
-        left.appendChild(separator);
       }
       const count = document.createElement("span");
       count.className = "multitask-count";
       if (multitaskMode) {
-        count.textContent = queueCollapsed ? activeCount > 0 ? `${activeCount} Working` : "Recent agents" : activeCount > 0 ? `${activeCount} Active` : "Recent agents";
+        count.textContent = queueCollapsed ? activeCount > 0 ? `${activeCount} Working` : "Recent agents" : activeCount > 0 ? `${activeCount} Working` : "Recent agents";
       } else {
         count.textContent = queue.length === 1 ? "1 Queued" : `${queue.length} Queued`;
       }
       const hint = document.createElement("span");
       hint.className = "multitask-send-hint";
-      hint.textContent = multitaskMode ? "Background agents" : "\u23CE to send next";
-      hint.title = multitaskMode ? "Tasks run one at a time to protect the local model and workspace" : "Press Enter on an empty composer to send the next queued task now";
+      hint.textContent = "\u23CE to send next";
+      hint.title = "Press Enter on an empty composer to send the next queued task now";
       left.appendChild(count);
-      if (!multitaskMode || !queueCollapsed) left.appendChild(hint);
+      if (!multitaskMode) left.appendChild(hint);
       const right = document.createElement("div");
       right.className = "multitask-card-right";
-      if (multitaskMode && !queueCollapsed && multitaskTasks.some((task) => task.status === "waiting" || task.status === "running")) {
-        const spinner = document.createElement("span");
-        spinner.className = "multitask-spinner";
-        spinner.setAttribute("aria-hidden", "true");
-        const status = document.createElement("span");
-        status.className = "multitask-card-status";
-        status.textContent = queueCardStatus();
-        right.appendChild(spinner);
-        right.appendChild(status);
-      }
       if (multitaskMode && !queueCollapsed && activeCount > 0) {
         const stopAll = document.createElement("button");
         stopAll.type = "button";
@@ -1268,20 +1245,23 @@
         row.classList.add(status);
         const iconWrap = document.createElement("span");
         iconWrap.className = "multitask-item-icon";
-        iconWrap.appendChild(
-          createElement(FileText, {
-            width: 13,
-            height: 13,
-            "stroke-width": 2
-          })
-        );
+        iconWrap.setAttribute("aria-hidden", "true");
+        iconWrap.innerHTML = '<span class="multitask-item-dots"><i></i><i></i><i></i><i></i><i></i><i></i></span>';
+        const copy = document.createElement("span");
+        copy.className = "multitask-item-copy";
         const text = document.createElement("span");
         text.className = "multitask-item-text";
-        text.textContent = truncatePreview(item.text);
-        text.title = item.text;
+        text.textContent = providerTask?.name || truncatePreview(item.text);
+        text.title = providerTask ? `${providerTask.name}: ${providerTask.text}` : item.text;
+        const action = document.createElement("span");
+        action.className = "multitask-item-action";
+        action.textContent = providerTask?.currentAction || (providerTask ? multitaskRunStatus(providerTask) : "Queued");
+        copy.appendChild(text);
+        copy.appendChild(action);
         const statusEl = document.createElement("span");
         statusEl.className = "multitask-item-status";
         statusEl.textContent = providerTask ? multitaskRunStatus(providerTask) : "Queued";
+        statusEl.hidden = multitaskMode;
         const steer = document.createElement("button");
         steer.type = "button";
         steer.className = "multitask-steer";
@@ -1295,7 +1275,7 @@
             "aria-hidden": "true"
           })
         );
-        steer.hidden = !providerTask || providerTask.status !== "waiting" || !multitaskTasks.some((candidate) => candidate.status === "running");
+        steer.hidden = multitaskMode || !providerTask || providerTask.status !== "waiting" || !multitaskTasks.some((candidate) => candidate.status === "running");
         steer.addEventListener("click", (event) => {
           event.stopPropagation();
           if (providerTask) vscode.postMessage({ type: "multitask-steer", id: providerTask.id });
@@ -1305,7 +1285,7 @@
         remove.className = "multitask-item-remove";
         remove.title = providerTask ? status === "running" ? "Cancel active subagent" : "Cancel waiting subagent" : "Remove from queue";
         remove.setAttribute("aria-label", remove.title);
-        remove.textContent = "\xD7";
+        remove.textContent = multitaskMode ? "Stop" : "\xD7";
         remove.hidden = status !== "queued" && status !== "waiting" && status !== "running";
         remove.addEventListener("click", (event) => {
           event.stopPropagation();
@@ -1319,7 +1299,7 @@
           }
         });
         row.appendChild(iconWrap);
-        row.appendChild(text);
+        row.appendChild(copy);
         row.appendChild(statusEl);
         row.appendChild(steer);
         row.appendChild(remove);
@@ -1700,10 +1680,24 @@
           resetChatUI();
           hideWelcome();
           for (const entry of msg.transcript) {
-            if (entry.role === "user") addBubble("user", entry.text);
-            else if (entry.role === "error") addBubble("error", entry.text);
-            else addReply(entry.text, entry.failed === true);
+            if (entry.role === "activity" && entry.message) {
+              window.dispatchEvent(new MessageEvent("message", { data: entry.message }));
+            } else if (entry.role === "user") {
+              finishTurnSession();
+              hideSpinner();
+              addBubble("user", entry.text);
+            } else if (entry.role === "error") {
+              finishTurnSession();
+              hideSpinner();
+              addBubble("error", entry.text);
+            } else if (entry.role === "reply") {
+              finishTurnSession();
+              hideSpinner();
+              addReply(entry.text, entry.failed === true);
+            }
           }
+          finishTurnSession();
+          hideSpinner();
           scrollDown();
           break;
         }
@@ -1718,7 +1712,6 @@ lucide/dist/esm/defaultAttributes.js:
 lucide/dist/esm/createElement.js:
 lucide/dist/esm/icons/arrow-right.js:
 lucide/dist/esm/icons/bot.js:
-lucide/dist/esm/icons/file-text.js:
 lucide/dist/esm/icons/list-checks.js:
 lucide/dist/esm/icons/message-circle-question.js:
 lucide/dist/esm/lucide.js:
