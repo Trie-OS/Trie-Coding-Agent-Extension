@@ -414,9 +414,11 @@ export class WorkspaceTools {
     if ('error' in match) {
       const candidates = formatEditCandidates(match.candidates)
       if (match.error === 'ambiguous') {
+        const matchMode =
+          match.ambiguity === 'exact' ? 'exactly' : 'after whitespace normalization'
         throw new Error(
           [
-            '`search` is ambiguous after whitespace normalization; no edit was made.',
+            `\`search\` matches multiple places ${matchMode}; no edit was made.`,
             candidates,
             `Recovery: call read_file with {"path":"${relPath}","startLine":<candidate start>,"endLine":<candidate end>} and include unique surrounding lines in the next search.`,
             'Do not retry the same truncated or reformatted search.',

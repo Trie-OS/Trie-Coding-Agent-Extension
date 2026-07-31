@@ -807,6 +807,7 @@
     let activeModeChipEl = null;
     let multitaskChipEl = null;
     let multitaskActivityEl = null;
+    let finishedSubagentsEl = null;
     const multitaskRunRows = /* @__PURE__ */ new Map();
     const composerEl = document.getElementById("composer");
     let plusMenuOpen = false;
@@ -983,8 +984,84 @@
       const firstWaitingTask = multitaskTasks.find((candidate) => candidate.status === "waiting");
       return !hasRunningTask && firstWaitingTask?.id === task.id ? "Starting up" : "Waiting for model/subagent";
     }
+    function isFinishedMultitaskStatus(status) {
+      return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
+    }
+    function multitaskElapsed(task) {
+      if (task.startedAt === void 0 || task.finishedAt === void 0) return "";
+      return formatElapsed(Math.max(0, task.finishedAt - task.startedAt));
+    }
+    function renderFinishedSubagents() {
+      const finished = multitaskTasks.filter((task) => isFinishedMultitaskStatus(task.status));
+      if (finished.length === 0) {
+        finishedSubagentsEl?.remove();
+        finishedSubagentsEl = null;
+        return;
+      }
+      if (!finishedSubagentsEl) {
+        finishedSubagentsEl = document.createElement("details");
+        finishedSubagentsEl.className = "finished-subagents";
+        finishedSubagentsEl.innerHTML = '<summary class="finished-subagents-summary"><span class="acc-chevron"></span><span class="finished-subagents-title"></span></summary><div class="finished-subagents-body"></div>';
+        messagesEl.appendChild(finishedSubagentsEl);
+      }
+      const title = finishedSubagentsEl.querySelector(".finished-subagents-title");
+      title.textContent = `Finished ${finished.length} subagent${finished.length === 1 ? "" : "s"}`;
+      const body = finishedSubagentsEl.querySelector(".finished-subagents-body");
+      const expandedIds = new Set(
+        Array.from(body.querySelectorAll(".finished-subagent-row[open]")).map((row) => row.dataset.id).filter((id) => !!id)
+      );
+      body.innerHTML = "";
+      for (const task of finished) {
+        const row = document.createElement("details");
+        row.className = `finished-subagent-row ${task.status}`;
+        row.dataset.id = task.id;
+        row.open = expandedIds.has(task.id);
+        const summary = document.createElement("summary");
+        summary.innerHTML = '<span class="finished-subagent-indicator" aria-hidden="true"></span><span class="finished-subagent-copy"><span class="finished-subagent-title"></span><span class="finished-subagent-result-preview"></span></span><span class="finished-subagent-meta"></span><span class="acc-chevron"></span>';
+        summary.querySelector(".finished-subagent-indicator").textContent = task.status === "completed" ? "\u2713" : task.status === "failed" ? "\xD7" : "\xB7";
+        summary.querySelector(".finished-subagent-title").textContent = truncatePreview(task.text, 72) || "Subagent";
+        const result = task.result?.trim() ?? "";
+        const preview = summary.querySelector(".finished-subagent-result-preview");
+        preview.textContent = truncatePreview(result, 110);
+        preview.hidden = !result;
+        const elapsed = multitaskElapsed(task);
+        summary.querySelector(".finished-subagent-meta").textContent = multitaskStatusLabel(task.status) + (elapsed ? ` \xB7 ${elapsed}` : "");
+        row.appendChild(summary);
+        const detail = document.createElement("div");
+        detail.className = "finished-subagent-detail";
+        const promptLabel = document.createElement("div");
+        promptLabel.className = "finished-subagent-detail-label";
+        promptLabel.textContent = "Prompt";
+        const prompt = document.createElement("div");
+        prompt.className = "finished-subagent-detail-text";
+        prompt.textContent = task.text;
+        detail.appendChild(promptLabel);
+        detail.appendChild(prompt);
+        if (result) {
+          const resultLabel = document.createElement("div");
+          resultLabel.className = "finished-subagent-detail-label";
+          resultLabel.textContent = task.status === "failed" ? "Error" : "Result";
+          const resultText = document.createElement("div");
+          resultText.className = "finished-subagent-detail-text result";
+          resultText.textContent = result;
+          detail.appendChild(resultLabel);
+          detail.appendChild(resultText);
+        }
+        row.appendChild(detail);
+        body.appendChild(row);
+      }
+    }
     function syncMultitaskRunRows() {
-      for (const task of multitaskTasks) {
+      const liveTasks = multitaskTasks.filter(
+        (task) => task.status === "waiting" || task.status === "running"
+      );
+      const liveIds = new Set(liveTasks.map((task) => task.id));
+      for (const [id, row] of multitaskRunRows) {
+        if (liveIds.has(id)) continue;
+        row.remove();
+        multitaskRunRows.delete(id);
+      }
+      for (const task of liveTasks) {
         let row = multitaskRunRows.get(task.id);
         if (!row) {
           row = document.createElement("details");
@@ -1018,8 +1095,9 @@
         row.querySelector(".multitask-run-prompt").textContent = task.text;
         const steer = row.querySelector(".multitask-steer");
         steer.hidden = task.status !== "waiting" || !multitaskTasks.some((candidate) => candidate.status === "running");
-        row.querySelector(".multitask-run-result").textContent = task.status === "completed" ? "\u2713" : task.status === "failed" || task.status === "cancelled" || task.status === "interrupted" ? "\xD7" : "";
+        row.querySelector(".multitask-run-result").textContent = "";
       }
+      renderFinishedSubagents();
       scrollDown();
     }
     function dispatch(text, mode) {
@@ -1064,7 +1142,7 @@
       queueCard?.querySelector(".queue-menu")?.remove();
     }
     function renderQueue() {
-      const providerTasks = multitaskTasks.slice(-8).reverse();
+      const providerTasks = multitaskTasks.filter((task) => task.status === "waiting" || task.status === "running").slice(-8).reverse();
       const showCard = multitaskMode ? providerTasks.length > 0 : queue.length > 0;
       if (!showCard) {
         queueCard?.remove();
@@ -1408,6 +1486,7 @@
       queue.length = 0;
       multitaskTasks = [];
       multitaskRunRows.clear();
+      finishedSubagentsEl = null;
       queueStartingId = null;
       multitaskMode = false;
       queueCollapsed = false;

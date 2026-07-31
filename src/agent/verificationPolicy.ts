@@ -65,3 +65,34 @@ export function verificationReminder(policy: VerificationPolicy): string {
     'Use its skipReason only when no test infrastructure exists or verification would be disproportionate, then finish honestly.'
   )
 }
+
+/** Turn-local freshness tracking: every later edit invalidates prior evidence. */
+export class VerificationTracker {
+  private mutationVersion = 0
+  private verifiedVersion = -1
+  private skippedVersion = -1
+  private nudgeUsed = false
+
+  noteMutation(): void {
+    this.mutationVersion++
+  }
+
+  noteVerification(skipped = false): void {
+    if (skipped) this.skippedVersion = this.mutationVersion
+    else this.verifiedVersion = this.mutationVersion
+  }
+
+  hasCurrentEvidence(): boolean {
+    return (
+      this.verifiedVersion === this.mutationVersion ||
+      this.skippedVersion === this.mutationVersion
+    )
+  }
+
+  /** Return at most one actionable completion nudge per turn. */
+  takeCompletionNudge(policy: VerificationPolicy): string | null {
+    if (!policy.needed || this.hasCurrentEvidence() || this.nudgeUsed) return null
+    this.nudgeUsed = true
+    return verificationReminder(policy)
+  }
+}

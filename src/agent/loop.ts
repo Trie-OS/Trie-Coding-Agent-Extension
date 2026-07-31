@@ -44,6 +44,7 @@ import {
   taskExpectsCodeChanges,
   summaryClaimsFileChanges,
 } from './taskIntent'
+import { VerificationTracker, verificationPolicy } from './verificationPolicy'
 import {
   parseToolCall,
   summarizeArgs,
@@ -209,6 +210,7 @@ export class AgentSession {
     let consecutiveFailures = 0
     this.mutatedThisTurn = false
     const mutatedFiles: ChangedFileStat[] = []
+    const verification = new VerificationTracker()
 
     for (let i = 0; i < maxCalls; i++) {
       if (signal.aborted) return { ok: false, summary: 'Stopped.', hybridStats }
@@ -340,6 +342,22 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
           consecutiveFailures++
           continue
         }
+        if (call.tool === 'step_complete' && mode === 'code' && this.mutatedThisTurn) {
+          const policy = verificationPolicy(
+            task,
+            mutatedFiles.map((file) => file.path),
+          )
+          const reminder = verification.takeCompletionNudge(policy)
+          if (reminder) {
+            const userTurn: ChatTurn = {
+              role: 'user',
+              content: toolResultTurn('step_complete', false, `Refused once: ${reminder}`),
+            }
+            this.turns.push(userTurn)
+            this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+            continue
+          }
+        }
         if (ok) {
           await this.finishWithHybridReview(
             client,
@@ -395,9 +413,9 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
 
       if (call.tool === 'web_search') webSearchUsedThisTurn = true
 
-      const spec = TOOL_SPECS.find((t) => t.name === call.tool)
-      if (outcome.ok && spec?.mutating) {
+      if (outcome.ok && (call.tool === 'edit_file' || call.tool === 'write_file')) {
         this.mutatedThisTurn = true
+        verification.noteMutation()
         const relPath = toolGroupKey(call)
         if (relPath) {
           const delta = toolLineDelta(call)
@@ -409,6 +427,10 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
             mutatedFiles.push({ path: relPath, ...delta })
           }
         }
+      }
+      if (outcome.ok && call.tool === 'run_verification') {
+        const skipReason = call.args['skipReason']
+        verification.noteVerification(typeof skipReason === 'string' && Boolean(skipReason.trim()))
       }
 
       if (outcome.ok) {

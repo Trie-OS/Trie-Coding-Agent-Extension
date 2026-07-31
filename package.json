@@ -306,6 +306,7 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test src/agent/verificationPolicy.test.ts",
     "package": "npm run typecheck && npm run build && vsce package --no-dependencies",
     "package:platform": "node scripts/package-platform.mjs",
     "package:marketplace": "node scripts/package-marketplace.mjs",

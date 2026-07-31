@@ -17,6 +17,7 @@ export type EditRange =
   | {
       error: 'ambiguous' | 'not_found'
       candidates: EditCandidate[]
+      ambiguity?: 'exact' | 'whitespace'
     }
 
 interface SourceLine {
@@ -97,6 +98,7 @@ function nearestCandidates(lines: SourceLine[], wanted: string[], limit = 2): Ed
  * in the file matches; the returned offsets always delimit the original bytes.
  */
 export function findEditRange(content: string, search: string): EditRange {
+  if (search.length === 0) return { error: 'not_found', candidates: [] }
   const exactHits: number[] = []
   for (let offset = content.indexOf(search); offset !== -1; offset = content.indexOf(search, offset + 1)) {
     exactHits.push(offset)
@@ -123,7 +125,7 @@ export function findEditRange(content: string, search: string): EditRange {
       )
       return candidate(lines, Math.max(0, startLine), count)
     })
-    return { error: 'ambiguous', candidates }
+    return { error: 'ambiguous', candidates, ambiguity: 'exact' }
   }
 
   const normalizedWanted = wanted.map(normalizeLine)
@@ -156,6 +158,7 @@ export function findEditRange(content: string, search: string): EditRange {
     return {
       error: 'ambiguous',
       candidates: hits.slice(0, 3).map((start) => candidate(lines, start, count)),
+      ambiguity: 'whitespace',
     }
   }
 

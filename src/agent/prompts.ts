@@ -24,6 +24,10 @@ const MODE_RULES: Record<AgentMode, string[]> = {
     '- When done, call step_complete — its summary is your answer to the user.',
     '- If the request is a question, answer it in step_complete.summary instead of editing files.',
     '- Never claim you changed files in step_complete unless edit_file or write_file succeeded this turn.',
+    '- For substantive logic or bug fixes, add/update a focused test when feasible. Batch a coherent set of edits, then verify once — not after every edit.',
+    '- Before step_complete, use run_verification for the narrowest relevant test or touched-area typecheck. Broaden to build/full suite only for cross-cutting or high-risk work, or when no narrow check exists.',
+    '- Docs/copy/assets/pure visual CSS/config-only edits usually need no check unless risk warrants. If code verification is impossible or disproportionate, call run_verification with an explicit honest skipReason.',
+    '- A passing check becomes stale after any later edit; verify the final mutation batch again.',
   ],
   plan: [
     '- You are in PLAN mode: explore the workspace but never modify anything.',

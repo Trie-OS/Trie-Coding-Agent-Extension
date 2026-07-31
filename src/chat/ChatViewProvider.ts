@@ -75,6 +75,7 @@ interface MultitaskTask {
   createdAt: number
   startedAt?: number
   finishedAt?: number
+  result?: string
   session?: AgentSession
   chatId: string
 }
@@ -97,6 +98,11 @@ interface RunRequest {
   session: AgentSession
   multitask?: MultitaskTask
   abort: AbortController
+}
+
+interface RunOutcome {
+  ok: boolean
+  result: string
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -228,9 +234,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private pushMultitaskTasks(): void {
+    const selectedChatId = this.selectedChatId
     this.post({
       type: 'multitask-list',
-      tasks: this.multitaskTasks.slice(-20).map(({ session: _session, ...task }) => task),
+      tasks: this.multitaskTasks
+        .filter((task) => task.chatId === selectedChatId)
+        .slice(-20)
+        .map(({ session: _session, ...task }) => task),
     })
   }
 
@@ -264,10 +274,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private cancelMultitask(id: string): void {
     const task = this.multitaskTasks.find((candidate) => candidate.id === id)
     if (!task || (task.status !== 'waiting' && task.status !== 'running')) return
+    const queued = this.runQueue.find((request) => request.multitask?.id === id)
     task.status = 'cancelled'
     task.finishedAt = Date.now()
-    const queued = this.runQueue.find((request) => request.multitask?.id === id)
-    if (queued) this.removeQueuedRun(queued)
+    if (queued) {
+      task.result = 'Cancelled before starting.'
+      this.removeQueuedRun(queued)
+    }
     if (this.activeRun?.multitask?.id === id) {
       this.activeRun.abort.abort()
       if (readConfig().backend === 'daemon') void this.daemonClient?.cancel()
@@ -282,10 +295,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (cancellable.length === 0) return
 
     const ids = new Set(cancellable.map((task) => task.id))
+    const queuedIds = new Set(
+      this.runQueue
+        .filter((request) => request.multitask && ids.has(request.multitask.id))
+        .map((request) => request.multitask!.id),
+    )
     const finishedAt = Date.now()
     for (const task of cancellable) {
       task.status = 'cancelled'
       task.finishedAt = finishedAt
+      if (queuedIds.has(task.id)) task.result = 'Cancelled before starting.'
     }
     for (const request of [...this.runQueue]) {
       if (request.multitask && ids.has(request.multitask.id)) this.removeQueuedRun(request)
@@ -438,6 +457,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (request.multitask && request.multitask.status === 'waiting') {
       request.multitask.status = 'cancelled'
       request.multitask.finishedAt = Date.now()
+      request.multitask.result = 'Cancelled before starting.'
     }
     void this.saveChat(request.runtime)
   }
@@ -459,16 +479,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.pushState()
     void this.executeRun(request).then(
-      (ok) => this.finishRun(request, ok),
-      () => this.finishRun(request, false),
+      (outcome) => this.finishRun(request, outcome),
+      (error) =>
+        this.finishRun(request, {
+          ok: false,
+          result: error instanceof Error ? error.message : String(error),
+        }),
     )
   }
 
-  private finishRun(request: RunRequest, ok: boolean): void {
+  private finishRun(request: RunRequest, outcome: RunOutcome): void {
     if (request.multitask) {
       if (request.multitask.status === 'running') {
-        request.multitask.status = ok ? 'completed' : 'failed'
+        request.multitask.status = outcome.ok ? 'completed' : 'failed'
       }
+      request.multitask.result = outcome.result
       request.multitask.finishedAt = Date.now()
       this.activeMultitaskId = null
       this.pushMultitaskTasks()
@@ -478,12 +503,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     queueMicrotask(() => this.pumpRuns())
   }
 
-  private async executeRun(request: RunRequest): Promise<boolean> {
+  private async executeRun(request: RunRequest): Promise<RunOutcome> {
     const { runtime, text, mode, session } = request
     const folder = vscode.workspace.workspaceFolders?.[0]
-    if (!folder) return false
+    if (!folder) return { ok: false, result: 'No workspace folder is open.' }
     const client = this.currentClient()
-    if (!client) return false
+    if (!client) return { ok: false, result: 'No model backend is configured.' }
     const cfg = readConfig()
 
     // Checkpoint before any turn that can mutate the workspace (fail-soft:
@@ -571,9 +596,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.log(`using tool-tracked files (${reviewFiles.length}) — shadow diff was empty`)
       }
       const hasReview = !!(reviewFiles && reviewFiles.length > 0)
-      const activeTask = this.activeMultitaskId
-        ? this.multitaskTasks.find((candidate) => candidate.id === this.activeMultitaskId)
-        : undefined
+      const activeTask = request.multitask
       let finalText =
         activeTask?.status === 'interrupted' && result.summary === 'Stopped.'
           ? 'Interrupted — context handed off to another subagent.'
@@ -598,18 +621,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         checkpoint: reviewFiles === null ? checkpointSha : undefined,
       })
       runtime.transcript.push({ role: 'reply', text: finalText, failed: !finalOk })
-      return finalOk
+      return { ok: finalOk, result: finalText }
     } catch (error) {
       if (request.abort.signal.aborted) {
-        const activeTask = this.activeMultitaskId
-          ? this.multitaskTasks.find((candidate) => candidate.id === this.activeMultitaskId)
-          : undefined
+        const activeTask = request.multitask
         const stoppedText =
           activeTask?.status === 'interrupted'
             ? 'Interrupted — context handed off to another subagent.'
             : 'Stopped.'
         this.postFor(runtime, { type: 'final', ok: false, text: stoppedText, checkpoint: checkpointSha })
         runtime.transcript.push({ role: 'reply', text: stoppedText, failed: true })
+        return { ok: false, result: stoppedText }
       } else {
         const message = error instanceof Error ? error.message : String(error)
         this.log(`turn FAILED: ${message}`)
@@ -618,8 +640,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           : message
         this.postFor(runtime, { type: 'error', text: friendly })
         runtime.transcript.push({ role: 'error', text: friendly })
+        return { ok: false, result: friendly }
       }
-      return false
     } finally {
       void this.saveChat(runtime)
     }

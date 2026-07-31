@@ -1187,6 +1187,154 @@ button.multitask-steer[hidden] {
   white-space: pre-wrap;
 }
 
+/* Finished agents stay in the transcript as a lightweight nested accordion. */
+.finished-subagents {
+  align-self: stretch;
+  margin: 2px 0;
+  border: 0;
+  background: transparent;
+}
+
+.finished-subagents-summary,
+.finished-subagent-row > summary {
+  list-style: none;
+}
+
+.finished-subagents-summary::-webkit-details-marker,
+.finished-subagent-row > summary::-webkit-details-marker {
+  display: none;
+}
+
+.finished-subagents-summary {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 26px;
+  padding: 3px 2px;
+  border-radius: 5px;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 550;
+}
+
+.finished-subagents-summary:hover,
+.finished-subagent-row > summary:hover {
+  background: color-mix(in srgb, var(--foreground) 3.5%, transparent);
+}
+
+.finished-subagents[open] > .finished-subagents-summary .acc-chevron::before,
+.finished-subagent-row[open] > summary .acc-chevron::before {
+  top: 2px;
+  transform: rotate(45deg);
+}
+
+.finished-subagents-body {
+  margin-left: 8px;
+  padding-left: 9px;
+  border-left: 1px solid var(--border);
+}
+
+.finished-subagent-row {
+  border: 0;
+  background: transparent;
+}
+
+.finished-subagent-row > summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 2px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.finished-subagent-indicator {
+  flex: none;
+  width: 14px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 17px;
+  text-align: center;
+}
+
+.finished-subagent-row.completed .finished-subagent-indicator {
+  color: var(--success);
+}
+
+.finished-subagent-row.failed .finished-subagent-indicator {
+  color: var(--destructive);
+}
+
+.finished-subagent-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.finished-subagent-title,
+.finished-subagent-result-preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.finished-subagent-title {
+  color: var(--foreground);
+  font-size: 12.5px;
+  font-weight: 550;
+  line-height: 1.35;
+}
+
+.finished-subagent-result-preview {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.finished-subagent-meta {
+  flex: none;
+  padding-top: 1px;
+  color: var(--muted-foreground);
+  font-size: 10.5px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.finished-subagent-row > summary > .acc-chevron {
+  margin-top: 1px;
+}
+
+.finished-subagent-detail {
+  margin: 0 0 7px 24px;
+  padding-left: 9px;
+  border-left: 1px solid var(--border);
+}
+
+.finished-subagent-detail-label {
+  margin: 7px 0 2px;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.finished-subagent-detail-text {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.finished-subagent-detail-text.result {
+  color: var(--foreground);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .multitask-run-dots i {
     animation: none;

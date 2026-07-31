@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { verificationPolicy, verificationReminder } from './verificationPolicy.ts'
+import {
+  VerificationTracker,
+  verificationPolicy,
+  verificationReminder,
+} from './verificationPolicy.ts'
 
 test('requires verification and encourages tests for a bug fix', () => {
   const policy = verificationPolicy('Fix the parser regression', ['src/parser.ts'])
@@ -24,10 +28,37 @@ test('skips pure docs, assets, visual CSS, and low-risk config', () => {
 })
 
 test('risk makes config-only changes worth verifying', () => {
-  const policy = verificationPolicy('Fix the production build config', ['tsconfig.json'])
-  assert.equal(policy.needed, true)
+  assert.equal(verificationPolicy('Fix the production build config', ['tsconfig.json']).needed, true)
 })
 
 test('unknown changed files are verified conservatively', () => {
   assert.equal(verificationPolicy('Update generated behavior', ['templates/runtime.tpl']).needed, true)
+})
+
+test('later edits invalidate successful verification', () => {
+  const tracker = new VerificationTracker()
+  tracker.noteMutation()
+  tracker.noteVerification()
+  assert.equal(tracker.hasCurrentEvidence(), true)
+  tracker.noteMutation()
+  assert.equal(tracker.hasCurrentEvidence(), false)
+})
+
+test('completion gets one verification nudge, not an infinite loop', () => {
+  const tracker = new VerificationTracker()
+  tracker.noteMutation()
+  const policy = verificationPolicy('Fix logic', ['src/logic.ts'])
+  const reminder = tracker.takeCompletionNudge(policy)
+  assert.ok(reminder)
+  assert.match(reminder, /Verification is still stale/)
+  assert.equal(tracker.takeCompletionNudge(policy), null)
+})
+
+test('an explicit skip is current until another edit', () => {
+  const tracker = new VerificationTracker()
+  tracker.noteMutation()
+  tracker.noteVerification(true)
+  assert.equal(tracker.hasCurrentEvidence(), true)
+  tracker.noteMutation()
+  assert.equal(tracker.hasCurrentEvidence(), false)
 })

@@ -926,6 +926,8 @@ const MODE_ICONS = {
     createdAt: number
     startedAt?: number
     finishedAt?: number
+    result?: string
+    chatId: string
   }
   const queue: QueuedItem[] = []
   let multitaskTasks: MultitaskTask[] = []
@@ -933,6 +935,7 @@ const MODE_ICONS = {
   let activeModeChipEl: HTMLElement | null = null
   let multitaskChipEl: HTMLElement | null = null
   let multitaskActivityEl: HTMLElement | null = null
+  let finishedSubagentsEl: HTMLDetailsElement | null = null
   const multitaskRunRows = new Map<string, HTMLElement>()
   const composerEl = document.getElementById('composer') as HTMLElement
   let plusMenuOpen = false
@@ -1150,8 +1153,114 @@ const MODE_ICONS = {
       : 'Waiting for model/subagent'
   }
 
+  function isFinishedMultitaskStatus(status: MultitaskStatus): boolean {
+    return status === 'completed' ||
+      status === 'failed' ||
+      status === 'cancelled' ||
+      status === 'interrupted'
+  }
+
+  function multitaskElapsed(task: MultitaskTask): string {
+    if (task.startedAt === undefined || task.finishedAt === undefined) return ''
+    return formatElapsed(Math.max(0, task.finishedAt - task.startedAt))
+  }
+
+  function renderFinishedSubagents(): void {
+    const finished = multitaskTasks.filter((task) => isFinishedMultitaskStatus(task.status))
+    if (finished.length === 0) {
+      finishedSubagentsEl?.remove()
+      finishedSubagentsEl = null
+      return
+    }
+
+    if (!finishedSubagentsEl) {
+      finishedSubagentsEl = document.createElement('details')
+      finishedSubagentsEl.className = 'finished-subagents'
+      finishedSubagentsEl.innerHTML =
+        '<summary class="finished-subagents-summary">' +
+        '<span class="acc-chevron"></span>' +
+        '<span class="finished-subagents-title"></span>' +
+        '</summary>' +
+        '<div class="finished-subagents-body"></div>'
+      messagesEl.appendChild(finishedSubagentsEl)
+    }
+
+    const title = finishedSubagentsEl.querySelector('.finished-subagents-title') as HTMLElement
+    title.textContent = `Finished ${finished.length} subagent${finished.length === 1 ? '' : 's'}`
+
+    const body = finishedSubagentsEl.querySelector('.finished-subagents-body') as HTMLElement
+    const expandedIds = new Set(
+      Array.from(body.querySelectorAll<HTMLDetailsElement>('.finished-subagent-row[open]'))
+        .map((row) => row.dataset.id)
+        .filter((id): id is string => !!id),
+    )
+    body.innerHTML = ''
+
+    for (const task of finished) {
+      const row = document.createElement('details')
+      row.className = `finished-subagent-row ${task.status}`
+      row.dataset.id = task.id
+      row.open = expandedIds.has(task.id)
+
+      const summary = document.createElement('summary')
+      summary.innerHTML =
+        '<span class="finished-subagent-indicator" aria-hidden="true"></span>' +
+        '<span class="finished-subagent-copy">' +
+        '<span class="finished-subagent-title"></span>' +
+        '<span class="finished-subagent-result-preview"></span>' +
+        '</span>' +
+        '<span class="finished-subagent-meta"></span>' +
+        '<span class="acc-chevron"></span>'
+      ;(summary.querySelector('.finished-subagent-indicator') as HTMLElement).textContent =
+        task.status === 'completed' ? '✓' : task.status === 'failed' ? '×' : '·'
+      ;(summary.querySelector('.finished-subagent-title') as HTMLElement).textContent =
+        truncatePreview(task.text, 72) || 'Subagent'
+      const result = task.result?.trim() ?? ''
+      const preview = summary.querySelector('.finished-subagent-result-preview') as HTMLElement
+      preview.textContent = truncatePreview(result, 110)
+      preview.hidden = !result
+      const elapsed = multitaskElapsed(task)
+      ;(summary.querySelector('.finished-subagent-meta') as HTMLElement).textContent =
+        multitaskStatusLabel(task.status) + (elapsed ? ` · ${elapsed}` : '')
+      row.appendChild(summary)
+
+      const detail = document.createElement('div')
+      detail.className = 'finished-subagent-detail'
+      const promptLabel = document.createElement('div')
+      promptLabel.className = 'finished-subagent-detail-label'
+      promptLabel.textContent = 'Prompt'
+      const prompt = document.createElement('div')
+      prompt.className = 'finished-subagent-detail-text'
+      prompt.textContent = task.text
+      detail.appendChild(promptLabel)
+      detail.appendChild(prompt)
+      if (result) {
+        const resultLabel = document.createElement('div')
+        resultLabel.className = 'finished-subagent-detail-label'
+        resultLabel.textContent = task.status === 'failed' ? 'Error' : 'Result'
+        const resultText = document.createElement('div')
+        resultText.className = 'finished-subagent-detail-text result'
+        resultText.textContent = result
+        detail.appendChild(resultLabel)
+        detail.appendChild(resultText)
+      }
+      row.appendChild(detail)
+      body.appendChild(row)
+    }
+  }
+
   function syncMultitaskRunRows(): void {
-    for (const task of multitaskTasks) {
+    const liveTasks = multitaskTasks.filter(
+      (task) => task.status === 'waiting' || task.status === 'running',
+    )
+    const liveIds = new Set(liveTasks.map((task) => task.id))
+    for (const [id, row] of multitaskRunRows) {
+      if (liveIds.has(id)) continue
+      row.remove()
+      multitaskRunRows.delete(id)
+    }
+
+    for (const task of liveTasks) {
       let row = multitaskRunRows.get(task.id)
       if (!row) {
         row = document.createElement('details')
@@ -1198,12 +1307,9 @@ const MODE_ICONS = {
         task.status !== 'waiting' ||
         !multitaskTasks.some((candidate) => candidate.status === 'running')
       ;(row.querySelector('.multitask-run-result') as HTMLElement).textContent =
-        task.status === 'completed'
-          ? '✓'
-          : task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted'
-            ? '×'
-            : ''
+        ''
     }
+    renderFinishedSubagents()
     scrollDown()
   }
 
@@ -1255,7 +1361,10 @@ const MODE_ICONS = {
   }
 
   function renderQueue(): void {
-    const providerTasks = multitaskTasks.slice(-8).reverse()
+    const providerTasks = multitaskTasks
+      .filter((task) => task.status === 'waiting' || task.status === 'running')
+      .slice(-8)
+      .reverse()
     const showCard = multitaskMode ? providerTasks.length > 0 : queue.length > 0
     if (!showCard) {
       queueCard?.remove()
@@ -1666,6 +1775,7 @@ const MODE_ICONS = {
     queue.length = 0
     multitaskTasks = []
     multitaskRunRows.clear()
+    finishedSubagentsEl = null
     queueStartingId = null
     multitaskMode = false
     queueCollapsed = false
