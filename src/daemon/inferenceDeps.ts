@@ -52,7 +52,7 @@ export async function ensureInferenceDeps(
   if (!prebuilt) {
     throw new Error(
       `Local GGUF inference is not supported on ${platformKey()}. ` +
-        'Switch to openai-compatible backend (Ollama / LM Studio) in settings.',
+        'Switch to the LLM API backend (Ollama / LM Studio) in settings.',
     )
   }
 
@@ -102,7 +102,7 @@ function runNpmInstall(cwd: string, packages: string[], log: (line: string) => v
     child.on('error', (error) => {
       reject(
         new Error(
-          `Could not run npm (${error.message}). Install Node.js/npm, or use the openai-compatible backend with Ollama.`,
+          `Could not run npm (${error.message}). Install Node.js/npm, or use the LLM API backend with Ollama.`,
         ),
       )
     })

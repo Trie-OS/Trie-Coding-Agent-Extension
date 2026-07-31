@@ -1,8 +1,8 @@
 {
   "name": "trie-ide",
   "displayName": "Trie Coding Agent",
-  "description": "Coding agent: local GGUF via embedded trie-daemon, or any OpenAI-compatible LLM API (Ollama, LM Studio, OpenAI, Kimi, and other cloud endpoints). Hybrid mode adds sparing frontier-model guidance — local model runs the loop, cloud only when it matters.",
-  "version": "0.4.13",
+  "description": "Coding agent: local GGUF via embedded trie-daemon, or any LLM API (Ollama, LM Studio, OpenAI, Kimi, and other cloud endpoints). Hybrid mode adds sparing frontier-model guidance.",
+  "version": "0.4.66",
   "publisher": "Trie",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -14,7 +14,8 @@
   "engines": {
     "vscode": "^1.96.0"
   },
-  "categories": [
+  "dependencies": {},
+    "categories": [
     "AI",
     "Chat",
     "Other"
@@ -101,7 +102,7 @@
           "default": "daemon",
           "enumDescriptions": [
             "Trie IDE daemon (embedded or external) serving local GGUF models over localhost.",
-            "Any OpenAI-compatible /v1/chat/completions API — local (Ollama, LM Studio, llama-server) or cloud (OpenAI, Kimi, etc.)."
+            "Any LLM API — local (Ollama, LM Studio, llama-server) or cloud (OpenAI, Kimi, etc.). Uses a standard /v1/chat/completions endpoint."
           ],
           "description": "Which inference backend drives the agent loop."
         },
@@ -138,7 +139,7 @@
         "trie-ide.api.baseUrl": {
           "type": "string",
           "default": "http://127.0.0.1:8080",
-          "description": "Base URL of any OpenAI-compatible `/v1/chat/completions` API — local (Ollama, LM Studio, llama-server) or cloud (OpenAI, Kimi, etc.)."
+          "description": "Base URL of your LLM API — local (Ollama, LM Studio, llama-server) or cloud (OpenAI, Kimi, etc.)."
         },
         "trie-ide.api.modelName": {
           "type": "string",
@@ -171,27 +172,70 @@
           "order": 50,
           "markdownDescription": "**Hybrid mode** — consult a frontier (cloud) model for advisory guide notes when the local model is stuck or finishes a turn. The frontier model never drives the tool loop and never edits files. Use the **Settings** button in the sidebar or **Trie Coding Agent: Configure Hybrid Mode**."
         },
+        "trie-ide.frontierAssist.activeSlot": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 2,
+          "order": 51,
+          "description": "Hybrid mode: which provider slot (0–2) is active in chat."
+        },
+        "trie-ide.frontierAssist.slots": {
+          "type": "array",
+          "default": [
+            { "provider": "openai", "apiKey": "", "models": ["", "", ""], "activeModel": 0 },
+            { "provider": "anthropic", "apiKey": "", "models": ["", "", ""], "activeModel": 0 },
+            { "provider": "moonshot", "apiKey": "", "models": ["", "", ""], "activeModel": 0 }
+          ],
+          "order": 52,
+          "markdownDescription": "Hybrid mode: up to 3 provider slots. Each slot has `provider`, `apiKey`, up to 3 `models`, and `activeModel` (0–2).",
+          "items": {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string",
+                "enum": ["openai", "anthropic", "moonshot"]
+              },
+              "apiKey": { "type": "string" },
+              "models": {
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "activeModel": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              }
+            }
+          }
+        },
         "trie-ide.frontierAssist.provider": {
           "type": "string",
           "enum": [
             "openai",
-            "anthropic"
+            "anthropic",
+            "moonshot"
           ],
           "default": "openai",
-          "order": 51,
-          "description": "Hybrid mode: frontier provider (OpenAI or Anthropic)."
+          "order": 53,
+          "deprecationMessage": "Use frontierAssist.slots instead. Kept for migration from older versions.",
+          "description": "Hybrid mode: legacy single provider (migrated to slot 0 on read)."
         },
         "trie-ide.frontierAssist.model": {
           "type": "string",
           "default": "",
-          "order": 52,
-          "description": "Hybrid mode: frontier model name (empty = provider default, e.g. gpt-4o or claude-sonnet)."
+          "order": 54,
+          "deprecationMessage": "Use frontierAssist.slots instead. Kept for migration from older versions.",
+          "description": "Hybrid mode: legacy model name (migrated to slot 0 on read)."
         },
         "trie-ide.frontierAssist.apiKey": {
           "type": "string",
           "default": "",
-          "order": 53,
-          "markdownDescription": "Hybrid mode: API key for the frontier provider. Required when hybrid mode is enabled."
+          "order": 55,
+          "deprecationMessage": "Use frontierAssist.slots instead. Kept for migration from older versions.",
+          "markdownDescription": "Hybrid mode: legacy API key (migrated to slot 0 on read)."
         },
         "trie-ide.webSearch.provider": {
           "type": "string",
@@ -222,6 +266,38 @@
           "default": 5,
           "order": 62,
           "description": "Web search: maximum results per query (1–10)."
+        },
+        "trie-ide.index.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "order": 70,
+          "markdownDescription": "**Codebase indexing** — maintain a prefix-trie symbol index of your workspace so the agent answers \"where is X declared\" in milliseconds instead of scanning every file. Runs entirely on your machine; nothing leaves it."
+        },
+        "trie-ide.index.onStartup": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "order": 71,
+          "description": "Codebase indexing: build the index when the workspace opens instead of lazily on the first search."
+        },
+        "trie-ide.index.maxResults": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "maximum": 100,
+          "scope": "resource",
+          "order": 72,
+          "description": "Codebase indexing: maximum declarations returned per symbol search (5–100)."
+        },
+        "trie-ide.index.scoreThreshold": {
+          "type": "number",
+          "default": 0.4,
+          "minimum": 0,
+          "maximum": 1,
+          "scope": "resource",
+          "order": 73,
+          "markdownDescription": "Codebase indexing: minimum match score (0–1) for `search_symbols` results. Scores are lexical and explainable — 1.0 exact, ~0.75–0.95 prefix, ~0.65 word initials, ~0.5–0.65 substring, ~0.3–0.7 multi-word subword coverage, ~0.35–0.5 typo-tolerant. Raise for exact-ish matches only; lower to allow fuzzier hits."
         }
       }
     }
@@ -233,7 +309,7 @@
     "package": "npm run typecheck && npm run build && vsce package --no-dependencies",
     "package:platform": "node scripts/package-platform.mjs",
     "package:marketplace": "node scripts/package-marketplace.mjs",
-    "publish:marketplace": "node scripts/package-marketplace.mjs && vsce publish --packagePath trie-ide-0.4.13.vsix"
+    "publish:marketplace": "node scripts/package-marketplace.mjs && vsce publish --packagePath trie-ide-0.4.66.vsix"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

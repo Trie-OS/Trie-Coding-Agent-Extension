@@ -43,7 +43,7 @@ export async function runConnectFlow(
   client.clearLoaded()
   if (!reachable) {
     const pick = await vscode.window.showErrorMessage(
-      `Could not reach the Trie IDE daemon at ${cfg.daemon.url}. Start an embedded daemon, run trie-daemon yourself, or switch to openai-compatible (Ollama / LM Studio).`,
+      `Could not reach the Trie IDE daemon at ${cfg.daemon.url}. Start an embedded daemon, run trie-daemon yourself, or switch to an LLM API backend (Ollama / LM Studio).`,
       'Open Settings',
       'Show Daemon Log',
     )

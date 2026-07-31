@@ -212,11 +212,23 @@ export class DaemonClient implements InferenceClient {
     let text = ''
     let tokensIn = 0
     let tokensOut = 0
+    let stopReason: string | undefined
+    let avgTokenConfidence: number | undefined
     let streamError: string | null = null
     await readSse(
       response,
       (data) => {
-        let event: { type: string; text?: string; message?: string; metrics?: { tokensIn: number; tokensOut: number } }
+        let event: {
+          type: string
+          text?: string
+          message?: string
+          metrics?: {
+            tokensIn: number
+            tokensOut: number
+            stopReason?: string
+            avgTokenConfidence?: number
+          }
+        }
         try {
           event = JSON.parse(data)
         } catch {
@@ -228,6 +240,8 @@ export class DaemonClient implements InferenceClient {
         } else if (event.type === 'end' && event.metrics) {
           tokensIn = event.metrics.tokensIn
           tokensOut = event.metrics.tokensOut
+          stopReason = event.metrics.stopReason
+          avgTokenConfidence = event.metrics.avgTokenConfidence
         } else if (event.type === 'error') {
           streamError = event.message ?? 'generation error'
         }
@@ -235,6 +249,13 @@ export class DaemonClient implements InferenceClient {
       signal,
     )
     if (streamError) throw new Error(streamError)
-    return { text, tokensIn, tokensOut }
+    const truncated = stopReason === 'max-tokens'
+    const uncertainty =
+      avgTokenConfidence !== undefined
+        ? Math.min(1, Math.max(0, 1 - avgTokenConfidence + (truncated ? 0.25 : 0)))
+        : truncated
+          ? 0.7
+          : undefined
+    return { text, tokensIn, tokensOut, truncated, uncertainty }
   }
 }

@@ -17,6 +17,10 @@ export interface GenerateResult {
   text: string
   tokensIn: number
   tokensOut: number
+  /** 0 = confident, 1 = uncertain — from daemon token confidence or heuristics. */
+  uncertainty?: number
+  /** True when generation hit max_tokens (often correlates with flailing). */
+  truncated?: boolean
 }
 
 export interface InferenceClient {

@@ -31,7 +31,7 @@ function assertNodeAvailable(bin: string): Promise<string> {
         reject(
           new Error(
             `Node.js is required for local GGUF inference (tried "${bin}"). Install Node.js from https://nodejs.org ` +
-              'or switch to the openai-compatible backend (Ollama / LM Studio) in settings.',
+              'or switch to the LLM API backend (Ollama / LM Studio) in settings.',
           ),
         )
         return

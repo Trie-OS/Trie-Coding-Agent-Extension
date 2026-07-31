@@ -1,17 +1,21 @@
 /**
  * Settings page — a webview panel with a form UI over the trie-ide.* settings,
  * styled to match the chat webview (media/main.css design tokens). Changes are
- * saved to global VS Code settings immediately on edit.
+ * saved to VS Code settings immediately on edit (index.* per workspace folder).
  */
 import * as crypto from 'node:crypto'
 import * as vscode from 'vscode'
-import { readConfig } from '../config'
+import { readConfig, updateWorkspaceScopedSetting } from '../config'
+import { getSymbolIndex, onIndexStatusChange } from '../agent/symbolIndex'
 
 type FromWebview =
   | { type: 'init' }
   | { type: 'update'; key: string; value: unknown }
   | { type: 'openNative' }
   | { type: 'connect' }
+  | { type: 'indexStatus' }
+  | { type: 'rebuildIndex' }
+  | { type: 'update-slots'; slots: unknown; activeSlot?: number }
 
 /** Only these keys can be written from the webview. */
 const EDITABLE_KEYS = new Set([
@@ -29,17 +33,29 @@ const EDITABLE_KEYS = new Set([
   'agent.temperature',
   'agent.maxTokens',
   'frontierAssist.enabled',
-  'frontierAssist.provider',
-  'frontierAssist.model',
-  'frontierAssist.apiKey',
+  'frontierAssist.activeSlot',
+  'frontierAssist.slots',
   'webSearch.provider',
   'webSearch.apiKey',
   'webSearch.maxResults',
+  'index.enabled',
+  'index.onStartup',
+  'index.maxResults',
+  'index.scoreThreshold',
+])
+
+/** Saved per workspace folder when one is open; otherwise global. */
+const WORKSPACE_SCOPED_KEYS = new Set([
+  'index.enabled',
+  'index.onStartup',
+  'index.maxResults',
+  'index.scoreThreshold',
 ])
 
 export class SettingsPanel {
   private static current: SettingsPanel | null = null
   private readonly panel: vscode.WebviewPanel
+  private readonly statusDisposable: vscode.Disposable
 
   static show(extensionUri: vscode.Uri, onConfigured: () => void): void {
     if (SettingsPanel.current) {
@@ -66,7 +82,12 @@ export class SettingsPanel {
     this.panel.iconPath = vscode.Uri.joinPath(extensionUri, 'media', 'icon.png')
     this.panel.webview.html = this.html(this.panel.webview)
     this.panel.webview.onDidReceiveMessage((message: FromWebview) => void this.onMessage(message))
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+    this.statusDisposable = onIndexStatusChange((root) => {
+      if (root === workspaceRoot) this.postIndexStatus()
+    })
     this.panel.onDidDispose(() => {
+      this.statusDisposable.dispose()
       SettingsPanel.current = null
     })
   }
@@ -90,13 +111,30 @@ export class SettingsPanel {
         'agent.temperature': cfg.agent.temperature,
         'agent.maxTokens': cfg.agent.maxTokens,
         'frontierAssist.enabled': cfg.frontierAssist.enabled,
-        'frontierAssist.provider': cfg.frontierAssist.provider,
-        'frontierAssist.model': cfg.frontierAssist.model,
-        'frontierAssist.apiKey': cfg.frontierAssist.apiKey,
+        'frontierAssist.activeSlot': cfg.frontierAssist.activeSlot,
+        'frontierAssist.slots': cfg.frontierAssist.slots,
         'webSearch.provider': cfg.webSearch.provider,
         'webSearch.apiKey': cfg.webSearch.apiKey,
         'webSearch.maxResults': cfg.webSearch.maxResults,
+        'index.enabled': cfg.index.enabled,
+        'index.onStartup': cfg.index.onStartup,
+        'index.maxResults': cfg.index.maxResults,
+        'index.scoreThreshold': cfg.index.scoreThreshold,
       },
+    })
+  }
+
+  private postIndexStatus(): void {
+    const folder = vscode.workspace.workspaceFolders?.[0]
+    const root = folder?.uri.fsPath
+    const status = root
+      ? getSymbolIndex(root).status()
+      : { state: 'standby' as const, files: 0, symbols: 0, buildMs: 0, totalFiles: null }
+    void this.panel.webview.postMessage({
+      type: 'indexStatus',
+      ...status,
+      hasWorkspace: !!root,
+      workspaceName: folder?.name ?? '',
     })
   }
 
@@ -107,8 +145,13 @@ export class SettingsPanel {
         break
       case 'update': {
         if (!EDITABLE_KEYS.has(message.key)) return
-        const settings = vscode.workspace.getConfiguration('trie-ide')
-        await settings.update(message.key, message.value, vscode.ConfigurationTarget.Global)
+        if (WORKSPACE_SCOPED_KEYS.has(message.key)) {
+          await updateWorkspaceScopedSetting(message.key, message.value)
+        } else {
+          await vscode.workspace
+            .getConfiguration('trie-ide')
+            .update(message.key, message.value, vscode.ConfigurationTarget.Global)
+        }
         this.onConfigured()
         void this.panel.webview.postMessage({ type: 'saved', key: message.key })
         break
@@ -119,6 +162,28 @@ export class SettingsPanel {
       case 'connect':
         await vscode.commands.executeCommand('trie-ide.connect')
         break
+      case 'indexStatus':
+        this.postIndexStatus()
+        break
+      case 'update-slots': {
+        const settings = vscode.workspace.getConfiguration('trie-ide')
+        await settings.update('frontierAssist.slots', message.slots, vscode.ConfigurationTarget.Global)
+        if (typeof message.activeSlot === 'number') {
+          await settings.update('frontierAssist.activeSlot', message.activeSlot, vscode.ConfigurationTarget.Global)
+        }
+        this.onConfigured()
+        void this.panel.webview.postMessage({ type: 'saved', key: 'frontierAssist.slots' })
+        break
+      }
+      case 'rebuildIndex': {
+        const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+        if (!root) break
+        const rebuild = getSymbolIndex(root).rebuild()
+        this.postIndexStatus() // show "Indexing…" immediately
+        await rebuild
+        this.postIndexStatus()
+        break
+      }
     }
   }
 
@@ -153,7 +218,7 @@ export class SettingsPanel {
       <p class="section-desc">What serves tokens to the agent loop.</p>
       <div class="seg" role="radiogroup" aria-label="Backend">
         <button class="seg-btn" data-backend="daemon">Embedded daemon <span class="seg-sub">local .gguf</span></button>
-        <button class="seg-btn" data-backend="openai-compatible">OpenAI-compatible API <span class="seg-sub">Ollama · LM Studio · cloud</span></button>
+        <button class="seg-btn" data-backend="openai-compatible">LLM API <span class="seg-sub">Ollama · LM Studio · cloud</span></button>
       </div>
 
       <div id="daemon-fields" class="field-group" hidden>
@@ -230,27 +295,13 @@ export class SettingsPanel {
 
     <section class="settings-card">
       <h2>Hybrid mode <span class="badge purple">advisor</span></h2>
-      <p class="section-desc">Your local model runs the loop. A frontier model adds purple guide notes only when you're stuck or at the finish line — capped to a few API calls per turn, so you get frontier judgment without frontier token bills.</p>
+      <p class="section-desc">Local model runs the loop; frontier model advises on stuck loops and turn-end review.</p>
       <div class="row check">
         <input id="f-hybrid" data-key="frontierAssist.enabled" data-type="boolean" type="checkbox" />
         <label for="f-hybrid">Enable hybrid mode</label>
       </div>
       <div id="hybrid-fields" class="field-group">
-        <div class="row">
-          <label for="f-hprov">Provider</label>
-          <select id="f-hprov" data-key="frontierAssist.provider" data-type="string">
-            <option value="openai">OpenAI</option>
-            <option value="anthropic">Anthropic</option>
-          </select>
-        </div>
-        <div class="row">
-          <label for="f-hkey">API key</label>
-          <input id="f-hkey" data-key="frontierAssist.apiKey" data-type="string" type="password" spellcheck="false" />
-        </div>
-        <div class="row">
-          <label for="f-hmodel">Model <span class="opt">empty = provider default</span></label>
-          <input id="f-hmodel" data-key="frontierAssist.model" data-type="string" type="text" spellcheck="false" placeholder="gpt-4o / claude-sonnet-4-20250514" />
-        </div>
+        <div id="hybrid-slots"></div>
       </div>
     </section>
 
@@ -277,6 +328,46 @@ export class SettingsPanel {
         </div>
       </div>
     </section>
+
+    <section class="settings-card">
+      <h2>Codebase indexing</h2>
+      <p class="section-desc">Each workspace gets its own symbol index on your machine — settings below apply to this project only. Powers <code>search_symbols</code> and the <code>grep</code> fast path so the agent finds declarations in milliseconds instead of scanning every file.</p>
+      <div class="row check">
+        <input id="f-idx" data-key="index.enabled" data-type="boolean" type="checkbox" />
+        <label for="f-idx">Enable codebase indexing</label>
+      </div>
+      <div id="idx-fields" class="field-group">
+        <div class="row">
+          <label>Status</label>
+          <div class="idx-status">
+            <span id="idx-dot" class="status-dot grey"></span>
+            <div class="idx-status-text">
+              <span id="idx-state">Not indexed yet</span>
+              <span id="idx-detail" class="idx-detail"></span>
+            </div>
+          </div>
+        </div>
+        <div class="row check">
+          <input id="f-idx-startup" data-key="index.onStartup" data-type="boolean" type="checkbox" />
+          <label for="f-idx-startup">Index when the workspace opens <span class="opt">default: lazily on first search</span></label>
+        </div>
+        <div class="row">
+          <label for="f-idx-thresh">Search score threshold <span class="opt">1.0 = exact only · lower = fuzzier (typos, initials, substrings)</span></label>
+          <div class="slider-row">
+            <input id="f-idx-thresh" data-key="index.scoreThreshold" data-type="number" type="range" min="0" max="1" step="0.05" />
+            <span id="idx-thresh-value" class="slider-value">0.40</span>
+            <button id="idx-thresh-reset" class="slider-reset" title="Reset to 0.40">↺</button>
+          </div>
+        </div>
+        <div class="row">
+          <label for="f-idx-max">Max symbol results / search</label>
+          <input id="f-idx-max" data-key="index.maxResults" data-type="number" type="number" min="5" max="100" />
+        </div>
+        <div class="row">
+          <button id="rebuild-btn" class="ghost">Rebuild index</button>
+        </div>
+      </div>
+    </section>
   </main>
 
   <script nonce="${nonce}">
@@ -284,6 +375,119 @@ export class SettingsPanel {
     const $ = (sel) => document.querySelector(sel)
     const controls = [...document.querySelectorAll('[data-key]')]
     let currentBackend = 'daemon'
+    let hybridSlots = []
+    let hybridActiveSlot = 0
+    let hybridSaveTimer = null
+
+    const PROVIDER_LABELS = { openai: 'OpenAI', anthropic: 'Anthropic', moonshot: 'Moonshot' }
+    const DEFAULT_SLOTS = [
+      { provider: 'openai', apiKey: '', models: ['', '', ''], activeModel: 0 },
+      { provider: 'anthropic', apiKey: '', models: ['', '', ''], activeModel: 0 },
+      { provider: 'moonshot', apiKey: '', models: ['', '', ''], activeModel: 0 },
+    ]
+
+    function normalizeSlots(raw) {
+      const arr = Array.isArray(raw) ? raw : []
+      return DEFAULT_SLOTS.map((fallback, i) => {
+        const s = arr[i] || {}
+        const models = Array.isArray(s.models) ? s.models.map(String) : []
+        return {
+          provider: s.provider === 'anthropic' || s.provider === 'moonshot' ? s.provider : (s.provider === 'openai' ? 'openai' : fallback.provider),
+          apiKey: typeof s.apiKey === 'string' ? s.apiKey : '',
+          models: [models[0] || '', models[1] || '', models[2] || ''],
+          activeModel: typeof s.activeModel === 'number' ? Math.max(0, Math.min(2, s.activeModel)) : 0,
+        }
+      })
+    }
+
+    function scheduleSlotSave() {
+      clearTimeout(hybridSaveTimer)
+      hybridSaveTimer = setTimeout(() => {
+        vscode.postMessage({ type: 'update-slots', slots: hybridSlots, activeSlot: hybridActiveSlot })
+      }, 300)
+    }
+
+    function renderHybridSlots() {
+      const root = $('#hybrid-slots')
+      root.innerHTML = ''
+      hybridSlots.forEach((slot, slotIdx) => {
+        const details = document.createElement('details')
+        details.className = 'hybrid-slot'
+        details.open = slotIdx === 0
+        const summary = document.createElement('summary')
+        const provLabel = PROVIDER_LABELS[slot.provider] || slot.provider
+        summary.textContent = 'Provider ' + (slotIdx + 1) + ' — ' + provLabel
+        details.appendChild(summary)
+
+        const body = document.createElement('div')
+        body.className = 'hybrid-slot-body'
+
+        const provRow = document.createElement('div')
+        provRow.className = 'row'
+        provRow.innerHTML = '<label>Provider</label>'
+        const provSel = document.createElement('select')
+        ;['openai', 'anthropic', 'moonshot'].forEach((p) => {
+          const opt = document.createElement('option')
+          opt.value = p
+          opt.textContent = PROVIDER_LABELS[p]
+          if (slot.provider === p) opt.selected = true
+          provSel.appendChild(opt)
+        })
+        provSel.addEventListener('change', () => {
+          hybridSlots[slotIdx].provider = provSel.value
+          summary.textContent = 'Provider ' + (slotIdx + 1) + ' — ' + PROVIDER_LABELS[provSel.value]
+          scheduleSlotSave()
+        })
+        provRow.appendChild(provSel)
+        body.appendChild(provRow)
+
+        const keyRow = document.createElement('div')
+        keyRow.className = 'row'
+        keyRow.innerHTML = '<label>API key</label>'
+        const keyInput = document.createElement('input')
+        keyInput.type = 'password'
+        keyInput.spellcheck = false
+        keyInput.value = slot.apiKey
+        keyInput.addEventListener('input', () => {
+          hybridSlots[slotIdx].apiKey = keyInput.value
+          scheduleSlotSave()
+        })
+        keyRow.appendChild(keyInput)
+        body.appendChild(keyRow)
+
+        for (let mi = 0; mi < 3; mi++) {
+          const modelRow = document.createElement('div')
+          modelRow.className = 'row hybrid-model-row'
+          const radioId = 'slot-' + slotIdx + '-model-' + mi
+          modelRow.innerHTML =
+            '<input type="radio" name="slot-' + slotIdx + '-default" id="' + radioId + '" />' +
+            '<label for="' + radioId + '">Model ' + (mi + 1) + '</label>'
+          const radio = modelRow.querySelector('input')
+          radio.checked = slot.activeModel === mi
+          radio.addEventListener('change', () => {
+            if (radio.checked) {
+              hybridSlots[slotIdx].activeModel = mi
+              scheduleSlotSave()
+            }
+          })
+          const modelInput = document.createElement('input')
+          modelInput.type = 'text'
+          modelInput.spellcheck = false
+          modelInput.placeholder = mi === 0 ? 'e.g. gpt-4o' : ''
+          modelInput.value = slot.models[mi] || ''
+          modelInput.addEventListener('input', () => {
+            hybridSlots[slotIdx].models[mi] = modelInput.value
+            scheduleSlotSave()
+          })
+          modelRow.appendChild(modelInput)
+          body.appendChild(modelRow)
+        }
+
+        details.appendChild(body)
+        root.appendChild(details)
+      })
+      applyVisibility()
+    }
 
     function send(key, value) {
       vscode.postMessage({ type: 'update', key, value })
@@ -309,11 +513,89 @@ export class SettingsPanel {
       document.querySelectorAll('.seg-btn').forEach((b) => {
         b.classList.toggle('active', b.dataset.backend === currentBackend)
       })
-      $('#hybrid-fields').classList.toggle('dimmed', !$('#f-hybrid').checked)
-      $('#hybrid-fields').querySelectorAll('input, select').forEach((el) => {
-        el.disabled = !$('#f-hybrid').checked
-      })
+      $('#hybrid-fields').classList.remove('dimmed')
       $('#ws-fields').hidden = $('#f-wsprov').value === 'none'
+      $('#idx-fields').classList.toggle('dimmed', !$('#f-idx').checked)
+      $('#idx-fields').querySelectorAll('input, button').forEach((el) => {
+        el.disabled = !$('#f-idx').checked
+      })
+    }
+
+    let idxPoll = null
+    let idxLastState = null
+    let idxJustReadyTimer = null
+
+    function stopIdxPoll() {
+      clearInterval(idxPoll)
+      idxPoll = null
+    }
+
+    function startIdxPoll() {
+      if (!idxPoll) idxPoll = setInterval(() => vscode.postMessage({ type: 'indexStatus' }), 1000)
+    }
+
+    function formatBuildTime(ms) {
+      return ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms'
+    }
+
+    function formatCount(n) {
+      return n >= 1000 ? (n / 1000).toFixed(1).replace(/\\.0$/, '') + 'k' : String(n)
+    }
+
+    function renderIndexStatus(msg) {
+      const dot = $('#idx-dot')
+      const state = $('#idx-state')
+      const detail = $('#idx-detail')
+
+      if (!msg.hasWorkspace) {
+        dot.className = 'status-dot grey'
+        state.textContent = 'No workspace open'
+        detail.textContent = ''
+        idxLastState = null
+        stopIdxPoll()
+        return
+      }
+
+      if (msg.state === 'indexing') {
+        dot.className = 'status-dot amber'
+        state.textContent = 'Indexing…'
+        if (msg.totalFiles != null && msg.totalFiles > 0) {
+          detail.textContent = formatCount(msg.files) + ' / ' + formatCount(msg.totalFiles) + ' files'
+        } else if (msg.files > 0) {
+          detail.textContent = formatCount(msg.files) + ' files scanned'
+        } else {
+          detail.textContent = 'Discovering files…'
+        }
+        idxLastState = 'indexing'
+        startIdxPoll()
+        return
+      }
+
+      stopIdxPoll()
+
+      if (msg.state === 'ready') {
+        const justFinished = idxLastState === 'indexing'
+        idxLastState = 'ready'
+        dot.className = 'status-dot green' + (justFinished ? ' just-ready' : '')
+        state.textContent = justFinished ? 'Indexed ✓' : 'Indexed'
+        detail.textContent =
+          formatCount(msg.files) + ' files · ' +
+          formatCount(msg.symbols) + ' symbols · built in ' +
+          formatBuildTime(msg.buildMs)
+        if (justFinished) {
+          clearTimeout(idxJustReadyTimer)
+          idxJustReadyTimer = setTimeout(() => {
+            state.textContent = 'Indexed'
+            dot.classList.remove('just-ready')
+          }, 4000)
+        }
+        return
+      }
+
+      idxLastState = 'standby'
+      dot.className = 'status-dot grey'
+      state.textContent = 'Not indexed yet'
+      detail.textContent = 'Builds when the agent first searches symbols'
     }
 
     let toastTimer = null
@@ -355,6 +637,20 @@ export class SettingsPanel {
       vscode.postMessage({ type: 'openNative' })
     })
     $('#connect-btn').addEventListener('click', () => vscode.postMessage({ type: 'connect' }))
+    $('#rebuild-btn').addEventListener('click', () => {
+      vscode.postMessage({ type: 'rebuildIndex' })
+      vscode.postMessage({ type: 'indexStatus' })
+    })
+
+    function syncThreshDisplay() {
+      $('#idx-thresh-value').textContent = Number($('#f-idx-thresh').value).toFixed(2)
+    }
+    $('#f-idx-thresh').addEventListener('input', syncThreshDisplay)
+    $('#idx-thresh-reset').addEventListener('click', () => {
+      $('#f-idx-thresh').value = '0.4'
+      syncThreshDisplay()
+      send('index.scoreThreshold', 0.4)
+    })
 
     window.addEventListener('message', (event) => {
       const msg = event.data
@@ -363,14 +659,21 @@ export class SettingsPanel {
           const el = controls.find((c) => c.dataset.key === key)
           if (el) writeControl(el, value)
           if (key === 'backend') currentBackend = value
+          if (key === 'frontierAssist.slots') hybridSlots = normalizeSlots(value)
+          if (key === 'frontierAssist.activeSlot') hybridActiveSlot = Number(value) || 0
         }
+        renderHybridSlots()
         applyVisibility()
+        syncThreshDisplay()
       } else if (msg.type === 'saved') {
         flashSaved()
+      } else if (msg.type === 'indexStatus') {
+        renderIndexStatus(msg)
       }
     })
 
     vscode.postMessage({ type: 'init' })
+    vscode.postMessage({ type: 'indexStatus' })
   </script>
 </body>
 </html>`

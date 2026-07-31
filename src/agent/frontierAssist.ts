@@ -5,13 +5,14 @@
  * The local model does all the work; an optional frontier (cloud) model is
  * consulted only at high-leverage checkpoints and returns a short advisory
  * guide note. It never drives the tool loop and never edits files. The local
- * model does every tool call; hybrid always reviews that work at turn end.
+ * model does every tool call and self-grades before a finish-line escalation.
+ * Trivial or confidently completed turns stay local.
  * disabled/no-key → silent null, max 6 calls per turn, 3-minute cooldown
  * after a 429.
  */
-import type { ExtensionConfig } from '../config'
+import { getActiveFrontierConfig, type FrontierAssistConfig } from '../config'
 
-export type Checkpoint = 'stuck_hint' | 'final_review'
+export type Checkpoint = 'stuck_hint' | 'final_review' | 'uncertainty' | 'self_grade'
 
 export interface GuideNote {
   checkpoint: Checkpoint
@@ -19,10 +20,15 @@ export interface GuideNote {
   text: string
 }
 
+export interface ConsultContext {
+  transcript: string
+  evidence?: string
+  selfGrade?: { confidence: number; concerns: string }
+  uncertainty?: number
+}
+
 const MAX_CALLS_PER_TURN = 6
 const RATE_LIMIT_COOLDOWN_MS = 3 * 60 * 1000
-const DEFAULT_OPENAI_MODEL = 'gpt-4o'
-const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-4-20250514'
 const MAX_CONTEXT_CHARS = 8000
 
 const SYSTEM = [
@@ -33,16 +39,23 @@ const SYSTEM = [
 ].join('\n')
 
 function checkpointQuestion(checkpoint: Checkpoint): string {
-  return checkpoint === 'stuck_hint'
-    ? 'The local model appears stuck (failed tool calls or malformed output). What should it try next?'
-    : 'The local model believes the task is complete. Review the transcript: is anything wrong or missing?'
+  switch (checkpoint) {
+    case 'stuck_hint':
+      return 'The local model appears stuck (failed tool calls or malformed output). What should it try next?'
+    case 'uncertainty':
+      return 'The local model looks uncertain (low token confidence or repeated flailing). Give one concrete next step.'
+    case 'self_grade':
+      return 'The local model rated its own work as low-confidence before finishing. What should it verify or fix?'
+    case 'final_review':
+      return 'The local model believes the task is complete. Review the evidence below (diff + verification output): is anything wrong or missing?'
+  }
 }
 
 export class FrontierAssist {
   private callsThisTurn = 0
   private cooldownUntil = 0
 
-  constructor(private readonly getConfig: () => ExtensionConfig['frontierAssist']) {}
+  constructor(private readonly getConfig: () => FrontierAssistConfig) {}
 
   resetTurn(): void {
     this.callsThisTurn = 0
@@ -50,26 +63,49 @@ export class FrontierAssist {
 
   enabled(): boolean {
     const cfg = this.getConfig()
-    return cfg.enabled && cfg.apiKey.trim().length > 0
+    if (!cfg.enabled) return false
+    return getActiveFrontierConfig(cfg) !== null
   }
 
   /** Returns null (silently) when disabled, rate-limited, or over budget — hybrid must never block local work. */
-  async consult(checkpoint: Checkpoint, transcript: string): Promise<GuideNote | null> {
-    const cfg = this.getConfig()
+  async consult(checkpoint: Checkpoint, ctx: ConsultContext): Promise<GuideNote | null> {
+    const fa = this.getConfig()
     if (!this.enabled()) return null
+    const cfg = getActiveFrontierConfig(fa)
+    if (!cfg) return null
     if (Date.now() < this.cooldownUntil) return null
     if (this.callsThisTurn >= MAX_CALLS_PER_TURN) return null
     this.callsThisTurn++
 
     const clipped =
-      transcript.length > MAX_CONTEXT_CHARS ? `…${transcript.slice(-MAX_CONTEXT_CHARS)}` : transcript
-    const userContent = `${checkpointQuestion(checkpoint)}\n\nTranscript:\n${clipped}`
+      ctx.transcript.length > MAX_CONTEXT_CHARS
+        ? `…${ctx.transcript.slice(-MAX_CONTEXT_CHARS)}`
+        : ctx.transcript
+    const parts = [checkpointQuestion(checkpoint)]
+    if (ctx.uncertainty !== undefined) {
+      parts.push(`Local uncertainty score: ${ctx.uncertainty.toFixed(2)} (0=confident, 1=flailing)`)
+    }
+    if (ctx.selfGrade) {
+      parts.push(
+        `Local self-grade: confidence=${ctx.selfGrade.confidence.toFixed(2)}, concerns="${ctx.selfGrade.concerns}"`,
+      )
+    }
+    if (ctx.evidence) parts.push('', ctx.evidence)
+    parts.push('', 'Transcript:', clipped)
+    const userContent = parts.join('\n')
 
     try {
       const raw =
         cfg.provider === 'anthropic'
-          ? await this.callAnthropic(cfg.apiKey, cfg.model || DEFAULT_ANTHROPIC_MODEL, userContent)
-          : await this.callOpenAi(cfg.apiKey, cfg.model || DEFAULT_OPENAI_MODEL, userContent)
+          ? await this.callAnthropic(cfg.apiKey, cfg.model, userContent)
+          : await this.callOpenAiCompatible(
+              cfg.provider === 'moonshot'
+                ? 'https://api.moonshot.ai/v1/chat/completions'
+                : 'https://api.openai.com/v1/chat/completions',
+              cfg.apiKey,
+              cfg.model,
+              userContent,
+            )
       if (raw === null) return null
       return this.parseGuideNote(checkpoint, raw)
     } catch {
@@ -77,8 +113,13 @@ export class FrontierAssist {
     }
   }
 
-  private async callOpenAi(apiKey: string, model: string, content: string): Promise<string | null> {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  private async callOpenAiCompatible(
+    url: string,
+    apiKey: string,
+    model: string,
+    content: string,
+  ): Promise<string | null> {
+    const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({

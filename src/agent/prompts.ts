@@ -19,21 +19,35 @@ export function isReadOnlyMode(mode: AgentMode): boolean {
 const MODE_RULES: Record<AgentMode, string[]> = {
   code: [
     '- Read a file before editing it. Keep edits minimal; do not refactor beyond the task.',
-    '- Use update_todos to track multi-step work.',
+    '- If edit_file fails, do not retry the same guessed/truncated search. Follow its recovery instruction: read_file the exact reported line range, then copy that text exactly; use write_file only when intentionally replacing the whole file.',
+    '- Complex ask (3+ distinct steps)? FIRST call update_todos with the full task list, then work through it. After finishing each item, call update_todos again moving it to `done`. Skip the list for trivial one-step tasks.',
     '- When done, call step_complete — its summary is your answer to the user.',
     '- If the request is a question, answer it in step_complete.summary instead of editing files.',
+    '- Never claim you changed files in step_complete unless edit_file or write_file succeeded this turn.',
   ],
   plan: [
     '- You are in PLAN mode: explore the workspace but never modify anything.',
-    '- Investigate with read_file, grep, glob, and list_dir until you understand the task.',
+    '- Investigate with read_file, grep, glob, list_dir, and web_search as needed until you understand the task.',
     '- Then call step_complete with a numbered, step-by-step implementation plan in `summary`.',
     '- Each step names the files to change and what to change. Be specific and concise.',
   ],
   ask: [
     '- You are in ASK mode: answer questions about the code but never modify anything.',
-    '- Investigate with read_file, grep, glob, and list_dir as needed.',
+    '- Investigate with read_file, grep, glob, list_dir, and web_search as needed.',
     '- Then call step_complete with your answer in `summary`.',
   ],
+}
+
+function webSearchRules(webSearchOn: boolean): string[] {
+  if (webSearchOn) {
+    return [
+      '- Questions about research papers, current docs, APIs, libraries, or anything outside this repo: call web_search (one or more queries) before step_complete.',
+      '- In step_complete.summary, list concrete links — each result as "Title — https://…" with the full URL. Do not substitute keyword lists or tell the user to search manually.',
+    ]
+  }
+  return [
+    '- Web search is off. If the user asks for internet research, papers, or external docs, say so in step_complete and tell them to enable Web search in Trie Settings (Exa, Tavily, or Ceramic).',
+  ]
 }
 
 export function agentSystemPrompt(mode: AgentMode = 'code'): string {
@@ -55,16 +69,24 @@ export function agentSystemPrompt(mode: AgentMode = 'code'): string {
     '- One tool call per response. JSON only — no prose, no markdown fences.',
     '- Paths are relative to the workspace root.',
     ...MODE_RULES[mode],
+    ...webSearchRules(webSearchOn),
     '- Interpret obvious typos in the task; call step_failed only when truly blocked.',
   ].join('\n')
 }
 
-export function agentUserPrompt(task: string, workspaceContext: string): string {
-  return [`Task: ${task}`, '', workspaceContext].join('\n')
+export function agentUserPrompt(task: string, workspaceContext: string, extraNote = ''): string {
+  const parts = [`Task: ${task}`]
+  if (extraNote) parts.push('', extraNote)
+  parts.push('', workspaceContext)
+  return parts.join('\n')
 }
 
 export function toolResultTurn(toolName: string, ok: boolean, result: string): string {
-  return `${ok ? 'Result' : 'FAILED result'} of ${toolName}:\n${result}`
+  const recovery =
+    !ok && toolName === 'edit_file'
+      ? '\n\nREQUIRED NEXT STEP: read_file the exact reported line range before another edit_file call. Do not retry the previous search.'
+      : ''
+  return `${ok ? 'Result' : 'FAILED result'} of ${toolName}:\n${result}${recovery}`
 }
 
 export function repairTurn(error: string): string {

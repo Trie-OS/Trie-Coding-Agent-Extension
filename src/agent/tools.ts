@@ -8,6 +8,7 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as vscode from 'vscode'
 import { readConfig, type WebSearchProvider } from '../config'
+import { findEditRange, reindentReplacement, type EditCandidate } from './editMatcher'
 import { getSymbolIndex, isIdentifierPattern } from './symbolIndex'
 
 export interface ToolSpec {
@@ -45,20 +46,20 @@ export const TOOL_SPECS: ToolSpec[] = [
     name: 'search_symbols',
     signature: '{"query": string}',
     description:
-      'Fast workspace symbol lookup via a prefix trie index. Use to find where a function, class, or type is declared before grepping for usages.',
+      'Fast workspace symbol lookup via a prefix trie index. Matches names, prefixes, initials, typos, and multi-word queries like "auth token". Use to find where a function, class, or type is declared before grepping for usages.',
   },
   {
     name: 'edit_file',
     signature: '{"path": string, "search": string, "replace": string}',
     description:
-      'Replace the first occurrence of `search` with `replace`. Read the file first and copy `search` exactly; small whitespace differences are tolerated.',
+      'Replace `search` with `replace`. Read the exact lines first. Exact text is preferred; formatting-only whitespace differences are accepted only for one unique byte range. After failure, read the reported line range instead of retrying a guessed or truncated snippet.',
     mutating: true,
   },
   {
     name: 'web_search',
     signature: '{"query": string}',
     description:
-      'Search the internet. Returns titles, URLs, and snippets. Use for current documentation, APIs, libraries, or error messages.',
+      'Search the internet. Returns titles, URLs, and snippets. Use for research papers, current docs, APIs, libraries, blog posts, or error messages — anything not in the repo.',
   },
   {
     name: 'write_file',
@@ -74,6 +75,14 @@ export const TOOL_SPECS: ToolSpec[] = [
     mutating: true,
   },
   {
+    name: 'run_verification',
+    signature:
+      '{"packagePath"?: string, "script"?: string, "args"?: string[], "skipReason"?: string}',
+    description:
+      'Autonomously run one focused test/typecheck/lint/build package script without a shell. The script must exist in package.json and have a verification-like name. Prefer tests/typecheck; use build only for broad or high-risk changes. Instead provide skipReason only when no test infrastructure exists or verification is disproportionate.',
+    mutating: true,
+  },
+  {
     name: 'update_todos',
     signature: '{"todo": string[], "done"?: string[]}',
     description: 'Replace the working todo list; move finished items to `done`.',
@@ -82,7 +91,7 @@ export const TOOL_SPECS: ToolSpec[] = [
     name: 'step_complete',
     signature: '{"summary": string}',
     description:
-      'Finish the turn. `summary` is shown to the user — put your final answer or a summary of the changes here.',
+      'Finish the turn. `summary` is shown to the user — put your final answer or a summary of the changes here. When citing web results, include each title and full https URL.',
     control: true,
   },
   {
@@ -112,6 +121,10 @@ export interface ToolOutcome {
   uiSummary: string
   /** True when the prefix-trie symbol index answered the query — UI celebrates. */
   viaTrie?: boolean
+  /** Measured trie lookup time (ms), when the trie was consulted. */
+  trieMs?: number
+  /** Measured full content-scan time (ms) from the same call — honest comparison. */
+  scanMs?: number
 }
 
 /** Extract the first balanced JSON object from model output (tolerates fences/prose). */
@@ -173,8 +186,15 @@ export function parseToolCall(raw: string): ToolCall | { error: string } {
 
 function str(args: Record<string, unknown>, key: string): string {
   const value = args[key]
-  if (typeof value !== 'string') throw new Error(`\`${key}\` must be a string`)
-  return value
+  if (value === undefined || value === null) {
+    throw new Error(`\`${key}\` is required`)
+  }
+  if (typeof value === 'string') return value
+  // Local models often emit bare numbers/booleans — coerce instead of failing the turn.
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  throw new Error(
+    `\`${key}\` must be a string (got ${typeof value}). Example: "${key}": "your text here"`,
+  )
 }
 
 function optNum(args: Record<string, unknown>, key: string): number | undefined {
@@ -188,149 +208,18 @@ function truncate(text: string, max = MAX_RESULT_CHARS): string {
   return text.length <= max ? text : `${text.slice(0, max)}\n… [truncated ${text.length - max} chars]`
 }
 
-type EditRange =
-  | { start: number; end: number; fuzzy: boolean; reindent: ((replace: string) => string) | null }
-  | { error: string }
-
-/**
- * Locate `search` in `content`. Local models often get whitespace slightly
- * wrong, so after an exact match we fall back to line-based matching that
- * tolerates trailing whitespace, then indentation differences — but only when
- * the fuzzy match is unique in the file.
- */
-function findEditRange(content: string, search: string): EditRange {
-  const exact = content.indexOf(search)
-  if (exact !== -1) return { start: exact, end: exact + search.length, fuzzy: false, reindent: null }
-
-  const contentLines = content.split('\n')
-  const searchLines = search.replace(/\r\n/g, '\n').replace(/\n+$/, '').split('\n')
-  const n = searchLines.length
-
-  const findLineMatches = (norm: (line: string) => string): number[] => {
-    const target = searchLines.map(norm)
-    const hits: number[] = []
-    for (let i = 0; i + n <= contentLines.length; i++) {
-      let all = true
-      for (let j = 0; j < n; j++) {
-        if (norm(contentLines[i + j]) !== target[j]) {
-          all = false
-          break
-        }
-      }
-      if (all) hits.push(i)
-    }
-    return hits
-  }
-
-  const passes: Array<{ norm: (line: string) => string; reindents: boolean }> = [
-    { norm: (l) => l.trimEnd(), reindents: false },
-    { norm: (l) => l.trim(), reindents: true },
-  ]
-  for (const pass of passes) {
-    const hits = findLineMatches(pass.norm)
-    if (hits.length > 1) {
-      return {
-        error: `\`search\` matches ${hits.length} places in the file (with whitespace tolerance). Include more surrounding lines to make it unique.`,
-      }
-    }
-    if (hits.length === 1) {
-      const line = hits[0]
-      const start = contentLines.slice(0, line).reduce((sum, l) => sum + l.length + 1, 0)
-      const matched = contentLines.slice(line, line + n).join('\n')
-      let reindent: ((replace: string) => string) | null = null
-      if (pass.reindents) {
-        const fileIndent = (contentLines[line].match(/^[ \t]*/) as RegExpMatchArray)[0]
-        const searchIndent = (searchLines[0].match(/^[ \t]*/) as RegExpMatchArray)[0]
-        if (fileIndent !== searchIndent) {
-          reindent = (replace) =>
-            replace
-              .split('\n')
-              .map((l) => (l.startsWith(searchIndent) ? fileIndent + l.slice(searchIndent.length) : l))
-              .join('\n')
-        }
-      }
-      return { start, end: start + matched.length, fuzzy: true, reindent }
-    }
-  }
-
-  // Nothing matched, even with whitespace tolerance — the model most likely
-  // guessed the file contents instead of reading them. Telling it to "re-read"
-  // costs a turn and often repeats the guess, so hand it the real text now:
-  // the whole file when it is small, otherwise the closest-matching region.
-  if (content.length <= SMALL_FILE_ERROR_CHARS) {
-    return {
-      error:
-        '`search` not found in the file. Here is the ACTUAL file content — copy your `search` text exactly from it (or rewrite the whole file with write_file):\n' +
-        content,
-    }
-  }
-  const nearest = nearestMatch(content, search)
-  if (nearest) {
-    return {
-      error:
-        `\`search\` not found in the file. The nearest text starts at line ${nearest.startLine} — copy it exactly:\n` +
-        nearest.text,
-    }
-  }
-  return {
-    error:
-      '`search` not found in the file, and nothing in it resembles your text. Read the file with read_file before editing it.',
-  }
-}
-
-/** Files at or under this size are embedded whole in a failed-edit error. */
-const SMALL_FILE_ERROR_CHARS = 3_000
-
-/**
- * Character-trigram Dice coefficient — cheap, deterministic similarity.
- * Ported from Trie IDE's writeTools so both agents recover the same way.
- */
-function similarity(a: string, b: string): number {
-  const trigrams = (text: string): Map<string, number> => {
-    const padded = `  ${text.trim()} `
-    const counts = new Map<string, number>()
-    for (let i = 0; i + 3 <= padded.length; i += 1) {
-      const key = padded.slice(i, i + 3)
-      counts.set(key, (counts.get(key) ?? 0) + 1)
-    }
-    return counts
-  }
-  const left = trigrams(a)
-  const right = trigrams(b)
-  const leftTotal = [...left.values()].reduce((sum, n) => sum + n, 0)
-  const rightTotal = [...right.values()].reduce((sum, n) => sum + n, 0)
-  if (leftTotal === 0 || rightTotal === 0) return a.trim() === b.trim() ? 1 : 0
-  let shared = 0
-  for (const [key, count] of left) shared += Math.min(count, right.get(key) ?? 0)
-  return (2 * shared) / (leftTotal + rightTotal)
-}
-
-/**
- * The line-window in `content` most similar to `search`, so a failed edit can
- * point the model at the region it probably meant. A 0.35 score floor keeps
- * "nothing resembles it" a real answer instead of a random line-1 hit.
- */
-function nearestMatch(
-  content: string,
-  search: string,
-): { startLine: number; text: string; score: number } | null {
-  const contentLines = content.split('\n')
-  const searchLines = search.split('\n')
-  const window = Math.max(1, searchLines.length)
-  if (contentLines.length === 0 || search.trim() === '') return null
-
-  let best: { startLine: number; text: string; score: number } | null = null
-  const lastStart = Math.max(0, contentLines.length - window)
-  for (let i = 0; i <= lastStart; i += 1) {
-    const slice = contentLines.slice(i, i + window)
-    let total = 0
-    for (let j = 0; j < window; j += 1) total += similarity(slice[j] ?? '', searchLines[j] ?? '')
-    const score = total / window
-    if (score >= 0.35 && (best === null || score > best.score)) {
-      best = { startLine: i + 1, text: slice.join('\n'), score }
-    }
-  }
-  return best
+function formatEditCandidates(candidates: EditCandidate[]): string {
+  if (candidates.length === 0) return '(no similar line window found)'
+  return candidates
+    .map((candidate, index) => {
+      const score =
+        candidate.score === undefined ? '' : `, similarity ${candidate.score.toFixed(2)}`
+      return [
+        `Candidate ${index + 1}: lines ${candidate.startLine}-${candidate.endLine}${score}`,
+        candidate.text,
+      ].join('\n')
+    })
+    .join('\n\n')
 }
 
 export class WorkspaceTools {
@@ -346,26 +235,31 @@ export class WorkspaceTools {
   }
 
   async execute(call: ToolCall): Promise<ToolOutcome> {
+    // `return await` is load-bearing: without it, async rejections (e.g. an
+    // ENOENT stat) escape this try/catch and kill the whole turn instead of
+    // coming back to the model as a recoverable tool failure.
     try {
       switch (call.tool) {
         case 'read_file':
-          return this.readFile(call.args)
+          return await this.readFile(call.args)
         case 'list_dir':
-          return this.listDir(call.args)
+          return await this.listDir(call.args)
         case 'glob':
-          return this.globFiles(call.args)
+          return await this.globFiles(call.args)
         case 'grep':
-          return this.grep(call.args)
+          return await this.grep(call.args)
         case 'search_symbols':
-          return this.searchSymbols(call.args)
+          return await this.searchSymbols(call.args)
         case 'edit_file':
-          return this.editFile(call.args)
+          return await this.editFile(call.args)
         case 'write_file':
-          return this.writeFile(call.args)
+          return await this.writeFile(call.args)
         case 'run_command':
-          return this.runCommand(call.args)
+          return await this.runCommand(call.args)
+        case 'run_verification':
+          return await this.runVerification(call.args)
         case 'web_search':
-          return this.webSearch(call.args)
+          return await this.webSearch(call.args)
         default:
           throw new Error(`Tool ${call.tool} is not executable here`)
       }
@@ -428,7 +322,22 @@ export class WorkspaceTools {
 
   private async searchSymbols(args: Record<string, unknown>): Promise<ToolOutcome> {
     const query = str(args, 'query')
-    const hits = await getSymbolIndex(this.root).search(query, 30)
+    const indexCfg = readConfig().index
+    if (!indexCfg.enabled) {
+      return {
+        ok: true,
+        result:
+          'Codebase indexing is disabled in Settings, so search_symbols is unavailable. Use grep to find declarations instead.',
+        uiSummary: 'indexing disabled',
+      }
+    }
+    const t0 = performance.now()
+    const hits = await getSymbolIndex(this.root).search(
+      query,
+      indexCfg.maxResults,
+      indexCfg.scoreThreshold,
+    )
+    const trieMs = performance.now() - t0
     if (hits.length === 0) {
       return {
         ok: true,
@@ -442,6 +351,7 @@ export class WorkspaceTools {
       result: truncate(`search_symbols "${query}" — ${hits.length} declarations:\n${lines.join('\n')}`),
       uiSummary: `${query} — ${hits.length} symbols`,
       viaTrie: true,
+      trieMs,
     }
   }
 
@@ -450,10 +360,15 @@ export class WorkspaceTools {
     const glob = typeof args['glob'] === 'string' && args['glob'] ? (args['glob'] as string) : '**/*'
     const regex = new RegExp(pattern)
     // Trie fast path: a bare identifier is usually "where is X declared" —
-    // answer from the symbol index first, then append content matches.
-    const symbolHits = isIdentifierPattern(pattern)
-      ? await getSymbolIndex(this.root).search(pattern, 10)
-      : []
+    // answer from the symbol index first, then append content matches. Both
+    // paths are timed so the UI can show the honest speed difference.
+    const trieStart = performance.now()
+    const symbolHits =
+      readConfig().index.enabled && isIdentifierPattern(pattern)
+        ? await getSymbolIndex(this.root).search(pattern, 10)
+        : []
+    const trieMs = performance.now() - trieStart
+    const scanStart = performance.now()
     const uris = await vscode.workspace.findFiles(glob, GREP_EXCLUDE, 2000)
     const hits: string[] = symbolHits.map(
       (h) => `${h.path}:${h.line}: [symbol trie] ${h.kind} ${h.name}`,
@@ -476,11 +391,13 @@ export class WorkspaceTools {
         }
       }
     }
+    const scanMs = performance.now() - scanStart
     return {
       ok: true,
       result: truncate(hits.join('\n') || 'No matches.'),
       uiSummary: `/${pattern}/ — ${hits.length} matches`,
       viaTrie: symbolHits.length > 0,
+      ...(symbolHits.length > 0 ? { trieMs, scanMs } : {}),
     }
   }
 
@@ -494,13 +411,40 @@ export class WorkspaceTools {
     const absolute = this.resolve(relPath)
     const content = await fs.promises.readFile(absolute, 'utf8')
     const match = findEditRange(content, search)
-    if ('error' in match) throw new Error(match.error)
-    const replacement = match.reindent ? match.reindent(replace) : replace
+    if ('error' in match) {
+      const candidates = formatEditCandidates(match.candidates)
+      if (match.error === 'ambiguous') {
+        throw new Error(
+          [
+            '`search` is ambiguous after whitespace normalization; no edit was made.',
+            candidates,
+            `Recovery: call read_file with {"path":"${relPath}","startLine":<candidate start>,"endLine":<candidate end>} and include unique surrounding lines in the next search.`,
+            'Do not retry the same truncated or reformatted search.',
+          ].join('\n\n'),
+        )
+      }
+      const nearest = match.candidates[0]
+      const recovery = nearest
+        ? `Recovery: call read_file with {"path":"${relPath}","startLine":${nearest.startLine},"endLine":${nearest.endLine}}, then copy the returned text exactly into search.`
+        : `Recovery: call read_file for "${relPath}" before editing.`
+      throw new Error(
+        [
+          '`search` was not found; no edit was made.',
+          candidates,
+          recovery,
+          'Do not retry a guessed, truncated, or reformatted snippet. If replacing the whole file is intentional, use write_file instead.',
+        ].join('\n\n'),
+      )
+    }
+    const replacement =
+      match.kind === 'whitespace'
+        ? reindentReplacement(replace, match.fileIndent, match.searchIndent, match.fileEol)
+        : replace
     const updated = content.slice(0, match.start) + replacement + content.slice(match.end)
     await fs.promises.writeFile(absolute, updated, 'utf8')
     return {
       ok: true,
-      result: `Edited ${relPath}.${match.fuzzy ? ' (matched with whitespace tolerance)' : ''}`,
+      result: `Edited ${relPath}.${match.kind === 'whitespace' ? ' (unique whitespace-normalized match)' : ''}`,
       uiSummary: relPath,
     }
   }
@@ -563,6 +507,105 @@ export class WorkspaceTools {
       uiSummary: command,
     }
   }
+
+  /**
+   * Autonomous verification is intentionally separate from run_command. It
+   * invokes an existing, verification-named package script directly via
+   * execFile: no shell, operators, arbitrary executables, or silent expansion
+   * of the general command approval surface.
+   */
+  private async runVerification(args: Record<string, unknown>): Promise<ToolOutcome> {
+    const skipReason = typeof args['skipReason'] === 'string' ? args['skipReason'].trim() : ''
+    if (skipReason) {
+      if (skipReason.length < 12) throw new Error('skipReason must explain why verification is not pragmatic.')
+      return {
+        ok: true,
+        result: `Verification explicitly skipped: ${skipReason}`,
+        uiSummary: `Skipped verification — ${truncate(skipReason, 120)}`,
+      }
+    }
+
+    const script = str(args, 'script').trim()
+    if (!/^(?:test(?::[\w.-]+)?|typecheck|check(?::[\w.-]+)?|lint(?::[\w.-]+)?|build)$/.test(script)) {
+      throw new Error(
+        `Script "${script}" is not an allowed verification script. Use test, test:*, typecheck, check:*, lint:*, or build.`,
+      )
+    }
+    const packagePath =
+      typeof args['packagePath'] === 'string' && args['packagePath'].trim()
+        ? args['packagePath'].trim()
+        : '.'
+    const packageRoot = this.resolve(packagePath)
+    const manifestPath = path.join(packageRoot, 'package.json')
+    const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8')) as {
+      scripts?: Record<string, unknown>
+    }
+    if (typeof manifest.scripts?.[script] !== 'string') {
+      throw new Error(`package.json at ${packagePath} has no "${script}" script.`)
+    }
+
+    const rawArgs = args['args']
+    if (rawArgs !== undefined && (!Array.isArray(rawArgs) || rawArgs.some((value) => typeof value !== 'string'))) {
+      throw new Error('`args` must be an array of strings.')
+    }
+    const scriptArgs = (rawArgs as string[] | undefined) ?? []
+    if (scriptArgs.length > 20 || scriptArgs.some((value) => value.length > 240 || value.includes('\u0000'))) {
+      throw new Error('Verification args are too large.')
+    }
+
+    const runner = await detectPackageRunner(packageRoot)
+    const runnerArgs =
+      runner === 'yarn'
+        ? ['run', script, ...scriptArgs]
+        : runner === 'bun'
+          ? ['run', script, ...scriptArgs]
+          : ['run', script, ...(scriptArgs.length > 0 ? ['--', ...scriptArgs] : [])]
+    const display = `${runner} ${runnerArgs.join(' ')}`
+    const output = await execFileResult(runner, runnerArgs, packageRoot)
+    return {
+      ok: output.ok,
+      result: truncate(`${output.ok ? 'Verification passed' : 'Verification failed'}: ${display}\n${output.text}`),
+      uiSummary: `${output.ok ? 'Passed' : 'Failed'} — ${display}`,
+    }
+  }
+}
+
+type PackageRunner = 'npm' | 'pnpm' | 'yarn' | 'bun'
+
+async function detectPackageRunner(packageRoot: string): Promise<PackageRunner> {
+  const candidates: Array<[string, PackageRunner]> = [
+    ['pnpm-lock.yaml', 'pnpm'],
+    ['yarn.lock', 'yarn'],
+    ['bun.lock', 'bun'],
+    ['bun.lockb', 'bun'],
+  ]
+  for (const [lockfile, runner] of candidates) {
+    try {
+      await fs.promises.access(path.join(packageRoot, lockfile))
+      return runner
+    } catch {
+      /* try the next lockfile */
+    }
+  }
+  return 'npm'
+}
+
+function execFileResult(
+  executable: string,
+  args: string[],
+  cwd: string,
+): Promise<{ ok: boolean; text: string }> {
+  return new Promise((resolvePromise) => {
+    execFile(
+      executable,
+      args,
+      { cwd, timeout: 120_000, maxBuffer: 1024 * 1024 },
+      (error, stdout, stderr) => {
+        const text = [stdout, stderr].filter(Boolean).join('\n')
+        resolvePromise({ ok: !error, text: text || (error ? String(error) : '(no output)') })
+      },
+    )
+  })
 }
 
 interface SearchResult {
@@ -612,9 +655,9 @@ async function runWebSearch(
   return normalizeSearchResults(data, maxResults)
 }
 
-/** Tolerant of provider response shapes: results under `results`, fields title/url/text|content|snippet. */
+/** Tolerant of provider response shapes: Exa/Tavily use top-level `results`; Ceramic nests under `result.results`. */
 function normalizeSearchResults(data: Record<string, unknown>, max: number): SearchResult[] {
-  const raw = Array.isArray(data['results']) ? (data['results'] as unknown[]) : []
+  const raw = extractSearchResultEntries(data)
   return raw.slice(0, max).map((entry) => {
     const r = (typeof entry === 'object' && entry !== null ? entry : {}) as Record<string, unknown>
     const pick = (...keys: string[]): string => {
@@ -630,6 +673,16 @@ function normalizeSearchResults(data: Record<string, unknown>, max: number): Sea
       snippet: pick('text', 'content', 'snippet', 'description').replace(/\s+/g, ' ').slice(0, 700),
     }
   })
+}
+
+function extractSearchResultEntries(data: Record<string, unknown>): unknown[] {
+  if (Array.isArray(data['results'])) return data['results'] as unknown[]
+  const nested = data['result']
+  if (typeof nested === 'object' && nested !== null && !Array.isArray(nested)) {
+    const inner = nested as Record<string, unknown>
+    if (Array.isArray(inner['results'])) return inner['results'] as unknown[]
+  }
+  return []
 }
 
 /** One-line arg summary for UI tool cards. */
@@ -650,6 +703,12 @@ export function summarizeArgs(call: ToolCall): string {
       return typeof a['query'] === 'string' ? (a['query'] as string) : ''
     case 'run_command':
       return typeof a['command'] === 'string' ? (a['command'] as string) : ''
+    case 'run_verification':
+      return typeof a['skipReason'] === 'string'
+        ? (a['skipReason'] as string)
+        : `${typeof a['packagePath'] === 'string' ? (a['packagePath'] as string) : '.'}:${
+            typeof a['script'] === 'string' ? (a['script'] as string) : ''
+          }`
     default:
       return ''
   }
@@ -698,6 +757,11 @@ export function formatToolRow(call: ToolCall): string {
       const cmd = typeof a['command'] === 'string' ? (a['command'] as string) : ''
       return cmd.length > 72 ? cmd.slice(0, 69) + '…' : cmd
     }
+    case 'run_verification': {
+      if (typeof a['skipReason'] === 'string') return 'Skipped verification'
+      const script = typeof a['script'] === 'string' ? (a['script'] as string) : 'verification'
+      return `Verify ${script}`
+    }
     default:
       return call.tool
   }
@@ -716,6 +780,16 @@ export function toolLineDelta(call: ToolCall): { added: number; deleted: number 
     return { added: countLines(content), deleted: 0 }
   }
   return { added: 0, deleted: 0 }
+}
+
+/** True when this call will (or did) consult the prefix-trie symbol index. */
+export function isTrieToolCall(call: ToolCall): boolean {
+  if (call.tool === 'search_symbols') return true
+  if (call.tool === 'grep') {
+    const pattern = call.args['pattern']
+    return typeof pattern === 'string' && isIdentifierPattern(pattern)
+  }
+  return false
 }
 
 /** File path key for grouping consecutive edits on the same file. */

@@ -1,5 +1,238 @@
 # Changelog
 
+## 0.4.66
+
+- **Purple Multitask styling:** updated the active chip, activity and queue statuses, spinner, running-task accents, and composer placeholder/focus treatment to match Cursor's soft purple Multitask UI while keeping Plan and Ask neutral and preserving Hybrid styling.
+
+## 0.4.65
+
+- **Strict Code-only Multitask:** restoring active background tasks after a webview reload now also forces Code mode, closing the final path that could show Multitask alongside Ask or Plan.
+
+## 0.4.64
+
+- **Code is implicit:** removed Code from the **+** menu because it is the default state reached by dismissing Plan or Ask.
+- **Coding-only Multitask:** enabling Multitask exits Plan/Ask and returns to Code; selecting Plan or Ask turns Multitask off.
+- **Neutral composer copy:** "Coordinate parallel work…" uses the normal placeholder color instead of orange.
+
+## 0.4.63
+
+- **One mode picker:** Code, Plan, Ask, and Multitask now live exclusively in the composer **+** menu; the duplicate segmented Code/Plan/Ask control was removed.
+- **Active-mode chips:** Plan and Ask appear as dismissible neutral chips beside **+**; Multitask keeps its orange chip. Code is the default and intentionally has no chip.
+
+## 0.4.62
+
+- **Interactive background agents:** Multitask submissions now enter a provider-owned FIFO task runner instead of a fragile webview-only queue. Each task has an isolated agent session and explicit Queued, Working, Done, Failed, or Cancelled state.
+- **Integrated task UX:** the composer shows active/recent background agents with live status, queued and running agents can be cancelled individually, and each launched agent gets an expandable transcript row showing its prompt and lifecycle.
+- **Safe local execution:** agents run one at a time because the embedded daemon has one inference slot and concurrent workspace edits would race checkpoints. Users can still submit more tasks while an agent is working.
+
+## 0.4.61
+
+- **Multitask mode picker (Cursor-style):** composer **+** menu lists Code, Plan, Ask, and **Multitask** with a checkmark on the active choice. Selecting Multitask shows an orange chip beside **+** (dismiss with ×) and switches the placeholder to "Coordinate parallel work…".
+- **Explicit opt-in:** Multitask no longer auto-enables from the queue card — you turn it on from **+** first. While Multitask is active, **Send** stays available during a running turn so follow-ups queue immediately; **Stop** hides until you exit Multitask.
+
+## 0.4.60
+
+- **Hybrid guidance is a plain accordion row** — removed the legacy purple card CSS whose `.guide` selector was still boxing the new accordion rows.
+- **Rainbow hybrid titles:** "Guidance from Hybrid · …" titles render in the rainbow gradient; the gradient animates only while checking.
+
+## 0.4.59
+
+- **Hybrid guidance always readable:** the guidance accordion body shows exactly the note the frontier model sent back — the same text injected into the local model's conversation. Approvals with no note render "Looks good — no changes requested." instead of an empty body, and the row meta shows ✓ (approved) or ! (concern).
+- Empty advisory notes are no longer injected into the local model's conversation.
+
+## 0.4.58
+
+- **Fix: Files Changed card invisible in long chats.** `#messages` is a flex column; once the conversation grew taller than the panel, flex compressed the review card (the only child with `overflow: hidden`) to ~11px. Chat items no longer flex-shrink, so the Keep/Undo review card always renders at full height.
+- **Fix: webview error on tool rows without a thought** (`thought.trim` on undefined) surfaced while reproducing the review-card bug in a browser harness.
+
+## 0.4.57
+
+- **Hybrid accordion:** guidance/review rows use the same nested accordion style as Explored/Edited groups — no bordered card, no Done badge. Rainbow animation applies only to the checking title text.
+
+## 0.4.56
+
+- Release bump bundling Hybrid accordion status UI (0.4.55), smart Hybrid routing (0.4.54), and branded hammer restore (0.4.53).
+
+## 0.4.55
+
+- **Visible Hybrid checks:** Hybrid activity is nested inside the active turn accordion and remains visible after completion.
+- **Provider-aware status:** while running, the row reads `Checking with Hybrid · <provider> · <model>` using the user's active frontier model.
+- **Text-only animation:** the checking label receives a restrained animated rainbow gradient; the card and border remain static.
+
+## 0.4.54
+
+- **Hybrid routing:** greetings, thanks, pings, and other trivial conversational turns never call the frontier model.
+- **Local-first finish check:** the local model self-grades first. Confident plain answers and confidently completed work stay local; Hybrid is reserved for low-confidence results, substantive changed-work review when grading fails, uncertainty, or genuinely stuck loops.
+
+## 0.4.53
+
+- **Restore branded hammer:** activity bar uses the original Trie hammer SVG geometry introduced in 0.3.8.
+
+## 0.4.52
+
+- **Fix: activity bar hammer:** replaced the ambiguous solid diagonal glyph with a recognizable 24px hammer outline whose head, claw, and handle remain distinct in VS Code's activity bar.
+
+## 0.4.51
+
+- **Fix: webview controls:** initialize multitask state before updating the composer placeholder. The earlier initialization order threw a `ReferenceError` and prevented all chat controls—including Connect, Settings, History, and New chat—from attaching click handlers.
+
+## 0.4.50
+
+- **Header toolbar:** Connect, Settings, History, and New chat are icon-only buttons with tooltips; New chat uses a bordered + button.
+- **Hybrid chip:** clearer dropdown caret (CSS chevron instead of faint unicode glyph).
+- **Fix: header clicks:** Hybrid dropdown menu moved outside the chip button (invalid HTML was breaking layout and blocking Connect/Settings clicks).
+- **Fix: activity bar icon:** cleaned up `hammer.svg` (removed comment, explicit 24×24) so the sidebar hammer icon loads reliably.
+
+## 0.4.49
+
+- **Multitask UI (Cursor-style):** Code-mode follow-up queue now has a collapsible multitask card above the composer — **N Queued**, send hint, file-icon rows with truncated previews, and a spinner + **Starting Multitask** / **Working…** header while tasks drain. Click **Start Multitasking** to enter multitask mode: orange **Multitask** activity badge with **Planning next moves…** / **Running N tasks…**, plus a purple **Multitask ×** pill on the composer (placeholder becomes "Coordinate parallel work…"). Queued items briefly pulse as **starting** before each follow-up dispatches. Exit multitask with the pill ×; queue still auto-drains when multitask is off.
+
+## 0.4.48
+
+- **Multi-provider hybrid mode:** configure up to **3 frontier providers** (OpenAI, Anthropic, Moonshot), each with up to **3 saved model names**. Settings → Hybrid mode shows collapsible provider slots with API key, model list, and default-model radio.
+- **Hybrid chip dropdown:** the chat header **Hybrid** chip is now a dropdown — toggle hybrid on/off and pick the active frontier model (`OpenAI · gpt-4o`, etc.) for this session. Selection is saved to settings.
+- **Backward compatible:** legacy `frontierAssist.provider` / `model` / `apiKey` settings migrate into slot 0 on read.
+
+## 0.4.47
+
+- **Fix: codebase indexing settings persist:** `index.enabled`, `index.onStartup`, `index.maxResults`, and `index.scoreThreshold` are `scope: resource` keys — they now save to the workspace folder (`.vscode/settings.json`) via `ConfigurationTarget.WorkspaceFolder` with a URI-scoped configuration object, and load through the same scoped read path. Fixes the settings panel checkbox resetting after reload. Falls back to user settings with a notice when workspace settings are not writable.
+
+## 0.4.46
+
+- **Codebase indexing status:** Settings → Codebase indexing now shows a clear four-state flow — **Not indexed yet** (grey), **Indexing…** with live file progress (`42 / 847 files`), **Indexed ✓** (green, brief flash on completion), then **Indexed** with file/symbol counts and build time. Status updates live when indexing runs on workspace open or from agent symbol search, not only when you click Rebuild.
+- **Settings:** Hybrid mode card — removed advisor badge, shorter one-line description.
+
+## 0.4.45
+
+- **Token gauge + memory compaction:** the composer's bottom-right corner now shows live context usage (`12.4k · 38%`) from real backend token counts — amber past 75%, red past 90%. When the conversation passes 75% of the context window (daemon: your configured context length; API backends: assumed 32k), older turns are automatically summarized by the local model and spliced into a compact memory note — a "Compacting…" pulse shows while it runs, then "freed Xk". Click the gauge to compact manually anytime.
+
+## 0.4.44
+
+- **Todos in the turn accordion:** removed the always-visible Todos strip above the composer. Task lists now live inside the **Worked for…** accordion as a collapsible **Todos** group — collapse the turn or the todos section to hide them.
+
+## 0.4.43
+
+- **Activity stream:** removed per-row **trie** badges on grep/search tool rows. Trie speed is still summarized once per turn in the header ("trie saved Xms") when the symbol index was used.
+
+## 0.4.42
+
+- **Summary vs review card:** the final reply text is model prose — it is not proof files changed. The **N Files Changed** card only appears when shadow-git (or successful edit tools) detect real diffs. The agent is now refused if `step_complete` claims file edits without a successful `edit_file`/`write_file`. If a mismatch still slips through, a notice is shown and the reply is marked failed. Review card now renders **above** the summary when changes exist.
+
+## 0.4.41
+
+- **Hybrid UI — minimal:** removed rainbow gradient borders and animated styling. Decompose now shows an numbered **Hybrid · subtasks** list with the actual injected steps (and rationale). Empty "frontier consult finished" placeholder cards are dropped.
+
+## 0.4.40
+
+- **Review card reliability:** the "N Files Changed" card only appears when files actually changed on disk. The agent is now blocked from calling `step_complete` on edit tasks until `edit_file`/`write_file` succeeds — stops hallucinated "I updated X.swift" answers with no real edits. Fallback review card when tools report edits but shadow-git diff is empty. Turn +/− stats no longer count failed edits.
+
+## 0.4.39
+
+- Release build.
+
+## 0.4.38
+
+- **Web search actually runs:** detects research/docs/internet questions and auto-runs `web_search` before the model loop (shows a **Web search** accordion in the activity stream). Blocks `step_complete` until search has run. Fixes Ceramic API response parsing (`result.results` was ignored, so searches returned empty).
+
+## 0.4.37
+
+- Release build.
+
+## 0.4.36
+
+- **Web search behavior:** the agent is now explicitly prompted to call `web_search` for research papers, external docs, and anything outside the repo — and to return full URLs in its answer instead of keyword lists. Final replies linkify `https://…` URLs so they are clickable. Requires Web search configured in Settings (Exa, Tavily, or Ceramic).
+
+## 0.4.35
+
+- **Codebase indexing — per project:** index data and settings (enable, index-on-open, score threshold, max results) now scope to the open workspace folder. Status shows the workspace name. Removed the trie badge from the settings card.
+
+## 0.4.34
+
+- **Fix: Hybrid card flicker** — the rainbow Hybrid card no longer disappears when the frontier consult finishes. It persists as a collapsible accordion (click the header to collapse/expand), transitions from “Checking…” to the guide note in place, and stacks one card per consult per turn.
+
+## 0.4.33
+
+- **Hybrid mode:** Moonshot AI (Kimi) added as a frontier provider alongside OpenAI and Anthropic. Uses the Moonshot OpenAI-compatible API; default model `kimi-k2-0711-preview`.
+
+## 0.4.32
+
+- Release build.
+
+## 0.4.31
+
+- **Hybrid mode v2 (research-backed):** four upgrades to frontier escalation — (1) evidence-grounded final review runs typecheck/tests locally and sends diff + pass/fail output to the frontier reviewer; (2) AutoMix-style local self-grade before finish, consulting frontier only when confidence is low; (3) token-uncertainty mid-turn escalation from daemon generation confidence + loop heuristics; (4) MinionS-style frontier decomposition for large tasks (atomic subtasks the local model executes in order). Per-turn hybrid telemetry logged to Output → Trie Coding Agent. README documents expected cost/quality gains.
+
+## 0.4.30
+
+- **Multi-word symbol search:** `search_symbols` now handles concept-ish queries like "auth token" by splitting the query into words and scoring symbols by subword coverage (`validateAuthToken` matches at ~0.7). Previously multi-word queries returned nothing. True synonym matching ("auth logic" → `validateCredentials`) still needs an embedding layer — planned as a hybrid on top of the same trie index, not a replacement.
+
+## 0.4.29
+
+- **Chat history:** chats now persist across reloads. A new History button in the header opens a full-pane list with fuzzy search, a Workspace: Current/All filter, and Newest/Oldest sort. Click a chat to reopen it — the transcript is replayed and the conversation continues with its full LLM context. Hover a row to delete that chat (✕); deleting the open chat simply starts fresh on the next message. Up to 100 chats are kept, stored locally in extension storage.
+
+## 0.4.28
+
+- **Search score threshold — powered by the trie, not embeddings:** symbol search now scores matches lexically (1.0 exact, ~0.75–0.95 prefix, ~0.65 word initials like `wsi` → `WorkspaceSymbolIndex`, ~0.5–0.65 substring, ~0.35–0.5 typo-tolerant via a bounded edit-distance walk over the trie). A new slider in Settings → Codebase Indexing (default 0.40) filters results by score: raise it for exact-ish only, lower it for fuzzier hits. Every score is explainable — no similarity black box.
+
+## 0.4.27
+
+- **Follow-up queue in all modes:** type while the agent is working and Enter queues the message instead of being ignored. A Cursor-style card above the composer shows "N Queued · ⏎ to Send" with previews; items can be removed individually. Queued follow-ups run automatically (with the mode they were typed in) as each turn finishes. Pressing Enter on an empty composer sends the next queued item now by stopping the current turn. Code-mode queues get a "Start Multitasking" menu with Send now and Clear queue.
+
+## 0.4.26
+
+- Welcome screen: removed the "Get started — pick one" hint block.
+
+## 0.4.25
+
+- **Codebase Indexing settings:** the trie symbol index is now user-visible and configurable. New Settings card with an enable toggle, live status (Standby / Indexing… / Indexed with file, symbol, and build-time counts), index-on-workspace-open option, max symbol results per search, and a Rebuild button. When disabled, `search_symbols` and the `grep` trie fast path politely step aside. Defaults unchanged: enabled, lazy build on first search.
+
+## 0.4.24
+
+- **Trie speed evidence, measured not estimated:** identifier `grep` runs both the trie lookup and the full content scan in the same call, and both are now timed. The trie pill shows real numbers (`trie <1ms · 214× faster`), and the turn header gets a purple **trie saved 1.2s** chip accumulating the measured difference across the turn. `search_symbols` shows its lookup time too.
+
+## 0.4.23
+
+- **Task lists for complex asks (Code mode):** the system prompt now tells the model to plan 3+-step work with `update_todos` first and check items off as it goes. The list renders inline in the activity stream as a Cursor-style checklist (**Created to-do list** → **Updated to-do list**, ✓ strikethrough for done items), updating in place instead of only living in the pinned panel.
+- **Copy:** marketplace description and README trimmed; "OpenAI-compatible" → **LLM API** everywhere user-facing.
+
+## 0.4.21
+
+- **Copy:** replaced user-facing "OpenAI-compatible" with **LLM API** in the marketplace description, settings UI, backend chip, README, and setup prompts. Internal setting key unchanged (`trie-ide.backend: openai-compatible`).
+
+## 0.4.20
+
+- Release build.
+
+## 0.4.19
+
+- **Undo in the composer:** after a turn that changed files, **↺ Undo** appears next to Send in the prompt box — same checkpoint restore as the review card. Clears after Keep, a successful undo, or New session.
+
+## 0.4.18
+
+- **Cursor-style message layout:** your prompts stay in a right-aligned bubble; the agent's final reply is plain text on the panel background — no assistant chat bubble.
+
+## 0.4.17
+
+- **Trie indicator: static and persistent.** Removed the animated rainbow text on trie rows (it flickered). `search_symbols` and identifier `grep` calls now show a stable purple left bar + **trie** pill from the moment the tool starts — no pop-in on completion.
+
+## 0.4.16
+
+- **Fix: tool arg type errors.** Local models sometimes emit numbers/booleans instead of quoted strings for `query`, `replace`, `search`, etc. Those are now coerced to strings instead of failing with "`query` must be a string".
+- **Fix: Review button visibility.** Review is now a blue text link (`#2563eb`) with no black fill — overrides the global button style that was rendering it invisible.
+- **Hybrid rainbow card:** when Hybrid is checking or returns a guide note, it now appears as a full-width rainbow-bordered card at the message level (not buried inside the nested activity accordion).
+
+## 0.4.15
+
+- **Review card matches the Cursor design (light):** seamless card with no internal separators, filename-only rows with per-file **+/−** stats right-aligned, and image/Swift file badges (`▨ AppIcon.png`, `SW PostcardTheme.swift`). Keep is now a soft green button.
+- **No black buttons:** the base button style is now white with a border (Send, Connect, Settings, New, welcome hints) — no more near-black `#262626` fills anywhere in the panel.
+
+## 0.4.14
+
+- **Fix: tool errors no longer kill the turn.** A missing `await` in the tool dispatcher let async failures (e.g. `read_file` on a nonexistent path → `ENOENT: stat …`) escape the error handler and abort the whole turn with a red banner. They now come back to the model as a normal ✗ tool result it can recover from.
+- **Fix: clearer backend-down error.** A bare `fetch failed` now reads "Could not reach the model backend — the local server may have stopped; check it, then use Connect and retry."
+- **Fix: no more double "explored" header.** The top-level turn label no longer repeats the nested **Explored N files** group; explore-only turns finish as **Worked for Xs**, matching Cursor.
+- **Fix: errored turns close the accordion** instead of leaving it stuck on "Working…".
+
 ## 0.4.13
 
 - **Rainbow trie rows:** when a search is answered by the prefix-trie symbol index (`search_symbols`, or `grep`'s identifier fast path), the row in the nested activity view gets an animated rainbow label and a **⚡ trie** badge — instant index hits are visibly different from full file walks.

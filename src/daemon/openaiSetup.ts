@@ -69,7 +69,7 @@ export async function promptOpenAiHost(onConfigured: () => void): Promise<void> 
         preset: 'lmstudio' as const,
       },
     ],
-    { placeHolder: 'Pick a local OpenAI-compatible host (no .gguf Connect step)' },
+    { placeHolder: 'Pick a local LLM API host (no .gguf Connect step)' },
   )
   if (!picked) return
   await runOpenAiHostSetup(picked.preset, onConfigured)
@@ -89,7 +89,7 @@ export async function explainOpenAiBackend(onConfigured: () => void): Promise<vo
   }
 
   const pick = await vscode.window.showWarningMessage(
-    'OpenAI-compatible backend is on, but trie-ide.api.modelName is empty. Set up Ollama or LM Studio — no Connect step.',
+    'LLM API backend is on, but trie-ide.api.modelName is empty. Set up Ollama or LM Studio — no Connect step.',
     'Set up Ollama',
     'Set up LM Studio',
     'Open Settings',

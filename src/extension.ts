@@ -6,6 +6,7 @@ import { runConnectFlow } from './daemon/connectFlow'
 import { runHybridSetup, runWebSearchSetup } from './daemon/hybridSetup'
 import { SettingsPanel } from './chat/SettingsPanel'
 import { DaemonClient } from './inference/daemonClient'
+import { getSymbolIndex } from './agent/symbolIndex'
 
 let daemonHost: DaemonHost | null = null
 
@@ -18,9 +19,22 @@ export function activate(context: vscode.ExtensionContext): void {
 
   daemonHost = new DaemonHost(context)
 
-  const provider = new ChatViewProvider(context.extensionUri, (label) => {
+  const provider = new ChatViewProvider(context.extensionUri, context.globalStorageUri, (label) => {
     statusBar.text = `$(sparkle) Trie Coding: ${label}`
   })
+
+  // Codebase indexing: eager build only when opted in — the default stays
+  // lazy (first search) so an idle extension costs nothing.
+  const warmUpIndexIfConfigured = (): void => {
+    const folder = vscode.workspace.workspaceFolders?.[0]
+    if (!folder) return
+    const cfg = readConfig()
+    if (cfg.index.enabled && cfg.index.onStartup) {
+      void getSymbolIndex(folder.uri.fsPath).warmUp()
+    }
+  }
+  warmUpIndexIfConfigured()
+  context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(warmUpIndexIfConfigured))
 
   const getDaemonClient = (): DaemonClient => {
     const cfg = readConfig()
