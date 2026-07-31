@@ -4,7 +4,8 @@
  *
  * The local model does all the work; an optional frontier (cloud) model is
  * consulted only at high-leverage checkpoints and returns a short advisory
- * guide note. It never drives the tool loop and never edits files. Guards:
+ * guide note. It never drives the tool loop and never edits files. The local
+ * model does every tool call; hybrid always reviews that work at turn end.
  * disabled/no-key → silent null, max 6 calls per turn, 3-minute cooldown
  * after a 429.
  */

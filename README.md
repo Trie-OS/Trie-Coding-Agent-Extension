@@ -1,65 +1,79 @@
-# Trie IDE Agent
+# Trie Coding Agent
 
-A local-first coding agent for VS Code. Run agent loops — read, search, edit, run commands — powered by open GGUF models running **100% on your machine**, with an optional *hybrid* mode where a frontier model quietly reviews the local model's work.
+AI coding agent for VS Code — run open models locally or plug in any LLM API, with a real tool loop for reading, editing, and running commands in your workspace.
 
-Part of the [Trie OS](https://github.com/Trie-OS) ecosystem. Works with the Trie IDE desktop app and open models you download from Hugging Face — no cloud, no API keys, no subscription required.
+## Features
 
-## Why this is different
+- **Works alongside you:** Trie autonomously explores your codebase, reads and writes files, and runs terminal commands — always with your approval
+- **Bring your own model:** Local `.gguf` via an embedded daemon, or any OpenAI-compatible API — Ollama, LM Studio, OpenAI, Kimi, and more
+- **A real agent loop:** `read_file`, `grep`, `glob`, `edit_file`, `write_file`, `run_command`, and a live todo list — then a summary when done
+- **Checkpoints & rollback:** Every Code-mode turn snapshots your workspace; one click reverts everything the agent changed
+- **Workspace-aware:** Detects your project type (Node, Xcode, Rust, Go, Python, …) and scopes a file tree into the first prompt
+- **Hybrid mode:** Your local model runs every tool call — a frontier model (OpenAI or Anthropic) chimes in only when you're stuck or at the finish line. Frontier-level judgment without frontier-level token bills.
+- **Web search:** Optional `web_search` tool via Exa, Tavily, or Ceramic — queries go directly from your machine with your API key
 
-- **Local models, easily.** Point the extension at the Trie IDE daemon (`trie-daemon`) and pick any GGUF model from your Trie IDE model store — external drive or internal folder. One command: *Trie IDE: Connect & Load Local Model*. Generation is grammar-constrained, so even 7–14B models emit well-formed tool calls reliably.
-- **A real agent loop.** The same tool-loop contract as the Trie IDE desktop app: the model works through `read_file`, `grep`, `glob`, `edit_file`, `write_file`, `run_command` (always user-approved), and a live todo list, then finishes with a summary you can read.
-- **The hybrid approach.** Optionally add an OpenAI or Anthropic key and the frontier model becomes an *advisor, not a driver*: it is consulted only at high-leverage checkpoints — when the local model gets stuck, and as a final review when it declares the task done. It never edits files and never issues tool calls. Most work never becomes a cloud call, so cost stays near zero and your code stays local.
+## Modes
 
-## Requirements
+Trie adapts to how you work:
 
-Pick one backend (Settings → Trie IDE Agent):
+- **Code** — full agent: edits files, runs commands (with approval), takes a checkpoint before each turn
+- **Plan** — read-only exploration, then a numbered implementation plan to review before you switch to Code
+- **Ask** — read-only Q&A about your codebase, no file changes
 
-1. **Trie IDE daemon** (default) — run the Trie IDE desktop app, or start the daemon directly:
-   ```bash
-   cd app && npm run daemon:local     # serves http://127.0.0.1:7841
-   ```
-2. **Any OpenAI-compatible server** — llama-server, LM Studio, Ollama, or a cloud endpoint. Set `trie-ide.api.baseUrl` and `trie-ide.api.modelName`.
+Mutating tools are hard-refused outside Code mode — not just discouraged in the prompt.
 
-## Quick start
+## Install
 
-1. Open the Trie IDE icon in the activity bar.
-2. Click **Connect** and pick a model (daemon backend), or configure your OpenAI-compatible server in settings.
-3. Describe a task: *"add input validation to the signup form and run the tests"*.
-4. Watch the tool calls stream by; approve any shell commands; read the final summary.
+Trie Coding Agent requires VS Code **1.96.0** or later.
 
-## Hybrid mode (frontier assist)
+1. Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Trie.trie-ide)
+2. Open a folder in VS Code
+3. Click the **Trie** hammer icon in the Activity Bar
+4. Click **Settings** and pick your backend — or use **Connect** to load a local `.gguf`
 
-Set `trie-ide.frontierAssist.enabled` to `true` and add a key:
+### Ollama (easiest)
 
-| Setting | Value |
-|---|---|
-| `trie-ide.frontierAssist.provider` | `openai` or `anthropic` |
-| `trie-ide.frontierAssist.model` | empty = provider default |
-| `trie-ide.frontierAssist.apiKey` | your key |
+```bash
+ollama pull qwen2.5-coder:7b
+```
 
-Guide notes appear inline in the chat, purple-tagged **Hybrid guide**, and are injected into the local model's context as advice. Hard caps: at most 6 frontier calls per turn, automatic 3-minute cooldown on rate limits, and a failed cloud call never interrupts local work.
+Then **Settings → OpenAI-compatible API → Ollama preset**, or set `trie-ide.backend` to `openai-compatible` with base URL `http://127.0.0.1:11434/v1` and model `qwen2.5-coder:7b`.
+
+### LM Studio
+
+Load a model, start the local server (port **1234**), then **Settings → LM Studio preset**.
+
+### Embedded daemon (local `.gguf`)
+
+**Connect → Pick a .gguf file.** Requires Node.js and npm on your PATH. On first use the extension downloads the inference runtime (~40 MB) into VS Code storage.
+
+**Connect is only for the embedded daemon.** Ollama, LM Studio, and cloud APIs are configured in **Settings** — no Connect step.
+
+## Settings
+
+Click **Settings** in the sidebar for a full settings page: backend, model, agent budget, hybrid mode, and web search. Everything saves as you edit.
+
+Search **Trie Coding Agent** in VS Code settings for the raw `trie-ide.*` keys.
+
+## Hybrid mode
+
+Your local model does the work — reading files, searching, editing, running commands. That stays on your machine and costs nothing beyond compute.
+
+Hybrid adds a frontier model sparingly: a nudge when the local model stalls, a final read when a turn finishes. It never edits files, runs tools, or drives the loop — and it's hard-capped to a handful of API calls per turn. You spend on intelligence where it counts, not on re-explaining your codebase to GPT on every grep.
+
+Enable in **Settings → Hybrid mode**, or run **Trie Coding Agent: Configure Hybrid Mode** from the Command Palette.
+
+## Web search
+
+Optional. Gives the agent a `web_search` tool for current docs, APIs, and error messages. Configure in **Settings → Web search** (Exa, Tavily, or Ceramic).
 
 ## Safety
 
-- All file operations are confined to the workspace root — path escapes are refused.
-- `run_command` always asks for explicit approval with the exact command shown.
-- Nothing leaves your machine unless you enable hybrid mode or point the backend at a cloud endpoint.
+- File operations stay inside the workspace root
+- `run_command` always asks for explicit approval
+- Nothing leaves your machine unless you use a cloud API, hybrid mode, or web search
 
-## Settings reference
-
-| Setting | Default | Description |
-|---|---|---|
-| `trie-ide.backend` | `daemon` | `daemon` or `openai-compatible` |
-| `trie-ide.daemon.url` | `http://127.0.0.1:7841` | trie-daemon base URL |
-| `trie-ide.daemon.storePath` | *(empty)* | Model store volume path |
-| `trie-ide.daemon.contextLength` | `8192` | Context length for model load |
-| `trie-ide.api.baseUrl` | `http://127.0.0.1:8080` | OpenAI-compatible server |
-| `trie-ide.api.modelName` | *(empty)* | Model name for the server |
-| `trie-ide.api.apiKey` | *(empty)* | Optional Bearer token |
-| `trie-ide.agent.maxToolCalls` | `24` | Tool-call budget per turn |
-| `trie-ide.agent.temperature` | `0.2` | Sampling temperature |
-| `trie-ide.agent.maxTokens` | `2048` | Max tokens per response |
-| `trie-ide.frontierAssist.*` | disabled | Hybrid advisory mode |
+Part of the [Trie ecosystem](https://trie.dev).
 
 ## License
 

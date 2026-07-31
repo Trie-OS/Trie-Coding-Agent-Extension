@@ -1,10 +1,15 @@
 {
   "name": "trie-ide",
-  "displayName": "Trie IDE Agent",
-  "description": "Local-first coding agent: run agent loops on GGUF models via the Trie IDE daemon or any OpenAI-compatible server, with optional hybrid frontier-model guidance.",
-  "version": "0.1.0",
+  "displayName": "Trie Coding Agent",
+  "description": "Coding agent: local GGUF via embedded trie-daemon, or any OpenAI-compatible LLM API (Ollama, LM Studio, OpenAI, Kimi, and other cloud endpoints). Hybrid mode adds sparing frontier-model guidance — local model runs the loop, cloud only when it matters.",
+  "version": "0.4.13",
   "publisher": "Trie",
   "license": "Apache-2.0",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Trie-OS/Trie-ide"
+  },
   "private": true,
   "engines": {
     "vscode": "^1.96.0"
@@ -21,7 +26,8 @@
     "gguf",
     "llama.cpp",
     "offline",
-    "trie-ide"
+    "trie-ide",
+    "ollama"
   ],
   "main": "./dist/extension.js",
   "activationEvents": [],
@@ -30,8 +36,8 @@
       "activitybar": [
         {
           "id": "trie-ide",
-          "title": "Trie IDE",
-          "icon": "media/trie-ide.svg"
+          "title": "Trie Coding Agent",
+          "icon": "media/hammer.svg"
         }
       ]
     },
@@ -40,31 +46,51 @@
         {
           "type": "webview",
           "id": "trie-ide.chatView",
-          "name": "Agent",
-          "icon": "media/trie-ide.svg"
+          "name": "",
+          "icon": "media/hammer.svg"
         }
       ]
     },
     "commands": [
       {
         "command": "trie-ide.openChat",
-        "title": "Trie IDE: Open Agent Chat"
+        "title": "Trie Coding Agent: Open Agent Chat"
       },
       {
         "command": "trie-ide.connect",
-        "title": "Trie IDE: Connect & Load Local Model"
+        "title": "Trie Coding Agent: Connect & Load Local Model"
+      },
+      {
+        "command": "trie-ide.configureHybrid",
+        "title": "Trie Coding Agent: Configure Hybrid Mode"
+      },
+      {
+        "command": "trie-ide.configureWebSearch",
+        "title": "Trie Coding Agent: Configure Web Search"
+      },
+      {
+        "command": "trie-ide.settings",
+        "title": "Trie Coding Agent: Settings"
+      },
+      {
+        "command": "trie-ide.installInference",
+        "title": "Trie Coding Agent: Install Local Inference Runtime"
+      },
+      {
+        "command": "trie-ide.stopDaemon",
+        "title": "Trie Coding Agent: Stop Embedded Daemon"
       },
       {
         "command": "trie-ide.newSession",
-        "title": "Trie IDE: New Agent Session"
+        "title": "Trie Coding Agent: New Agent Session"
       },
       {
         "command": "trie-ide.stop",
-        "title": "Trie IDE: Stop Generation"
+        "title": "Trie Coding Agent: Stop Generation"
       }
     ],
     "configuration": {
-      "title": "Trie IDE Agent",
+      "title": "Trie Coding Agent",
       "properties": {
         "trie-ide.backend": {
           "type": "string",
@@ -74,8 +100,8 @@
           ],
           "default": "daemon",
           "enumDescriptions": [
-            "Trie IDE daemon (trie-daemon) serving local GGUF models over localhost.",
-            "Any OpenAI-compatible /v1/chat/completions server (llama-server, LM Studio, Ollama, or a cloud API)."
+            "Trie IDE daemon (embedded or external) serving local GGUF models over localhost.",
+            "Any OpenAI-compatible /v1/chat/completions API — local (Ollama, LM Studio, llama-server) or cloud (OpenAI, Kimi, etc.)."
           ],
           "description": "Which inference backend drives the agent loop."
         },
@@ -83,6 +109,21 @@
           "type": "string",
           "default": "http://127.0.0.1:7841",
           "description": "Base URL of the Trie IDE daemon (trie-daemon)."
+        },
+        "trie-ide.daemon.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "When backend is daemon, start the embedded trie-daemon if none is reachable at trie-ide.daemon.url."
+        },
+        "trie-ide.daemon.keepRunning": {
+          "type": "boolean",
+          "default": false,
+          "description": "Leave the embedded trie-daemon running after VS Code closes (server mode for other clients)."
+        },
+        "trie-ide.daemon.command": {
+          "type": "string",
+          "default": "",
+          "description": "Advanced: shell command to start an external trie-daemon (empty = use embedded daemon bundled in this extension)."
         },
         "trie-ide.daemon.storePath": {
           "type": "string",
@@ -97,17 +138,17 @@
         "trie-ide.api.baseUrl": {
           "type": "string",
           "default": "http://127.0.0.1:8080",
-          "description": "Base URL of the OpenAI-compatible server (llama-server, LM Studio, Ollama, or a cloud endpoint)."
+          "description": "Base URL of any OpenAI-compatible `/v1/chat/completions` API — local (Ollama, LM Studio, llama-server) or cloud (OpenAI, Kimi, etc.)."
         },
         "trie-ide.api.modelName": {
           "type": "string",
           "default": "",
-          "description": "Model name sent to the OpenAI-compatible server."
+          "description": "Model id on that API (e.g. qwen2.5-coder:7b, gpt-4o-mini)."
         },
         "trie-ide.api.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Optional Bearer token for the OpenAI-compatible server."
+          "description": "Bearer token for cloud APIs; optional for local servers."
         },
         "trie-ide.agent.maxToolCalls": {
           "type": "number",
@@ -127,7 +168,8 @@
         "trie-ide.frontierAssist.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Hybrid mode: consult a frontier (cloud) model for advisory guide notes at checkpoints. The frontier model never drives the tool loop and never edits files."
+          "order": 50,
+          "markdownDescription": "**Hybrid mode** — consult a frontier (cloud) model for advisory guide notes when the local model is stuck or finishes a turn. The frontier model never drives the tool loop and never edits files. Use the **Settings** button in the sidebar or **Trie Coding Agent: Configure Hybrid Mode**."
         },
         "trie-ide.frontierAssist.provider": {
           "type": "string",
@@ -136,17 +178,50 @@
             "anthropic"
           ],
           "default": "openai",
-          "description": "Frontier assist provider."
+          "order": 51,
+          "description": "Hybrid mode: frontier provider (OpenAI or Anthropic)."
         },
         "trie-ide.frontierAssist.model": {
           "type": "string",
           "default": "",
-          "description": "Frontier assist model (empty = provider default)."
+          "order": 52,
+          "description": "Hybrid mode: frontier model name (empty = provider default, e.g. gpt-4o or claude-sonnet)."
         },
         "trie-ide.frontierAssist.apiKey": {
           "type": "string",
           "default": "",
-          "description": "API key for the frontier assist provider."
+          "order": 53,
+          "markdownDescription": "Hybrid mode: API key for the frontier provider. Required when hybrid mode is enabled."
+        },
+        "trie-ide.webSearch.provider": {
+          "type": "string",
+          "enum": [
+            "none",
+            "exa",
+            "tavily",
+            "ceramic"
+          ],
+          "default": "none",
+          "order": 60,
+          "enumDescriptions": [
+            "Web search disabled — the web_search tool is not offered to the agent.",
+            "Exa (exa.ai) — neural web search API.",
+            "Tavily (tavily.com) — search API built for AI agents.",
+            "Ceramic (ceramic.ai) — low-cost web search API for LLMs."
+          ],
+          "markdownDescription": "**Web search** — give the agent a `web_search` tool. Requests go directly from your machine to the provider using your API key; nothing is proxied through Trie."
+        },
+        "trie-ide.webSearch.apiKey": {
+          "type": "string",
+          "default": "",
+          "order": 61,
+          "markdownDescription": "Web search: API key for the selected provider. Required for the `web_search` tool to appear."
+        },
+        "trie-ide.webSearch.maxResults": {
+          "type": "number",
+          "default": 5,
+          "order": 62,
+          "description": "Web search: maximum results per query (1–10)."
         }
       }
     }
@@ -155,13 +230,17 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
-    "package": "npm run typecheck && npm run build && vsce package --no-dependencies --allow-missing-repository"
+    "package": "npm run typecheck && npm run build && vsce package --no-dependencies",
+    "package:platform": "node scripts/package-platform.mjs",
+    "package:marketplace": "node scripts/package-marketplace.mjs",
+    "publish:marketplace": "node scripts/package-marketplace.mjs && vsce publish --packagePath trie-ide-0.4.13.vsix"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.96.0",
     "@vscode/vsce": "^3.0.0",
     "esbuild": "^0.25.0",
+    "lucide": "^0.503.0",
     "typescript": "~5.9.3"
   }
 }

@@ -7,10 +7,17 @@
  * consulted for a stuck hint after consecutive failures and for a final
  * review after a mutating turn completes.
  */
-import * as fs from 'node:fs'
 import type { ChatTurn, GenerationParams, InferenceClient } from '../inference/types'
+import { buildWorkspaceContext } from './context'
 import { FrontierAssist, type GuideNote } from './frontierAssist'
-import { agentSystemPrompt, agentUserPrompt, repairTurn, toolResultTurn } from './prompts'
+import {
+  agentSystemPrompt,
+  agentUserPrompt,
+  isReadOnlyMode,
+  repairTurn,
+  toolResultTurn,
+  type AgentMode,
+} from './prompts'
 import {
   parseToolCall,
   summarizeArgs,
@@ -22,8 +29,10 @@ import {
 export interface LoopEvents {
   onGenerating(active: boolean): void
   onToolCall(id: number, call: ToolCall, argsSummary: string): void
-  onToolResult(id: number, ok: boolean, summary: string): void
+  onToolResult(id: number, ok: boolean, summary: string, viaTrie?: boolean): void
   onTodos(todo: string[], done: string[]): void
+  /** Frontier model is consulting (stuck hint or final review). */
+  onHybridChecking(active: boolean, checkpoint?: 'stuck_hint' | 'final_review'): void
   onGuideNote(note: GuideNote): void
 }
 
@@ -40,6 +49,9 @@ export class AgentSession {
   private done: string[] = []
   private started = false
   private callId = 0
+  private mode: AgentMode = 'code'
+  /** Whether any mutating tool succeeded this turn — fed to the hybrid final review. */
+  private mutatedThisTurn = false
 
   constructor(
     private readonly root: string,
@@ -56,6 +68,7 @@ export class AgentSession {
 
   async runTurn(
     task: string,
+    mode: AgentMode,
     client: InferenceClient,
     params: GenerationParams,
     maxCalls: number,
@@ -64,24 +77,21 @@ export class AgentSession {
   ): Promise<LoopResult> {
     this.frontier.resetTurn()
     const tools = new WorkspaceTools(this.root)
+    this.mode = mode
 
     if (!this.started) {
-      const rootListing = fs
-        .readdirSync(this.root, { withFileTypes: true })
-        .filter((e) => !e.name.startsWith('.'))
-        .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
-        .slice(0, 50)
-        .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
-        .join('\n')
-      this.turns.push({ role: 'system', content: agentSystemPrompt() })
-      this.turns.push({ role: 'user', content: agentUserPrompt(task, this.workspaceName, rootListing) })
+      const workspaceContext = buildWorkspaceContext(this.root, this.workspaceName)
+      this.turns.push({ role: 'system', content: agentSystemPrompt(mode) })
+      this.turns.push({ role: 'user', content: agentUserPrompt(task, workspaceContext) })
       this.started = true
     } else {
+      // The mode can change between turns; the system prompt is always turn 0.
+      this.turns[0] = { role: 'system', content: agentSystemPrompt(mode) }
       this.turns.push({ role: 'user', content: `Task: ${task}` })
     }
 
     let consecutiveFailures = 0
-    let mutated = false
+    this.mutatedThisTurn = false
 
     for (let i = 0; i < maxCalls; i++) {
       if (signal.aborted) return { ok: false, summary: 'Stopped.' }
@@ -118,7 +128,7 @@ export class AgentSession {
           (typeof call.args['summary'] === 'string' && (call.args['summary'] as string)) ||
           (typeof call.args['reason'] === 'string' && (call.args['reason'] as string)) ||
           (ok ? 'Done.' : 'Failed.')
-        if (ok && mutated) await this.maybeFinalReview(events)
+        if (ok) await this.maybeFinalReview(events)
         return { ok, summary }
       }
 
@@ -135,13 +145,34 @@ export class AgentSession {
         continue
       }
 
+      const spec0 = TOOL_SPECS.find((t) => t.name === call.tool)
+      if (spec0?.mutating && isReadOnlyMode(this.mode)) {
+        const modeName = this.mode === 'plan' ? 'PLAN' : 'ASK'
+        this.turns.push({
+          role: 'user',
+          content: toolResultTurn(
+            call.tool,
+            false,
+            `Refused: ${call.tool} modifies the workspace, but you are in ${modeName} mode (read-only). Finish with step_complete instead.`,
+          ),
+        })
+        consecutiveFailures++
+        if (consecutiveFailures >= 4) {
+          return {
+            ok: false,
+            summary: `Stopped: the model kept trying to modify files in ${modeName.toLowerCase()} mode. Switch to Code mode to make changes.`,
+          }
+        }
+        continue
+      }
+
       events.onToolCall(id, call, summarizeArgs(call))
       const outcome = await tools.execute(call)
-      events.onToolResult(id, outcome.ok, outcome.uiSummary)
+      events.onToolResult(id, outcome.ok, outcome.uiSummary, outcome.viaTrie)
       this.turns.push({ role: 'user', content: toolResultTurn(call.tool, outcome.ok, outcome.result) })
 
       const spec = TOOL_SPECS.find((t) => t.name === call.tool)
-      if (outcome.ok && spec?.mutating) mutated = true
+      if (outcome.ok && spec?.mutating) this.mutatedThisTurn = true
 
       if (outcome.ok) {
         consecutiveFailures = 0
@@ -175,7 +206,13 @@ export class AgentSession {
 
   private async maybeStuckHint(consecutiveFailures: number, events: LoopEvents): Promise<void> {
     if (consecutiveFailures < 2 || !this.frontier.enabled()) return
-    const note = await this.frontier.consult('stuck_hint', this.transcriptTail())
+    events.onHybridChecking(true, 'stuck_hint')
+    let note: GuideNote | null = null
+    try {
+      note = await this.frontier.consult('stuck_hint', this.transcriptTail())
+    } finally {
+      events.onHybridChecking(false)
+    }
     if (!note) return
     events.onGuideNote(note)
     this.turns.push({
@@ -186,7 +223,37 @@ export class AgentSession {
 
   private async maybeFinalReview(events: LoopEvents): Promise<void> {
     if (!this.frontier.enabled()) return
-    const note = await this.frontier.consult('final_review', this.transcriptTail())
+    events.onHybridChecking(true, 'final_review')
+    let note: GuideNote | null = null
+    try {
+      note = await this.frontier.consult('final_review', this.buildFinalReviewContext())
+    } finally {
+      events.onHybridChecking(false)
+    }
     if (note) events.onGuideNote(note)
+  }
+
+  /** Transcript plus a one-line work summary for the frontier reviewer. */
+  private buildFinalReviewContext(): string {
+    const toolsUsed: string[] = []
+    for (const turn of this.turns) {
+      if (turn.role !== 'assistant') continue
+      try {
+        const call = JSON.parse(turn.content) as { tool?: string }
+        if (call.tool && call.tool !== 'step_complete' && call.tool !== 'step_failed') {
+          toolsUsed.push(call.tool)
+        }
+      } catch {
+        /* prose turn */
+      }
+    }
+    const work = this.mutatedThisTurn
+      ? 'Workspace was modified this turn.'
+      : 'Read-only turn (no file edits).'
+    const summary =
+      toolsUsed.length > 0
+        ? `${work} Tools used (${toolsUsed.length}): ${toolsUsed.join(', ')}`
+        : `${work} No tools were called.`
+    return `${summary}\n\n${this.transcriptTail()}`
   }
 }

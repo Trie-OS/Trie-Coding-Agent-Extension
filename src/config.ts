@@ -2,10 +2,18 @@ import * as vscode from 'vscode'
 
 export type BackendKind = 'daemon' | 'openai-compatible'
 export type FrontierProvider = 'openai' | 'anthropic'
+export type WebSearchProvider = 'none' | 'exa' | 'tavily' | 'ceramic'
 
 export interface ExtensionConfig {
   backend: BackendKind
-  daemon: { url: string; storePath: string; contextLength: number }
+  daemon: {
+    url: string
+    storePath: string
+    contextLength: number
+    autoStart: boolean
+    keepRunning: boolean
+    command: string
+  }
   api: { baseUrl: string; modelName: string; apiKey: string }
   agent: { maxToolCalls: number; temperature: number; maxTokens: number }
   frontierAssist: {
@@ -14,6 +22,15 @@ export interface ExtensionConfig {
     model: string
     apiKey: string
   }
+  webSearch: {
+    provider: WebSearchProvider
+    apiKey: string
+    maxResults: number
+  }
+}
+
+export function isWebSearchConfigured(cfg: ExtensionConfig): boolean {
+  return cfg.webSearch.provider !== 'none' && cfg.webSearch.apiKey.trim().length > 0
 }
 
 export function readConfig(): ExtensionConfig {
@@ -24,6 +41,9 @@ export function readConfig(): ExtensionConfig {
       url: cfg.get<string>('daemon.url', 'http://127.0.0.1:7841').replace(/\/+$/, ''),
       storePath: cfg.get<string>('daemon.storePath', ''),
       contextLength: cfg.get<number>('daemon.contextLength', 8192),
+      autoStart: cfg.get<boolean>('daemon.autoStart', true),
+      keepRunning: cfg.get<boolean>('daemon.keepRunning', false),
+      command: cfg.get<string>('daemon.command', ''),
     },
     api: {
       baseUrl: cfg.get<string>('api.baseUrl', 'http://127.0.0.1:8080').replace(/\/+$/, ''),
@@ -40,6 +60,11 @@ export function readConfig(): ExtensionConfig {
       provider: cfg.get<FrontierProvider>('frontierAssist.provider', 'openai'),
       model: cfg.get<string>('frontierAssist.model', ''),
       apiKey: cfg.get<string>('frontierAssist.apiKey', ''),
+    },
+    webSearch: {
+      provider: cfg.get<WebSearchProvider>('webSearch.provider', 'none'),
+      apiKey: cfg.get<string>('webSearch.apiKey', ''),
+      maxResults: cfg.get<number>('webSearch.maxResults', 5),
     },
   }
 }

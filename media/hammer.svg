@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+  <!-- Head + handle at a diagonal — reads clearly at 16px (not a cube) -->
+  <path d="M17.1 2.9a1.2 1.2 0 0 1 1.7 0l2.3 2.3a1.2 1.2 0 0 1 0 1.7l-7.8 7.8-4-4 7.8-7.8zM9.5 10.5 3.7 16.3a1.2 1.2 0 0 0 0 1.7l1.6 1.6a1.2 1.2 0 0 0 1.7 0l5.8-5.8-3.3-3.3z" />
+</svg>

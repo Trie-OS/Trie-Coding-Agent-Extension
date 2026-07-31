@@ -75,6 +75,10 @@ export class DaemonClient implements InferenceClient {
     return this.loadedModelName ? `${this.loadedModelName} @ daemon` : 'daemon (no model loaded)'
   }
 
+  hasModel(): boolean {
+    return this.loadedModelName !== null
+  }
+
   async handshake(): Promise<DaemonHandshake> {
     const response = await fetch(`${this.baseUrl}/v1/handshake`)
     return jsonOrThrow<DaemonHandshake>(response, 'handshake')
@@ -94,22 +98,81 @@ export class DaemonClient implements InferenceClient {
 
   async loadModel(model: DaemonStoreModel, volumePath: string, ctxLen: number): Promise<void> {
     const modelPath = `${volumePath}/${model.relPath}`.replace(/\/+/g, '/')
+    const effectiveCtx =
+      model.ctxLen && model.ctxLen > 0 ? Math.min(model.ctxLen, ctxLen) : ctxLen
+    await this.loadModelFromPath(modelPath, model.displayName, effectiveCtx, model.modelId)
+  }
+
+  async loadModelFromPath(
+    modelPath: string,
+    displayName: string,
+    ctxLen: number,
+    modelId?: string,
+    onProgress?: (pct: number) => void,
+  ): Promise<void> {
     const response = await fetch(`${this.baseUrl}/v1/model/load`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        modelId: model.modelId,
+        modelId: modelId ?? displayName,
         modelPath,
-        ctxLen: model.ctxLen && model.ctxLen > 0 ? Math.min(model.ctxLen, ctxLen) : ctxLen,
+        ctxLen,
+        streamProgress: onProgress !== undefined,
       }),
     })
+
+    if (onProgress && response.headers.get('content-type')?.includes('text/event-stream')) {
+      if (!response.ok) {
+        const err = (await response.json().catch(() => ({}))) as { error?: string; message?: string }
+        throw new Error(`model load: ${err.message ?? err.error ?? response.status}`)
+      }
+      let loadError: string | null = null
+      let loadDone = false
+      await readSse(response, (data) => {
+        let event: { type: string; pct?: number; message?: string }
+        try {
+          event = JSON.parse(data)
+        } catch {
+          return
+        }
+        if (event.type === 'progress' && typeof event.pct === 'number') onProgress(event.pct)
+        else if (event.type === 'done') loadDone = true
+        else if (event.type === 'error') loadError = event.message ?? 'model load failed'
+      })
+      if (loadError) throw new Error(loadError)
+      if (!loadDone) {
+        throw new Error('Model load ended before the daemon confirmed success. Check Output → Trie Coding Agent Daemon.')
+      }
+      this.loadedModelName = displayName
+      return
+    }
+
     await jsonOrThrow(response, 'model load')
-    this.loadedModelName = model.displayName
+    this.loadedModelName = displayName
+    const loaded = await this.syncStatus()
+    if (!loaded) {
+      throw new Error('Model load returned OK but the daemon reports no model is active.')
+    }
   }
 
   /** Reflect a model that was already loaded (e.g. by the Trie IDE app). */
   noteLoaded(modelName: string): void {
     this.loadedModelName = modelName
+  }
+
+  clearLoaded(): void {
+    this.loadedModelName = null
+  }
+
+  /** Read /v1/model/status and mirror it into describe(). */
+  async syncStatus(): Promise<boolean> {
+    const status = await this.status()
+    if (status.loaded && status.modelId) {
+      this.loadedModelName = status.modelId
+      return true
+    }
+    this.loadedModelName = null
+    return false
   }
 
   async cancel(): Promise<void> {
@@ -141,7 +204,7 @@ export class DaemonClient implements InferenceClient {
       const err = (await response.json().catch(() => ({}))) as { error?: string }
       throw new Error(
         err.error === 'NO_MODEL_LOADED'
-          ? 'No model loaded on the daemon — run "Trie IDE: Connect & Load Local Model".'
+          ? 'No model loaded on the daemon — run "Trie Coding Agent: Connect & Load Local Model".'
           : `generate failed (${response.status}): ${err.error ?? 'unknown error'}`,
       )
     }

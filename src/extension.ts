@@ -1,18 +1,31 @@
 import * as vscode from 'vscode'
 import { ChatViewProvider } from './chat/ChatViewProvider'
 import { readConfig } from './config'
+import { DaemonHost } from './daemon/daemonHost'
+import { runConnectFlow } from './daemon/connectFlow'
+import { runHybridSetup, runWebSearchSetup } from './daemon/hybridSetup'
+import { SettingsPanel } from './chat/SettingsPanel'
 import { DaemonClient } from './inference/daemonClient'
+
+let daemonHost: DaemonHost | null = null
 
 export function activate(context: vscode.ExtensionContext): void {
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90)
   statusBar.command = 'trie-ide.openChat'
-  statusBar.text = '$(sparkle) Trie IDE'
-  statusBar.tooltip = 'Trie IDE Agent — open chat'
+  statusBar.text = '$(sparkle) Trie Coding'
+  statusBar.tooltip = 'Trie Coding Agent — open chat'
   statusBar.show()
 
+  daemonHost = new DaemonHost(context)
+
   const provider = new ChatViewProvider(context.extensionUri, (label) => {
-    statusBar.text = `$(sparkle) Trie IDE: ${label}`
+    statusBar.text = `$(sparkle) Trie Coding: ${label}`
   })
+
+  const getDaemonClient = (): DaemonClient => {
+    const cfg = readConfig()
+    return (provider.daemonClient ??= new DaemonClient(cfg.daemon.url))
+  }
 
   context.subscriptions.push(
     statusBar,
@@ -27,79 +40,73 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('trie-ide.stop', () => provider.stop()),
 
     vscode.commands.registerCommand('trie-ide.connect', async () => {
-      const cfg = readConfig()
-      if (cfg.backend !== 'daemon') {
-        void vscode.window.showInformationMessage(
-          'Backend is set to OpenAI-compatible — nothing to load. Switch trie-ide.backend to "daemon" to use local GGUF models.',
-        )
-        return
-      }
-      const client = (provider.daemonClient ??= new DaemonClient(cfg.daemon.url))
-      try {
-        await client.handshake()
-      } catch {
-        void vscode.window.showErrorMessage(
-          `Could not reach the Trie IDE daemon at ${cfg.daemon.url}. Start it with \`npm run daemon:local\` in the Trie IDE app, or run the Trie IDE desktop app.`,
-        )
-        return
-      }
+      await runConnectFlow(daemonHost!, getDaemonClient, () => provider.refreshState())
+    }),
 
-      let store
+    vscode.commands.registerCommand('trie-ide.configureHybrid', async () => {
+      await runHybridSetup(() => provider.refreshState())
+    }),
+
+    vscode.commands.registerCommand('trie-ide.configureWebSearch', async () => {
+      await runWebSearchSetup(() => provider.refreshState())
+    }),
+
+    vscode.commands.registerCommand('trie-ide.settings', () => {
+      SettingsPanel.show(context.extensionUri, () => provider.refreshState())
+    }),
+
+    vscode.commands.registerCommand('trie-ide.installInference', async () => {
       try {
-        store = await client.store(cfg.daemon.storePath || undefined)
+        await daemonHost!.installInferenceRuntime()
       } catch (error) {
         void vscode.window.showErrorMessage(
-          `Store scan failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Failed to install inference runtime: ${error instanceof Error ? error.message : String(error)}`,
         )
-        return
       }
-      if (!store || store.models.length === 0) {
-        void vscode.window.showWarningMessage(
-          'No Trie IDE model store found on the daemon host. Set trie-ide.daemon.storePath to a drive initialized by Trie IDE.',
+    }),
+
+    vscode.commands.registerCommand('trie-ide.startDaemon', async () => {
+      try {
+        await daemonHost!.startEmbedded()
+        void vscode.window.showInformationMessage('Trie Coding Agent embedded daemon started.')
+      } catch (error) {
+        void vscode.window.showErrorMessage(
+          `Failed to start embedded daemon: ${error instanceof Error ? error.message : String(error)}`,
         )
-        return
       }
+    }),
 
-      const picked = await vscode.window.showQuickPick(
-        store.models.map((m) => ({
-          label: m.displayName,
-          description: `${m.quant} · ${(m.sizeBytes / 1e9).toFixed(1)} GB`,
-          model: m,
-        })),
-        { placeHolder: 'Pick a local model to load' },
-      )
-      if (!picked) return
-
-      await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: `Loading ${picked.model.displayName}…` },
-        async () => {
-          await client.loadModel(picked.model, store.volumePath, cfg.daemon.contextLength)
-        },
-      )
-      provider.refreshState()
-      void vscode.window.showInformationMessage(`Loaded ${picked.model.displayName}.`)
+    vscode.commands.registerCommand('trie-ide.stopDaemon', async () => {
+      await daemonHost!.stopEmbedded()
+      void vscode.window.showInformationMessage('Trie Coding Agent embedded daemon stopped.')
     }),
 
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('trie-ide')) provider.refreshState()
     }),
+
+    { dispose: () => daemonHost?.dispose() },
   )
 
-  // If the daemon already has a model loaded (e.g. the Trie IDE app loaded
-  // it), reflect that in the status bar without requiring a connect.
   const cfg = readConfig()
   if (cfg.backend === 'daemon') {
-    const client = (provider.daemonClient ??= new DaemonClient(cfg.daemon.url))
-    void client
-      .status()
-      .then((status) => {
+    void daemonHost.handshake(cfg.daemon.url).then(async (ready) => {
+      if (!ready) return
+      const client = getDaemonClient()
+      try {
+        const status = await client.status()
         if (status.loaded && status.modelId) {
           client.noteLoaded(status.modelId)
           provider.refreshState()
         }
-      })
-      .catch(() => {})
+      } catch {
+        // Daemon may still be starting.
+      }
+    })
   }
 }
 
-export function deactivate(): void {}
+export function deactivate(): void {
+  daemonHost?.dispose()
+  daemonHost = null
+}
