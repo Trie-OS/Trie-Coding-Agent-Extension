@@ -210,7 +210,7 @@ export function getResourceConfiguration(): vscode.WorkspaceConfiguration {
 
 const INDEX_DEFAULTS = {
   enabled: true,
-  onStartup: false,
+  onStartup: true,
   maxResults: 30,
   scoreThreshold: 0.4,
 } as const

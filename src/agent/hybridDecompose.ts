@@ -3,11 +3,14 @@
  * atomic single-instruction subtasks; the local model executes them.
  */
 import { defaultFrontierModel, getActiveFrontierConfig, type FrontierAssistConfig } from '../config'
+import { DECOMPOSE_TIMEOUT_MS, shouldDecompose } from './hybridDecomposePolicy'
 
 export interface DecomposePlan {
   subtasks: string[]
   rationale: string
 }
+
+export { DECOMPOSE_TIMEOUT_MS, shouldDecompose }
 
 const DECOMPOSE_SYSTEM = [
   'You are a senior engineer planning work for a smaller local coding model.',
@@ -17,15 +20,11 @@ const DECOMPOSE_SYSTEM = [
   '{"subtasks": ["...", "..."], "rationale": "<one short sentence>"}',
 ].join('\n')
 
-export function shouldDecompose(task: string, todoCount: number): boolean {
-  const words = task.trim().split(/\s+/).length
-  return todoCount >= 3 || words >= 35 || task.length >= 220
-}
-
 export async function frontierDecompose(
   task: string,
   workspaceHint: string,
   getConfig: () => FrontierAssistConfig,
+  signal?: AbortSignal,
 ): Promise<DecomposePlan | null> {
   const fa = getConfig()
   if (!fa.enabled) return null
@@ -33,10 +32,12 @@ export async function frontierDecompose(
   if (!cfg) return null
 
   const userContent = `Task:\n${task}\n\nWorkspace:\n${workspaceHint.slice(0, 1500)}`
+  const timeout = AbortSignal.timeout(DECOMPOSE_TIMEOUT_MS)
+  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
   try {
     const raw =
       cfg.provider === 'anthropic'
-        ? await callAnthropic(cfg.apiKey, cfg.model, userContent)
+        ? await callAnthropic(cfg.apiKey, cfg.model, userContent, combined)
         : await callOpenAiCompatible(
             cfg.provider === 'moonshot'
               ? 'https://api.moonshot.ai/v1/chat/completions'
@@ -44,6 +45,7 @@ export async function frontierDecompose(
             cfg.apiKey,
             cfg.model || defaultFrontierModel(cfg.provider),
             userContent,
+            combined,
           )
     if (!raw) return null
     const start = raw.indexOf('{')
@@ -71,6 +73,7 @@ async function callOpenAiCompatible(
   apiKey: string,
   model: string,
   content: string,
+  signal: AbortSignal,
 ): Promise<string | null> {
   const response = await fetch(url, {
     method: 'POST',
@@ -84,13 +87,19 @@ async function callOpenAiCompatible(
       max_tokens: 500,
       temperature: 0.2,
     }),
+    signal,
   })
   if (!response.ok) return null
   const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> }
   return data.choices?.[0]?.message?.content ?? null
 }
 
-async function callAnthropic(apiKey: string, model: string, content: string): Promise<string | null> {
+async function callAnthropic(
+  apiKey: string,
+  model: string,
+  content: string,
+  signal: AbortSignal,
+): Promise<string | null> {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -104,6 +113,7 @@ async function callAnthropic(apiKey: string, model: string, content: string): Pr
       messages: [{ role: 'user', content }],
       max_tokens: 500,
     }),
+    signal,
   })
   if (!response.ok) return null
   const data = (await response.json()) as { content?: Array<{ type: string; text?: string }> }

@@ -8,7 +8,19 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as vscode from 'vscode'
 import { readConfig, type WebSearchProvider } from '../config'
-import { findEditRange, reindentReplacement, type EditCandidate } from './editMatcher'
+import {
+  findEditRange,
+  findLineRange,
+  reindentReplacement,
+  type EditCandidate,
+} from './editMatcher'
+import {
+  executeMultitaskTool,
+  MULTITASK_TOOL_NAMES,
+  MULTITASK_TOOL_SPECS,
+  type MultitaskToolContext,
+} from './multitaskBus'
+import { parseToolCall as parseToolCallInner, extractJsonObject as extractJsonObjectInner } from './toolParse'
 import { getSymbolIndex, isIdentifierPattern } from './symbolIndex'
 
 export interface ToolSpec {
@@ -18,6 +30,8 @@ export interface ToolSpec {
   description: string
   mutating?: boolean
   control?: boolean
+  /** Only offered to Multitask sibling sessions. */
+  multitaskOnly?: boolean
 }
 
 export const TOOL_SPECS: ToolSpec[] = [
@@ -50,16 +64,17 @@ export const TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: 'edit_file',
-    signature: '{"path": string, "search": string, "replace": string}',
+    signature:
+      '{"path": string, "replace": string, "startLine"?: number, "endLine"?: number, "search"?: string}',
     description:
-      'Replace `search` with `replace`. Read the exact lines first. Exact text is preferred; formatting-only whitespace differences are accepted only for one unique byte range. After failure, read the reported line range instead of retrying a guessed or truncated snippet.',
+      'Edit a file. Preferred (durable): after read_file, pass startLine/endLine + replace to rewrite that inclusive line range — no need to retype file bytes. Alternate: search + replace for a short unique snippet (exact or whitespace-normalized). On search failure, use the reported startLine/endLine with replace.',
     mutating: true,
   },
   {
     name: 'web_search',
     signature: '{"query": string}',
     description:
-      'Search the internet. Returns titles, URLs, and snippets. Use for research papers, current docs, APIs, libraries, blog posts, or error messages — anything not in the repo.',
+      'Search the internet when the active user request explicitly asks for web research or requires current/external factual information. Repository implementation, debugging, architecture, and missing local symbols stay local.',
   },
   {
     name: 'write_file',
@@ -100,6 +115,14 @@ export const TOOL_SPECS: ToolSpec[] = [
     description: 'Finish the turn as failed when the task is impossible or blocked.',
     control: true,
   },
+  ...MULTITASK_TOOL_SPECS.map(
+    (tool): ToolSpec => ({
+      name: tool.name,
+      signature: tool.signature,
+      description: tool.description,
+      multitaskOnly: true,
+    }),
+  ),
 ]
 
 const TOOL_NAMES = new Set(TOOL_SPECS.map((t) => t.name))
@@ -107,10 +130,14 @@ const MAX_RESULT_CHARS = 6000
 const MAX_FILE_READ_BYTES = 512 * 1024
 const GREP_EXCLUDE = '**/{node_modules,.git,dist,out,build,.next,coverage}/**'
 
-export interface ToolCall {
-  thought: string
-  tool: string
-  args: Record<string, unknown>
+export type ToolCall = import('./toolParse').ParsedToolCall
+
+export function extractJsonObject(text: string): string | null {
+  return extractJsonObjectInner(text, TOOL_NAMES)
+}
+
+export function parseToolCall(raw: string): ToolCall | { error: string } {
+  return parseToolCallInner(raw, TOOL_NAMES)
 }
 
 export interface ToolOutcome {
@@ -125,63 +152,6 @@ export interface ToolOutcome {
   trieMs?: number
   /** Measured full content-scan time (ms) from the same call — honest comparison. */
   scanMs?: number
-}
-
-/** Extract the first balanced JSON object from model output (tolerates fences/prose). */
-export function extractJsonObject(text: string): string | null {
-  const start = text.indexOf('{')
-  if (start === -1) return null
-  let depth = 0
-  let inString = false
-  let escaped = false
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i]
-    if (inString) {
-      if (escaped) escaped = false
-      else if (ch === '\\') escaped = true
-      else if (ch === '"') inString = false
-      continue
-    }
-    if (ch === '"') inString = true
-    else if (ch === '{') depth++
-    else if (ch === '}') {
-      depth--
-      if (depth === 0) return text.slice(start, i + 1)
-    }
-  }
-  // Truncated output: try closing an open string and any open braces.
-  let candidate = text.slice(start)
-  if (inString) candidate += '"'
-  candidate += '}'.repeat(Math.max(depth, 0))
-  try {
-    JSON.parse(candidate)
-    return candidate
-  } catch {
-    return null
-  }
-}
-
-export function parseToolCall(raw: string): ToolCall | { error: string } {
-  const json = extractJsonObject(raw)
-  if (!json) return { error: 'No JSON object found in the response.' }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(json)
-  } catch (error) {
-    return { error: `Invalid JSON: ${error instanceof Error ? error.message : String(error)}` }
-  }
-  if (typeof parsed !== 'object' || parsed === null) return { error: 'Response is not an object.' }
-  const obj = parsed as Record<string, unknown>
-  const tool = obj['tool']
-  if (typeof tool !== 'string' || !TOOL_NAMES.has(tool)) {
-    return { error: `Unknown tool: ${String(tool)}. Use one of: ${[...TOOL_NAMES].join(', ')}` }
-  }
-  const args = obj['args']
-  if (typeof args !== 'object' || args === null || Array.isArray(args)) {
-    return { error: '`args` must be an object.' }
-  }
-  const thought = typeof obj['thought'] === 'string' ? obj['thought'] : ''
-  return { thought, tool, args: args as Record<string, unknown> }
 }
 
 function str(args: Record<string, unknown>, key: string): string {
@@ -223,7 +193,10 @@ function formatEditCandidates(candidates: EditCandidate[]): string {
 }
 
 export class WorkspaceTools {
-  constructor(private readonly root: string) {}
+  constructor(
+    private readonly root: string,
+    private readonly multitask?: MultitaskToolContext,
+  ) {}
 
   /** Resolve a workspace-relative path; escapes are refused (Trie IDE's PATH_OUTSIDE_WORKSPACE policy). */
   private resolve(relPath: string): string {
@@ -234,11 +207,26 @@ export class WorkspaceTools {
     return absolute
   }
 
+  private assertPathWritable(relPath: string): void {
+    if (!this.multitask) return
+    const owner = this.multitask.bus.ownerOf(relPath, this.multitask.agentId)
+    if (!owner) return
+    throw new Error(
+      `Path "${relPath}" is claimed by sibling ${owner.ownerName}. Use claim_paths only for unclaimed files, or pick a different path.`,
+    )
+  }
+
   async execute(call: ToolCall): Promise<ToolOutcome> {
     // `return await` is load-bearing: without it, async rejections (e.g. an
     // ENOENT stat) escape this try/catch and kill the whole turn instead of
     // coming back to the model as a recoverable tool failure.
     try {
+      if (MULTITASK_TOOL_NAMES.has(call.tool)) {
+        if (!this.multitask) {
+          throw new Error(`${call.tool} is only available during Multitask sibling runs`)
+        }
+        return executeMultitaskTool(call.tool, call.args, this.multitask)
+      }
       switch (call.tool) {
         case 'read_file':
           return await this.readFile(call.args)
@@ -403,13 +391,66 @@ export class WorkspaceTools {
 
   private async editFile(args: Record<string, unknown>): Promise<ToolOutcome> {
     const relPath = str(args, 'path')
-    const search = str(args, 'search')
     const replace = str(args, 'replace')
-    if (!search.trim()) {
-      throw new Error('`search` must not be empty. To create or fully overwrite a file, use write_file.')
+    const search = typeof args['search'] === 'string' ? (args['search'] as string) : ''
+    const startLine = optNum(args, 'startLine')
+    const endLine = optNum(args, 'endLine')
+    const hasLineRange = startLine !== undefined && endLine !== undefined
+    if (!hasLineRange && !search.trim()) {
+      throw new Error(
+        'Provide startLine+endLine+replace (preferred) or search+replace. To create or fully overwrite a file, use write_file.',
+      )
     }
+    if ((startLine !== undefined) !== (endLine !== undefined)) {
+      throw new Error('startLine and endLine must be provided together.')
+    }
+    this.assertPathWritable(relPath)
     const absolute = this.resolve(relPath)
     const content = await fs.promises.readFile(absolute, 'utf8')
+
+    if (hasLineRange) {
+      const match = findLineRange(content, startLine!, endLine!)
+      if ('error' in match) {
+        const lineCount = content.split('\n').length
+        throw new Error(
+          `Invalid line range ${startLine}-${endLine} for ${relPath} (${lineCount} lines). Re-read the file and use inclusive 1-based startLine/endLine.`,
+        )
+      }
+      // Optional search acts as a safety check when the model also supplies it.
+      if (search.trim()) {
+        const current = content.slice(match.start, match.end).replace(/\r\n/g, '\n').replace(/\n$/, '')
+        const wanted = search.replace(/\r\n/g, '\n').replace(/\n$/, '')
+        const same =
+          current === wanted ||
+          current.split('\n').map((l) => l.trim().replace(/\s+/g, ' ')).join('\n') ===
+            wanted.split('\n').map((l) => l.trim().replace(/\s+/g, ' ')).join('\n')
+        if (!same) {
+          throw new Error(
+            [
+              `Line range ${startLine}-${endLine} in ${relPath} no longer matches the provided search; no edit was made.`,
+              'Re-read those lines, then call edit_file with startLine/endLine + replace only (omit search).',
+              '--- current lines ---',
+              content.slice(match.start, match.end).replace(/\n$/, ''),
+            ].join('\n'),
+          )
+        }
+      }
+      const eol = match.fileEol
+      let replacement = replace.replace(/\r\n/g, '\n')
+      if (eol === '\r\n') replacement = replacement.replace(/\n/g, '\r\n')
+      // Keep a trailing newline when replacing a mid-file line window.
+      if (match.end < content.length && !replacement.endsWith(eol) && !replacement.endsWith('\n')) {
+        replacement += eol === '\r\n' ? '\r\n' : '\n'
+      }
+      const updated = content.slice(0, match.start) + replacement + content.slice(match.end)
+      await fs.promises.writeFile(absolute, updated, 'utf8')
+      return {
+        ok: true,
+        result: `Edited ${relPath} lines ${startLine}-${endLine}.`,
+        uiSummary: relPath,
+      }
+    }
+
     const match = findEditRange(content, search)
     if ('error' in match) {
       const candidates = formatEditCandidates(match.candidates)
@@ -420,33 +461,45 @@ export class WorkspaceTools {
           [
             `\`search\` matches multiple places ${matchMode}; no edit was made.`,
             candidates,
-            `Recovery: call read_file with {"path":"${relPath}","startLine":<candidate start>,"endLine":<candidate end>} and include unique surrounding lines in the next search.`,
-            'Do not retry the same truncated or reformatted search.',
+            `Recovery: call read_file for a candidate range, then edit_file with startLine/endLine + replace (no search).`,
           ].join('\n\n'),
         )
       }
       const nearest = match.candidates[0]
       const recovery = nearest
-        ? `Recovery: call read_file with {"path":"${relPath}","startLine":${nearest.startLine},"endLine":${nearest.endLine}}, then copy the returned text exactly into search.`
-        : `Recovery: call read_file for "${relPath}" before editing.`
+        ? [
+            'Durable recovery (preferred): rewrite those lines by number — no search retyping:',
+            `{"path":"${relPath}","startLine":${nearest.startLine},"endLine":${nearest.endLine},"replace":"<your new content>"}`,
+            '',
+            `--- exact file text lines ${nearest.startLine}-${nearest.endLine} ---`,
+            nearest.text,
+            '--- end ---',
+          ].join('\n')
+        : `Recovery: call read_file for "${relPath}", then edit_file with startLine/endLine + replace.`
       throw new Error(
         [
           '`search` was not found; no edit was made.',
           candidates,
           recovery,
-          'Do not retry a guessed, truncated, or reformatted snippet. If replacing the whole file is intentional, use write_file instead.',
+          'Do not retry a guessed or reformatted search. Prefer startLine/endLine + replace.',
         ].join('\n\n'),
       )
     }
     const replacement =
-      match.kind === 'whitespace'
-        ? reindentReplacement(replace, match.fileIndent, match.searchIndent, match.fileEol)
-        : replace
+      match.kind === 'exact'
+        ? replace
+        : reindentReplacement(replace, match.fileIndent, match.searchIndent, match.fileEol)
     const updated = content.slice(0, match.start) + replacement + content.slice(match.end)
     await fs.promises.writeFile(absolute, updated, 'utf8')
+    const note =
+      match.kind === 'whitespace'
+        ? ' (unique whitespace-normalized match)'
+        : match.kind === 'lines'
+          ? ` lines ${match.matchedStartLine}-${match.matchedEndLine}`
+          : ''
     return {
       ok: true,
-      result: `Edited ${relPath}.${match.kind === 'whitespace' ? ' (unique whitespace-normalized match)' : ''}`,
+      result: `Edited ${relPath}.${note}`,
       uiSummary: relPath,
     }
   }
@@ -454,6 +507,7 @@ export class WorkspaceTools {
   private async writeFile(args: Record<string, unknown>): Promise<ToolOutcome> {
     const relPath = str(args, 'path')
     const content = str(args, 'content')
+    this.assertPathWritable(relPath)
     const absolute = this.resolve(relPath)
     await fs.promises.mkdir(path.dirname(absolute), { recursive: true })
     await fs.promises.writeFile(absolute, content, 'utf8')
@@ -830,6 +884,18 @@ export function formatToolRow(call: ToolCall): string {
       const script = typeof a['script'] === 'string' ? (a['script'] as string) : 'verification'
       return `Verify ${script}`
     }
+    case 'post_finding':
+      return 'Post sibling finding'
+    case 'read_sibling_updates':
+      return 'Read sibling updates'
+    case 'claim_paths': {
+      const paths = Array.isArray(a['paths']) ? a['paths'].filter((p): p is string => typeof p === 'string') : []
+      return paths.length ? `Claim ${paths.map((p) => basename(p)).join(', ')}` : 'Claim paths'
+    }
+    case 'release_paths': {
+      const paths = Array.isArray(a['paths']) ? a['paths'].filter((p): p is string => typeof p === 'string') : []
+      return paths.length ? `Release ${paths.map((p) => basename(p)).join(', ')}` : 'Release paths'
+    }
     default:
       return call.tool
   }
@@ -839,9 +905,15 @@ export function formatToolRow(call: ToolCall): string {
 export function toolLineDelta(call: ToolCall): { added: number; deleted: number } {
   const a = call.args
   if (call.tool === 'edit_file') {
-    const search = typeof a['search'] === 'string' ? a['search'] : ''
     const replace = typeof a['replace'] === 'string' ? a['replace'] : ''
-    return { added: countLines(replace), deleted: countLines(search) }
+    const search = typeof a['search'] === 'string' ? a['search'] : ''
+    const startLine = typeof a['startLine'] === 'number' ? a['startLine'] : undefined
+    const endLine = typeof a['endLine'] === 'number' ? a['endLine'] : undefined
+    const deleted =
+      startLine !== undefined && endLine !== undefined && endLine >= startLine
+        ? endLine - startLine + 1
+        : countLines(search)
+    return { added: countLines(replace), deleted }
   }
   if (call.tool === 'write_file') {
     const content = typeof a['content'] === 'string' ? a['content'] : ''

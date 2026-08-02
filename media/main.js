@@ -94,6 +94,16 @@
     const hybridMenuEnabled = document.getElementById("hybrid-menu-enabled");
     const hybridModelList = document.getElementById("hybrid-model-list");
     const hybridModelLabel = hybridChip?.querySelector(".hybrid-model-label");
+    const historyBtn = document.getElementById("history-btn");
+    const historyView = document.getElementById("history-view");
+    newBtn.addEventListener("click", () => vscode.postMessage({ type: "new" }));
+    connectBtn.addEventListener("click", () => vscode.postMessage({ type: "connect" }));
+    settingsBtn.addEventListener("click", () => vscode.postMessage({ type: "settings" }));
+    historyBtn.addEventListener("click", () => {
+      document.body.classList.add("history-open");
+      historyView.hidden = false;
+      vscode.postMessage({ type: "history" });
+    });
     const toolCards = /* @__PURE__ */ new Map();
     let spinnerEl = null;
     let planningEl = null;
@@ -187,14 +197,6 @@
     function refreshTurnSummary() {
       if (!turnSession) return;
       turnSession.labelEl.textContent = turnSummaryText(turnSession, false);
-      const trieEl = turnSession.el.querySelector(".turn-trie");
-      if (trieEl) {
-        trieEl.hidden = turnSession.trieSavedMs < 1;
-        if (turnSession.trieSavedMs >= 1) {
-          trieEl.textContent = "trie saved " + fmtMs(turnSession.trieSavedMs);
-          trieEl.title = "Measured time the prefix-trie symbol index saved vs full content scans this turn";
-        }
-      }
       if (turnSession.statsEl) {
         const showStats = turnSession.added > 0 || turnSession.deleted > 0;
         turnSession.statsEl.hidden = !showStats;
@@ -210,10 +212,9 @@
       if (turnSession) return turnSession;
       const el = document.createElement("details");
       el.className = "turn-session";
-      el.open = true;
       const summary = document.createElement("summary");
       summary.className = "turn-summary";
-      summary.innerHTML = '<span class="acc-chevron"></span><span class="turn-label">Working\u2026</span><span class="turn-trie" hidden></span><span class="turn-stats" hidden><span class="stat-add"></span> <span class="stat-del"></span></span>';
+      summary.innerHTML = '<span class="acc-chevron"></span><span class="turn-label">Working\u2026</span><span class="turn-stats" hidden><span class="stat-add"></span> <span class="stat-del"></span></span>';
       el.appendChild(summary);
       const body = document.createElement("div");
       body.className = "turn-body";
@@ -230,7 +231,6 @@
         editedPaths: /* @__PURE__ */ new Set(),
         exploredFiles: /* @__PURE__ */ new Set(),
         exploredActions: 0,
-        trieSavedMs: 0,
         added: 0,
         deleted: 0,
         commandCount: 0
@@ -260,7 +260,6 @@
       if (active && active.kind === kind && active.key === key) return active;
       const el = document.createElement("details");
       el.className = "acc-group acc-" + kind;
-      el.open = true;
       const summary = document.createElement("summary");
       summary.className = "acc-summary";
       summary.innerHTML = '<span class="acc-chevron"></span><span class="acc-title"></span><span class="acc-meta"></span>';
@@ -357,7 +356,6 @@
       if (!todoCard) {
         const el = document.createElement("details");
         el.className = "acc-group acc-todos";
-        el.open = true;
         el.innerHTML = '<summary class="acc-summary"><span class="acc-chevron"></span><span class="acc-title">Todos</span><span class="acc-meta"></span></summary><div class="acc-body todo-card-body"></div>';
         session.body.appendChild(el);
         todoCard = el;
@@ -385,10 +383,19 @@
       }
       scrollDown();
     }
+    function turnSessionHasVisibleActivity(session) {
+      if (session.editedPaths.size > 0 || session.commandCount > 0 || session.exploredActions > 0) {
+        return true;
+      }
+      return session.body.querySelector(".acc-group, .acc-row:not(.planning), .todo-card") !== null;
+    }
     function finishTurnSession() {
       if (!turnSession) return;
       refreshTurnSummary();
-      turnSession.labelEl.textContent = turnSummaryText(turnSession, true);
+      const session = turnSession;
+      session.labelEl.textContent = turnSummaryText(session, true);
+      session.el.open = false;
+      if (!turnSessionHasVisibleActivity(session)) session.el.remove();
       turnSession = null;
       todoCard = null;
       todoCardSeen = false;
@@ -455,12 +462,29 @@
       if (ms < 1e3) return Math.round(ms) + "ms";
       return (ms / 1e3).toFixed(1) + "s";
     }
+    function attachTrieBadge(row, trieMs, scanMs) {
+      row.classList.add("trie-fast");
+      const badge = document.createElement("span");
+      badge.className = "trie-badge";
+      if (typeof scanMs === "number" && scanMs > trieMs) {
+        const saved = Math.max(0, scanMs - trieMs);
+        badge.textContent = "Trie saved " + fmtMs(saved);
+        badge.title = `Symbol index ${fmtMs(trieMs)} vs full scan ${fmtMs(scanMs)} on this search`;
+      } else {
+        badge.textContent = "Trie \xB7 " + fmtMs(trieMs);
+        badge.title = "Answered from the prefix-trie symbol index";
+      }
+      row.appendChild(badge);
+    }
     let ctxUsed = 0;
     let ctxLimit = 0;
     let ctxFlashTimer = null;
     function fmtTokens(n) {
       if (n < 1e3) return String(n);
       return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+    }
+    function applyTheme(theme) {
+      document.documentElement.dataset.theme = theme === "dark" ? "dark" : "light";
     }
     function renderCtxGauge() {
       if (ctxLimit <= 0) {
@@ -613,7 +637,6 @@
       closeActiveGroup();
       const el = document.createElement("details");
       el.className = "acc-group acc-hybrid checking";
-      el.open = true;
       el.dataset.checkpoint = checkpoint;
       const summary = document.createElement("summary");
       summary.className = "acc-summary";
@@ -743,36 +766,204 @@
     function scrollDown() {
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
-    function addBubble(className, text) {
+    function addBubble(className, text, images) {
       const el = document.createElement("div");
       el.className = "bubble " + className;
       el.textContent = text;
+      if (images && images.length > 0) {
+        const row = document.createElement("div");
+        row.className = "user-image-row";
+        for (const image of images) {
+          const img = document.createElement("img");
+          img.src = image.previewUrl;
+          img.alt = image.name;
+          row.appendChild(img);
+        }
+        el.appendChild(row);
+      }
       messagesEl.appendChild(el);
       scrollDown();
       return el;
     }
-    function linkifyText(text) {
-      const fragment = document.createDocumentFragment();
-      const urlRe = /https?:\/\/[^\s<>"')\]]+/g;
-      let last = 0;
-      let match;
-      while ((match = urlRe.exec(text)) !== null) {
-        if (match.index > last) fragment.appendChild(document.createTextNode(text.slice(last, match.index)));
-        const a = document.createElement("a");
-        a.href = match[0];
-        a.textContent = match[0];
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        fragment.appendChild(a);
-        last = match.index + match[0].length;
+    function isInlineMarkdownSpecial(text, index) {
+      const ch = text[index];
+      if (ch === "`" || ch === "*") return true;
+      if (ch === "_" && (text[index + 1] === "_" || isItalicUnderscoreStart(text, index))) return true;
+      return /^https?:\/\//.test(text.slice(index));
+    }
+    function isItalicUnderscoreStart(text, index) {
+      if (text[index] !== "_" || text[index + 1] === "_") return false;
+      const before = index > 0 ? text[index - 1] : " ";
+      if (/[\w/]/.test(before)) return false;
+      const close = text.indexOf("_", index + 1);
+      if (close === -1 || text[close + 1] === "_") return false;
+      const after = close + 1 < text.length ? text[close + 1] : " ";
+      return !/[\w/]/.test(after) && close > index + 1;
+    }
+    function formatInlineMarkdownInto(parent, text) {
+      let i = 0;
+      while (i < text.length) {
+        if (text[i] === "`") {
+          let j = i + 1;
+          while (j < text.length) {
+            if (text[j] === "\\" && j + 1 < text.length) {
+              j += 2;
+              continue;
+            }
+            if (text[j] === "`") break;
+            j++;
+          }
+          if (j < text.length && text[j] === "`") {
+            const code = document.createElement("code");
+            code.className = "reply-inline-code";
+            code.textContent = text.slice(i + 1, j).replace(/\\`/g, "`");
+            parent.appendChild(code);
+            i = j + 1;
+            continue;
+          }
+        }
+        if (text[i] === "*" && text[i + 1] === "*") {
+          const close = text.indexOf("**", i + 2);
+          if (close !== -1 && close > i + 2) {
+            const strong = document.createElement("strong");
+            formatInlineMarkdownInto(strong, text.slice(i + 2, close));
+            parent.appendChild(strong);
+            i = close + 2;
+            continue;
+          }
+        }
+        if (text[i] === "_" && text[i + 1] === "_") {
+          const close = text.indexOf("__", i + 2);
+          if (close !== -1 && close > i + 2) {
+            const strong = document.createElement("strong");
+            formatInlineMarkdownInto(strong, text.slice(i + 2, close));
+            parent.appendChild(strong);
+            i = close + 2;
+            continue;
+          }
+        }
+        if (text[i] === "*" && text[i + 1] !== "*") {
+          const close = text.indexOf("*", i + 1);
+          if (close !== -1 && text[close + 1] !== "*" && close > i + 1) {
+            const em = document.createElement("em");
+            formatInlineMarkdownInto(em, text.slice(i + 1, close));
+            parent.appendChild(em);
+            i = close + 1;
+            continue;
+          }
+        }
+        if (isItalicUnderscoreStart(text, i)) {
+          const close = text.indexOf("_", i + 1);
+          if (close !== -1) {
+            const em = document.createElement("em");
+            formatInlineMarkdownInto(em, text.slice(i + 1, close));
+            parent.appendChild(em);
+            i = close + 1;
+            continue;
+          }
+        }
+        const urlMatch = text.slice(i).match(/^https?:\/\/[^\s<>"')\]]+/);
+        if (urlMatch) {
+          const a = document.createElement("a");
+          a.href = urlMatch[0];
+          a.textContent = urlMatch[0];
+          a.target = "_blank";
+          a.rel = "noopener noreferrer";
+          parent.appendChild(a);
+          i += urlMatch[0].length;
+          continue;
+        }
+        let next = i + 1;
+        while (next < text.length && !isInlineMarkdownSpecial(text, next)) next++;
+        parent.appendChild(document.createTextNode(text.slice(i, next)));
+        i = next;
       }
-      if (last < text.length) fragment.appendChild(document.createTextNode(text.slice(last)));
+    }
+    function formatReplyMarkdown(text) {
+      const fragment = document.createDocumentFragment();
+      const lines = text.replace(/\r\n/g, "\n").split("\n");
+      let i = 0;
+      const appendNestedBullets = (li, start) => {
+        let j = start;
+        if (j >= lines.length || !/^\s+[-*]\s/.test(lines[j])) return j;
+        const ul = document.createElement("ul");
+        ul.className = "reply-ul";
+        while (j < lines.length && /^\s+[-*]\s/.test(lines[j])) {
+          const match = lines[j].match(/^\s+[-*]\s+(.*)$/);
+          const subLi = document.createElement("li");
+          formatInlineMarkdownInto(subLi, match?.[1] ?? "");
+          ul.appendChild(subLi);
+          j++;
+        }
+        li.appendChild(ul);
+        return j;
+      };
+      while (i < lines.length) {
+        const line = lines[i];
+        if (!line.trim()) {
+          i++;
+          continue;
+        }
+        const headerMatch = line.match(/^(#{1,6})\s+(.+)$/);
+        if (headerMatch) {
+          const level = Math.min(headerMatch[1].length, 6);
+          const h = document.createElement("h" + level);
+          h.className = "reply-h" + level;
+          formatInlineMarkdownInto(h, headerMatch[2]);
+          fragment.appendChild(h);
+          i++;
+          continue;
+        }
+        if (/^\d+\.\s/.test(line)) {
+          const ol = document.createElement("ol");
+          ol.className = "reply-ol";
+          while (i < lines.length && /^\d+\.\s/.test(lines[i])) {
+            const itemMatch = lines[i].match(/^\d+\.\s+(.*)$/);
+            const li = document.createElement("li");
+            formatInlineMarkdownInto(li, itemMatch?.[1] ?? "");
+            i++;
+            i = appendNestedBullets(li, i);
+            ol.appendChild(li);
+          }
+          fragment.appendChild(ol);
+          continue;
+        }
+        if (/^[-*]\s/.test(line)) {
+          const ul = document.createElement("ul");
+          ul.className = "reply-ul";
+          while (i < lines.length && /^[-*]\s/.test(lines[i])) {
+            const itemMatch = lines[i].match(/^[-*]\s+(.*)$/);
+            const li = document.createElement("li");
+            formatInlineMarkdownInto(li, itemMatch?.[1] ?? "");
+            i++;
+            ul.appendChild(li);
+          }
+          fragment.appendChild(ul);
+          continue;
+        }
+        const paraLines = [];
+        while (i < lines.length) {
+          const l = lines[i];
+          if (!l.trim()) break;
+          if (/^#{1,6}\s/.test(l)) break;
+          if (/^\d+\.\s/.test(l)) break;
+          if (/^[-*]\s/.test(l)) break;
+          paraLines.push(l);
+          i++;
+        }
+        if (paraLines.length > 0) {
+          const p = document.createElement("p");
+          p.className = "reply-p";
+          formatInlineMarkdownInto(p, paraLines.join(" "));
+          fragment.appendChild(p);
+        }
+      }
       return fragment;
     }
     function addReply(text, failed = false) {
       const el = document.createElement("div");
       el.className = "reply" + (failed ? " failed" : "");
-      el.appendChild(linkifyText(text));
+      el.appendChild(formatReplyMarkdown(text));
       messagesEl.appendChild(el);
       scrollDown();
       return el;
@@ -801,7 +992,99 @@
     let finishedSubagentsEl = null;
     const multitaskRunRows = /* @__PURE__ */ new Map();
     const composerEl = document.getElementById("composer");
+    const imageAttachmentChipsEl = document.getElementById("image-attachment-chips");
+    const imageDropOverlayEl = document.getElementById("image-drop-overlay");
+    const imageFileInputEl = document.getElementById("image-file-input");
     let plusMenuOpen = false;
+    let imageSupport = "non-vision-model";
+    let imageDragDepth = 0;
+    const MAX_IMAGE_ATTACHMENTS = 4;
+    const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+    const ACCEPTED_IMAGE_TYPES = /* @__PURE__ */ new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+    const ACCEPTED_IMAGE_EXT = /* @__PURE__ */ new Set(["png", "jpg", "jpeg", "gif", "webp"]);
+    let imageAttachments = [];
+    function isAcceptedImageFile(file) {
+      if (ACCEPTED_IMAGE_TYPES.has(file.type)) return true;
+      const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+      return ACCEPTED_IMAGE_EXT.has(ext);
+    }
+    function readFileAsAttachment(file) {
+      if (!isAcceptedImageFile(file)) return Promise.resolve(null);
+      if (file.size > MAX_IMAGE_BYTES) return Promise.resolve(null);
+      return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = typeof reader.result === "string" ? reader.result : "";
+          const match = /^data:([^;]+);base64,(.+)$/.exec(result);
+          if (!match) {
+            resolve(null);
+            return;
+          }
+          resolve({
+            id: crypto.randomUUID(),
+            name: file.name,
+            mimeType: match[1] ?? file.type,
+            previewUrl: result,
+            dataBase64: match[2] ?? ""
+          });
+        };
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(file);
+      });
+    }
+    async function addImageFiles(files) {
+      const remaining = MAX_IMAGE_ATTACHMENTS - imageAttachments.length;
+      if (remaining <= 0) return;
+      const parsed = (await Promise.all(Array.from(files).slice(0, remaining).map((file) => readFileAsAttachment(file)))).filter((item) => item !== null);
+      if (parsed.length === 0) return;
+      imageAttachments = [...imageAttachments, ...parsed];
+      renderImageAttachmentChips();
+    }
+    function removeImageAttachment(id) {
+      imageAttachments = imageAttachments.filter((item) => item.id !== id);
+      renderImageAttachmentChips();
+    }
+    function clearImageAttachments() {
+      imageAttachments = [];
+      renderImageAttachmentChips();
+    }
+    function renderImageAttachmentChips() {
+      imageAttachmentChipsEl.innerHTML = "";
+      if (imageAttachments.length === 0) {
+        imageAttachmentChipsEl.hidden = true;
+        return;
+      }
+      imageAttachmentChipsEl.hidden = false;
+      for (const attachment of imageAttachments) {
+        const chip = document.createElement("span");
+        chip.className = "image-attachment-chip";
+        chip.title = attachment.name;
+        const img = document.createElement("img");
+        img.src = attachment.previewUrl;
+        img.alt = attachment.name;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.setAttribute("aria-label", `Remove ${attachment.name}`);
+        remove.textContent = "\xD7";
+        remove.addEventListener("click", () => removeImageAttachment(attachment.id));
+        chip.appendChild(img);
+        chip.appendChild(remove);
+        imageAttachmentChipsEl.appendChild(chip);
+      }
+    }
+    function setImageDragOver(active) {
+      imageDropOverlayEl.hidden = !active;
+      imageDropOverlayEl.setAttribute("aria-hidden", active ? "false" : "true");
+    }
+    function hasDraggedImage(dataTransfer) {
+      if (!dataTransfer) return false;
+      if (Array.from(dataTransfer.items).some(
+        (item) => item.kind === "file" && item.type.startsWith("image/")
+      )) {
+        return true;
+      }
+      return Array.from(dataTransfer.files).some((file) => isAcceptedImageFile(file));
+    }
     const MULTITASK_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="6.25" cy="9" r="3.75"/><circle cx="9.75" cy="7" r="3.75"/></svg>';
     function renderBackgroundWork() {
       backgroundWorkEl?.remove();
@@ -827,6 +1110,7 @@
       for (const item of composerPlusMenu.querySelectorAll(".plus-menu-item")) {
         const pick = item.dataset.pick;
         const check = item.querySelector(".plus-menu-check");
+        if (!check) continue;
         const active = pick === "multitask" ? multitaskMode : pick === currentMode;
         check.hidden = !active;
       }
@@ -921,7 +1205,7 @@
       if (!multitaskChipEl) {
         multitaskChipEl = document.createElement("span");
         multitaskChipEl.className = "composer-mode-chip multitask";
-        multitaskChipEl.title = "Run isolated background coding agents safely, one at a time";
+        multitaskChipEl.title = "Run parallel Multitask agents in isolated git worktrees with sibling messaging";
         multitaskChipEl.innerHTML = MULTITASK_ICON + '<span class="composer-mode-chip-label">Multitask</span><button type="button" class="composer-mode-chip-dismiss" aria-label="Turn off Multitask">\xD7</button>';
         multitaskChipEl.querySelector(".composer-mode-chip-dismiss")?.addEventListener("click", () => {
           disableMultitask();
@@ -932,9 +1216,14 @@
     function multitaskActivityStatus() {
       const running = multitaskTasks.filter((task) => task.status === "running").length;
       const waiting = multitaskTasks.filter((task) => task.status === "waiting").length;
-      if (running && waiting) return `${running} working \xB7 ${waiting} waiting`;
-      if (running) return `${running} working`;
-      if (waiting) return `${waiting} starting up`;
+      const done = multitaskTasks.filter(
+        (task) => task.status === "completed" || task.status === "failed" || task.status === "cancelled" || task.status === "interrupted"
+      ).length;
+      const parts = [];
+      if (running) parts.push(`${running} working`);
+      if (waiting) parts.push(`${waiting} waiting`);
+      if (done && (running || waiting)) parts.push(`${done} done`);
+      if (parts.length) return parts.join(" \xB7 ");
       return "Planning next moves\u2026";
     }
     function renderMultitaskActivity() {
@@ -971,9 +1260,9 @@
     }
     function multitaskRunStatus(task) {
       if (task.status !== "waiting") return multitaskStatusLabel(task.status);
-      const hasRunningTask = multitaskTasks.some((candidate) => candidate.status === "running");
-      const firstWaitingTask = multitaskTasks.find((candidate) => candidate.status === "waiting");
-      return !hasRunningTask && firstWaitingTask?.id === task.id ? "Starting up" : "Waiting for model/subagent";
+      const runningCount = multitaskTasks.filter((candidate) => candidate.status === "running").length;
+      if (runningCount === 0) return "Starting up";
+      return "Queued for a free model slot";
     }
     function isFinishedMultitaskStatus(status) {
       return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
@@ -1082,7 +1371,7 @@
         }
         row.className = "multitask-run-row " + task.status;
         row.querySelector(".multitask-run-title").textContent = task.name || "New subagent";
-        row.querySelector(".multitask-run-status").textContent = task.currentAction || multitaskRunStatus(task);
+        row.querySelector(".multitask-run-status").textContent = task.currentAction || (task.worktreeBranch && task.status === "waiting" ? `${multitaskRunStatus(task)} \xB7 ${task.worktreeBranch}` : multitaskRunStatus(task));
         row.querySelector(".multitask-run-prompt").textContent = task.text;
         const steer = row.querySelector(".multitask-steer");
         steer.hidden = task.status !== "waiting" || !multitaskTasks.some((candidate) => candidate.status === "running");
@@ -1094,10 +1383,17 @@
     function dispatch(text, mode) {
       isBusy = true;
       hideWelcome();
-      addBubble("user", text);
+      const images = [...imageAttachments];
+      addBubble("user", text, images);
+      clearImageAttachments();
       showSpinner();
       renderMultitaskActivity();
-      vscode.postMessage({ type: "send", text, mode });
+      vscode.postMessage({
+        type: "send",
+        text,
+        mode,
+        images: images.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 }))
+      });
     }
     function drainQueue() {
       if (isBusy || queue.length === 0) return;
@@ -1321,6 +1617,8 @@
         if (pick === "multitask") {
           if (multitaskMode) disableMultitask();
           else enableMultitask();
+        } else if (pick === "attach-image") {
+          imageFileInputEl.click();
         } else if (pick && pick in MODE_ICONS) {
           setMode(pick);
         }
@@ -1333,17 +1631,26 @@
     renderPlusMenu();
     function send() {
       const text = inputEl.value.trim();
-      if (!text) {
+      const hasImages = imageAttachments.length > 0;
+      if (!text && !hasImages) {
         if (isBusy && queue.length > 0) sendQueuedNow();
         return;
       }
       inputEl.value = "";
       if (multitaskMode) {
+        if (hasImages) {
+          const row = document.createElement("div");
+          row.className = "notice-row";
+          row.textContent = "Image attachments are not supported in Multitask mode yet.";
+          messagesEl.appendChild(row);
+          scrollDown();
+          return;
+        }
         hideWelcome();
         vscode.postMessage({ type: "multitask-enqueue", text, mode: currentMode });
         return;
       }
-      dispatch(text, currentMode);
+      dispatch(text || "Describe this image.", currentMode);
     }
     sendBtn.addEventListener("click", send);
     inputEl.addEventListener("keydown", (event) => {
@@ -1352,26 +1659,68 @@
         send();
       }
     });
+    inputEl.addEventListener("paste", (event) => {
+      const items = event.clipboardData?.items;
+      if (!items) return;
+      const files = [];
+      for (const item of items) {
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      }
+      if (files.length === 0) return;
+      event.preventDefault();
+      void addImageFiles(files);
+    });
+    imageFileInputEl.addEventListener("change", () => {
+      if (imageFileInputEl.files?.length) void addImageFiles(imageFileInputEl.files);
+      imageFileInputEl.value = "";
+    });
+    composerEl.addEventListener("dragenter", (event) => {
+      if (!hasDraggedImage(event.dataTransfer)) return;
+      event.preventDefault();
+      imageDragDepth += 1;
+      if (imageDragDepth === 1) setImageDragOver(true);
+    });
+    composerEl.addEventListener("dragover", (event) => {
+      if (!hasDraggedImage(event.dataTransfer)) return;
+      event.preventDefault();
+    });
+    composerEl.addEventListener("dragleave", (event) => {
+      if (imageDragDepth === 0) return;
+      event.preventDefault();
+      imageDragDepth = Math.max(0, imageDragDepth - 1);
+      if (imageDragDepth === 0) setImageDragOver(false);
+    });
+    composerEl.addEventListener("drop", (event) => {
+      imageDragDepth = 0;
+      setImageDragOver(false);
+      const files = [];
+      if (event.dataTransfer?.files.length) {
+        files.push(...Array.from(event.dataTransfer.files));
+      } else if (event.dataTransfer?.items) {
+        for (const item of event.dataTransfer.items) {
+          if (item.kind !== "file") continue;
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      }
+      const imageFiles = files.filter((file) => isAcceptedImageFile(file));
+      if (imageFiles.length === 0) return;
+      event.preventDefault();
+      void addImageFiles(imageFiles);
+    });
     stopBtn.addEventListener("click", () => vscode.postMessage({ type: "stop" }));
     undoBtn.addEventListener("click", () => {
       if (pendingUndoSha) vscode.postMessage({ type: "restore", sha: pendingUndoSha });
     });
-    newBtn.addEventListener("click", () => vscode.postMessage({ type: "new" }));
-    connectBtn.addEventListener("click", () => vscode.postMessage({ type: "connect" }));
-    settingsBtn.addEventListener("click", () => vscode.postMessage({ type: "settings" }));
-    const historyBtn = document.getElementById("history-btn");
-    const historyView = document.getElementById("history-view");
     const histBack = document.getElementById("hist-back");
     const histSearch = document.getElementById("hist-search");
     const histScope = document.getElementById("hist-scope");
     const histSort = document.getElementById("hist-sort");
     const histList = document.getElementById("hist-list");
     let histChats = [];
-    function openHistory() {
-      document.body.classList.add("history-open");
-      historyView.hidden = false;
-      vscode.postMessage({ type: "history" });
-    }
     function closeHistory() {
       document.body.classList.remove("history-open");
       historyView.hidden = true;
@@ -1443,7 +1792,6 @@
         histList.appendChild(row);
       }
     }
-    historyBtn.addEventListener("click", openHistory);
     histBack.addEventListener("click", closeHistory);
     histSearch.addEventListener("input", renderHistory);
     histScope.addEventListener("change", renderHistory);
@@ -1484,6 +1832,7 @@
       const msg = event.data;
       switch (msg.type) {
         case "state": {
+          applyTheme(msg.theme);
           backendChip.hidden = !msg.model;
           backendChip.textContent = msg.model;
           backendChip.title = msg.backend;
@@ -1497,6 +1846,7 @@
             hybridModelLabel.textContent = msg.hybridActiveLabel && msg.hybridActiveLabel !== "Hybrid" ? " \xB7 " + msg.hybridActiveLabel : "";
           }
           renderHybridMenu(msg.hybridModels ?? [], !!msg.hybridEnabled);
+          imageSupport = msg.imageSupport ?? "non-vision-model";
           isBusy = msg.busy;
           workElsewhere = Number(msg.workElsewhere ?? 0);
           sendBtn.disabled = false;
@@ -1542,9 +1892,8 @@
           row.classList.add(msg.ok ? "ok" : "failed");
           const status = row.querySelector(".acc-status");
           if (status) status.textContent = msg.ok ? "\u2713" : "\u2717";
-          if (msg.viaTrie && turnSession && typeof msg.trieMs === "number" && typeof msg.scanMs === "number") {
-            turnSession.trieSavedMs += Math.max(0, msg.scanMs - msg.trieMs);
-            refreshTurnSummary();
+          if (msg.viaTrie && typeof msg.trieMs === "number") {
+            attachTrieBadge(row, msg.trieMs, msg.scanMs);
           }
           if (!msg.ok) {
             row.classList.add("failed");

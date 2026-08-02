@@ -7,7 +7,7 @@ import * as vscode from 'vscode'
 import type { ChatTurn } from '../inference/types'
 
 export type TranscriptEntry =
-  | { role: 'user' | 'reply' | 'error'; text: string; failed?: boolean }
+  | { role: 'user' | 'reply' | 'error'; text: string; failed?: boolean; imageNames?: string[] }
   | {
       role: 'activity'
       /** Serializable provider event replayed to reconstruct tool/review UI. */

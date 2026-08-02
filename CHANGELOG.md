@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.4.88
+
+- **Release packaging:** ships LLM-as-judge recommendation finishes (light intent routing, judge + one feedback rewrite, no fixed recommendation template).
+
+## 0.4.87
+
+- **LLM-as-judge for recommendations:** recommendation asks use a light intent note only (no fixed “4–7 bullets” template). At finish, an LLM judge scores whether the draft is actionable advice; if not, one rewrite uses the judge’s feedback. Deterministic keyword checklists and hardcoded fallback recommendation lists are gone.
+
+## 0.4.86
+
+- **Prompt routing for recommendations:** recommend/suggest/improve asks get an explicit turn brief up front (explore briefly → prioritized advice in `step_complete.summary`) so the model handles the ask correctly instead of relying on post-hoc refusal/rewrite loops. Synthesis remains only as a last-resort safety net.
+
+## 0.4.85
+
+- **Durable recommendation finishes:** when a recommend/improve ask ends in an architecture dump or `step_failed` apology, the harness does one focused rewrite from exploration notes and always returns a real recommendations answer — no refusal loops, no red “I failed” replies.
+
+## 0.4.84
+
+- **Fix: recommendation asks ending in red apologies:** refuse `step_failed` meta-failures (“I failed to provide recommendations…”) and nudge the model to `step_complete` with concrete advice. Clarifies Ask/Plan is read-only and answering in summary is enough. Caps architecture-dump refusals so the turn cannot loop into abandonment.
+
+## 0.4.83
+
+- **Fix: recommendation asks get advice, not architecture dumps:** when the user asks for recommendations/improvements, `step_complete` summaries that only map files/responsibilities (no should/recommend/improve advice) are refused and the model must return concrete prioritized recommendations.
+
+## 0.4.82
+
+- **Indexing works automatically:** `index.onStartup` defaults to on, and toggling Enable / Index-on-open starts a build immediately (no reload, no waiting for the first `search_symbols`).
+- **Fix: stale index after agent edits:** file create/change/delete watchers keep the trie current for `write_file` and external edits, not only editor saves.
+- **Fix: rebuild race:** in-flight builds are generation-cancelled so Rebuild / overlapping warm-ups cannot corrupt the trie.
+- **Fix: multi-root scope:** indexing is scoped to the primary workspace folder via `RelativePattern`.
+
+## 0.4.81
+
+- **Release packaging:** ships durable line-anchored `edit_file`, harness-assisted search recovery, plan-artifact parse/lint improvements, reply markdown blocks, and lazy-summary guards from the 0.4.78–0.4.80 cycle.
+
+## 0.4.80
+
+- **Durable edit_file:** preferred path is `startLine`/`endLine` + `replace` after `read_file` — no retyping file bytes. Search+replace remains for short unique snippets. On search miss, the harness returns the exact nearest lines plus a ready-to-use line-anchored retry. Fuzzy auto-apply removed in favor of this durable path.
+- **Plan artifact parsing:** truncated JSON is salvaged via `tryCloseTruncatedJson` before schema errors; failures name the cause (truncated vs schema vs lint); `risks`/`out_of_scope` are optional; action/file paths must be workspace-relative; parse-time lint rejects empty/whitespace fields and bad verification shapes.
+
+## 0.4.79
+
+- **edit_file just works:** a new locate tier accepts a unique near-match when the model's `search` drifts slightly from the file (a trailing comma, one reflowed line) — the search only locates the range, the original file bytes are replaced, and the result reports which lines drifted. Exact and whitespace tiers still win first; ambiguous or low-similarity searches are still refused.
+- **Truncated edits never applied:** tool output cut off mid-`search`/`replace` by the token limit is no longer force-closed into a chopped edit; the model is told to re-issue with a shorter search block.
+- **Short-search guidance:** edit_file description, failure recovery, and repair prompts now steer the model to search for only the 3-8 lines being changed instead of whole functions.
+- **Reply markdown blocks:** headers (`###`), numbered lists, and bullet lists in final replies now render as real headings and lists instead of raw text.
+
+## 0.4.78
+
+- **Fix: lazy step_complete answers:** the agent now refuses placeholder summaries (`Here are ...`, teaser text) and recommendation requests that skip codebase exploration. The model must read/search the repo first, then finish with a real answer.
+- **Empty turn accordions hidden:** turns with no tool activity no longer show a bare "Worked for Ns" accordion — only turns with exploration, edits, commands, todos, or hybrid notes keep the activity chip.
+
+## 0.4.77
+
+- **Assistant reply formatting:** final summaries now render inline markdown — `**bold**`, `*italic*`, `` `code` ``, and links — instead of showing raw markers.
+- **Fix: malformed tool calls:** the agent parser no longer grabs bare `{path, startLine}` args objects as the tool call (which produced `Unknown tool: undefined`). It now picks the best `{thought, tool, args}` envelope, recovers args-only payloads, accepts alternate field names (`action`, `arguments`), and handles OpenAI native `tool_calls` streams on LLM API backends.
+- **Turn accordions closed by default:** "Worked for…" and nested exploration/edit groups start collapsed; expand to inspect.
+- **Trie savings per search:** purple "Trie saved …" chips now appear on the grep/search row that used the symbol index, instead of accumulating in the turn header where they are easy to miss while scrolling.
+
+## 0.4.76
+
+- **Fix: header toolbar clicks:** the Image… composer menu item no longer crashes webview init (missing checkmark on a non-toggle row), so Connect, Settings, History, and New chat stay wired. Header listeners register first so a later init error cannot leave them dead.
+- **VS Code theme sync:** chat and settings webviews follow the editor light/dark theme and update live when you change color theme.
+
+## 0.4.75
+
+- **Composer overlay fix:** the image drop target stays hidden during normal chat and appears only while an image file is dragged over the composer.
+
+## 0.4.74
+
+- **Image attachments (release):** ships composer drag-and-drop, paste, file picker, thumbnail chips, user-bubble previews, and multimodal LLM API inference with vision-aware gating for local and cloud backends.
+
+## 0.4.73
+
+- **Image attachments in the composer:** drag-and-drop, paste, or pick images from the **+** menu. Thumbnails appear above the input and in the user bubble when sent.
+- **Vision-aware gating:** LLM API / hybrid backends send multimodal `image_url` payloads to vision-capable cloud or local OpenAI-compatible servers (Ollama, LM Studio, etc.). Non-vision local models and the embedded daemon are blocked with clear errors until local VL inference is wired.
+
+## 0.4.72
+
+- **True parallel Multitask:** Architecture, Implementation, and Verification agents now start together instead of waiting on each other. API/hybrid backends run up to six concurrent model turns; daemon backends still serialize generation but keep isolated worktrees.
+- **Git worktree isolation:** code-mode Multitask provisions one worktree per sibling under `.trie-ide/multitask/…`, commits child edits on `trie/mt/…` branches, and merges them back into the primary workspace when all children finish.
+- **Sibling messaging and path claims:** Multitask children can `post_finding`, `read_sibling_updates`, and `claim_paths` / `release_paths`. Mutating tools refuse paths claimed by another sibling to reduce merge conflicts.
+- **Hybrid decompose hang fix:** frontier decomposition now times out after 30s and is skipped for Multitask children so runs no longer stall indefinitely on “Breaking the task into steps…”.
+
+## 0.4.71
+
+- **Repository-local web-search gate:** configured web search is now authorized per active user request at execution time. Ordinary implementation, debugging, architecture, and repository exploration remain local after no-match searches; explicit web research and current external facts still work.
+- **New-feature discovery pivot:** add/implement/build requests treat absent feature symbols as expected, bound repeated equivalent searches, and direct the agent to composer/webview/provider or other integration files before planning or editing.
+- **Hybrid stuck recovery and bounded generation:** repeated no-result discovery, denied unnecessary web search, and generation timeouts trigger at most one Hybrid recovery instruction per turn when configured, inject it into the local transcript, and continue. Generation now times out clearly instead of leaving “Planning next moves…” active indefinitely.
+
 ## 0.4.70
 
 - **Smart rendered-UI verification:** the agent now distinguishes consequential UI/webview behavior from cosmetic presentation, proactively finds and uses existing visual/e2e/component harnesses, and creates a narrow reusable harness only when rendered behavior cannot otherwise be verified.

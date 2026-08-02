@@ -8,6 +8,8 @@
  * and refused by the loop).
  */
 import { isWebSearchConfigured, readConfig } from '../config'
+import { recommendationTaskNote } from './taskIntent'
+import { webSearchTaskNote } from './webSearchIntent'
 import { TOOL_SPECS } from './tools'
 
 export type AgentMode = 'code' | 'plan' | 'ask'
@@ -19,7 +21,8 @@ export function isReadOnlyMode(mode: AgentMode): boolean {
 const MODE_RULES: Record<AgentMode, string[]> = {
   code: [
     '- Read a file before editing it. Keep edits minimal; do not refactor beyond the task.',
-    '- If edit_file fails, do not retry the same guessed/truncated search. Follow its recovery instruction: read_file the exact reported line range, then copy that text exactly; use write_file only when intentionally replacing the whole file.',
+    '- For add/implement/build requests, missing matching symbols usually means the feature is new. After at most two targeted no-match searches, inspect likely integration files and architecture, then implement; do not keep broadening feature-name searches.',
+    '- Prefer edit_file with startLine/endLine + replace after read_file (durable; no retyping file bytes). search+replace is fine for short unique snippets. If edit_file fails, follow its recovery: use the reported startLine/endLine with replace — do not retry a guessed search.',
     '- Complex ask (3+ distinct steps)? FIRST call update_todos with the full task list, then work through it. After finishing each item, call update_todos again moving it to `done`. Skip the list for trivial one-step tasks.',
     '- When done, call step_complete — its summary is your answer to the user.',
     '- If the request is a question, answer it in step_complete.summary instead of editing files.',
@@ -45,10 +48,16 @@ const MODE_RULES: Record<AgentMode, string[]> = {
   ],
 }
 
+/** Intent-specific turn framing (web search, recommendations, …). */
+export function buildTaskNotes(task: string, mode: AgentMode): string {
+  return [webSearchTaskNote(task), recommendationTaskNote(task, mode)].filter(Boolean).join('\n\n')
+}
+
 function webSearchRules(webSearchOn: boolean): string[] {
   if (webSearchOn) {
     return [
-      '- Questions about research papers, current docs, APIs, libraries, or anything outside this repo: call web_search (one or more queries) before step_complete.',
+      '- Call web_search only when the active user request explicitly asks to search/research/browse the web or genuinely requires current/external factual information. Ordinary implementation, debugging, architecture, and repo exploration stay local even after no-match searches.',
+      '- Prefer repository files, installed package types, and local documentation before external docs.',
       '- In step_complete.summary, list concrete links — each result as "Title — https://…" with the full URL. Do not substitute keyword lists or tell the user to search manually.',
     ]
   }
@@ -57,12 +66,25 @@ function webSearchRules(webSearchOn: boolean): string[] {
   ]
 }
 
-export function agentSystemPrompt(mode: AgentMode = 'code'): string {
+export function agentSystemPrompt(
+  mode: AgentMode = 'code',
+  options: { multitask?: boolean } = {},
+): string {
   const webSearchOn = isWebSearchConfigured(readConfig())
   const specs = TOOL_SPECS.filter(
-    (t) => (!isReadOnlyMode(mode) || !t.mutating) && (t.name !== 'web_search' || webSearchOn),
+    (t) =>
+      (!isReadOnlyMode(mode) || !t.mutating) &&
+      (t.name !== 'web_search' || webSearchOn) &&
+      (!t.multitaskOnly || options.multitask),
   )
   const toolLines = specs.map((t) => `- ${t.name} ${t.signature} — ${t.description}`).join('\n')
+  const multitaskRules = options.multitask
+    ? [
+        '- You are one parallel Multitask sibling. Do not wait for other agents to finish.',
+        '- Use post_finding and read_sibling_updates to coordinate. Respect claim_paths ownership before editing.',
+        '- Edits apply in your isolated worktree; path claims reduce merge conflicts with siblings.',
+      ]
+    : []
   return [
     "You are Trie Coding Agent, a coding agent working inside the user's editor workspace.",
     '',
@@ -77,6 +99,7 @@ export function agentSystemPrompt(mode: AgentMode = 'code'): string {
     '- Paths are relative to the workspace root.',
     ...MODE_RULES[mode],
     ...webSearchRules(webSearchOn),
+    ...multitaskRules,
     '- Interpret obvious typos in the task; call step_failed only when truly blocked.',
   ].join('\n')
 }
@@ -91,7 +114,7 @@ export function agentUserPrompt(task: string, workspaceContext: string, extraNot
 export function toolResultTurn(toolName: string, ok: boolean, result: string): string {
   const recovery =
     !ok && toolName === 'edit_file'
-      ? '\n\nREQUIRED NEXT STEP: read_file the exact reported line range before another edit_file call. Do not retry the previous search.'
+      ? '\n\nREQUIRED NEXT STEP: call edit_file with the reported startLine/endLine and your replace content (omit search). Do not retry the previous search string.'
       : ''
   return `${ok ? 'Result' : 'FAILED result'} of ${toolName}:\n${result}${recovery}`
 }

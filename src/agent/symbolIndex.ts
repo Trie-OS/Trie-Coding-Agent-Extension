@@ -8,8 +8,9 @@
  * scan), and `grep` consults it first for plain-identifier queries so "where
  * is X declared" is answered from the index instead of a full file walk.
  *
- * Built lazily on the first query, updated incrementally on file save,
- * never on activation — an idle extension costs nothing.
+ * Built on startup when configured (default), otherwise lazily on the first
+ * query. Updated incrementally on save / create / delete / rename — including
+ * agent write_file edits that never open a text document.
  */
 import * as fs from 'node:fs'
 import * as path from 'node:path'
@@ -322,16 +323,29 @@ function emitIndexStatus(root: string, index: WorkspaceSymbolIndex): void {
 export class WorkspaceSymbolIndex {
   private readonly trie = new SymbolTrie()
   private built: Promise<void> | null = null
-  private saveListener: vscode.Disposable | null = null
+  private watchers: vscode.Disposable[] = []
   private state: IndexStatus['state'] = 'standby'
   private fileCount = 0
   private totalFiles: number | null = null
   private buildMs = 0
+  /** Bumps on every rebuild so an older in-flight build cannot finish over a newer one. */
+  private generation = 0
 
   constructor(private readonly root: string) {}
 
   private notifyStatus(): void {
     emitIndexStatus(this.root, this)
+  }
+
+  private toRel(absolute: string): string | null {
+    const rel = path.relative(this.root, absolute)
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null
+    return rel.split(path.sep).join('/')
+  }
+
+  private isIndexable(relPath: string): boolean {
+    const ext = relPath.split('.').pop()?.toLowerCase() ?? ''
+    return INDEXABLE_EXTENSIONS.includes(ext)
   }
 
   /**
@@ -363,64 +377,109 @@ export class WorkspaceSymbolIndex {
 
   /** Drop everything and re-scan the workspace from scratch. */
   async rebuild(): Promise<void> {
+    this.generation += 1
     this.trie.clear()
     this.fileCount = 0
     this.totalFiles = null
     this.buildMs = 0
-    this.state = 'standby'
-    this.built = this.build()
+    this.built = this.build(this.generation)
     await this.built
   }
 
   dispose(): void {
-    this.saveListener?.dispose()
-    this.saveListener = null
+    this.generation += 1
+    for (const d of this.watchers) d.dispose()
+    this.watchers = []
   }
 
   private ensureBuilt(): Promise<void> {
-    this.built ??= this.build()
+    this.built ??= this.build(++this.generation)
     return this.built
   }
 
-  private async build(): Promise<void> {
+  private ensureWatchers(): void {
+    if (this.watchers.length > 0) return
+    const pattern = new vscode.RelativePattern(
+      this.root,
+      `**/*.{${INDEXABLE_EXTENSIONS.join(',')}}`,
+    )
+    const watcher = vscode.workspace.createFileSystemWatcher(pattern)
+    const refresh = (uri: vscode.Uri): void => {
+      void this.refreshPath(uri.fsPath)
+    }
+    const remove = (uri: vscode.Uri): void => {
+      const rel = this.toRel(uri.fsPath)
+      if (!rel) return
+      this.trie.removePath(rel)
+      this.notifyStatus()
+    }
+    this.watchers = [
+      watcher,
+      watcher.onDidCreate(refresh),
+      watcher.onDidChange(refresh),
+      watcher.onDidDelete(remove),
+      // Covers editor saves; watcher covers agent write_file / external edits.
+      vscode.workspace.onDidSaveTextDocument((doc) => refresh(doc.uri)),
+    ]
+  }
+
+  private async refreshPath(absolute: string): Promise<void> {
+    if (this.state === 'indexing') return
+    const rel = this.toRel(absolute)
+    if (!rel || !this.isIndexable(rel)) return
+    this.trie.removePath(rel)
+    const inserted = await this.indexFile(absolute)
+    if (inserted && this.state === 'ready') this.notifyStatus()
+  }
+
+  private async build(generation: number): Promise<void> {
     this.state = 'indexing'
     this.fileCount = 0
     this.totalFiles = null
     this.notifyStatus()
     const start = Date.now()
     const pattern = `**/*.{${INDEXABLE_EXTENSIONS.join(',')}}`
-    const uris = await vscode.workspace.findFiles(pattern, INDEX_EXCLUDE, MAX_INDEXED_FILES)
+    const uris = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(this.root, pattern),
+      INDEX_EXCLUDE,
+      MAX_INDEXED_FILES,
+    )
+    if (generation !== this.generation) return
     this.totalFiles = uris.length
     this.notifyStatus()
+    let indexedFiles = 0
     for (const uri of uris) {
-      await this.indexFile(uri.fsPath)
-      this.fileCount++
+      if (generation !== this.generation) return
+      const inserted = await this.indexFile(uri.fsPath)
+      if (inserted) indexedFiles++
+      this.fileCount = indexedFiles
       if (this.fileCount % 5 === 0 || this.fileCount === this.totalFiles) {
         this.notifyStatus()
       }
     }
+    if (generation !== this.generation) return
+    this.fileCount = indexedFiles
     this.buildMs = Date.now() - start
     this.state = 'ready'
     this.notifyStatus()
-    this.saveListener ??= vscode.workspace.onDidSaveTextDocument((doc) => {
-      const rel = path.relative(this.root, doc.uri.fsPath)
-      if (rel.startsWith('..')) return
-      this.trie.removePath(rel)
-      void this.indexFile(doc.uri.fsPath)
-    })
+    this.ensureWatchers()
   }
 
-  private async indexFile(absolute: string): Promise<void> {
-    const rel = path.relative(this.root, absolute)
+  /** Returns true when the file was scanned (even if it had no declarations). */
+  private async indexFile(absolute: string): Promise<boolean> {
+    const rel = this.toRel(absolute)
+    if (!rel) return false
     try {
       const stat = await fs.promises.stat(absolute)
-      if (stat.size > MAX_INDEXED_FILE_BYTES) return
+      if (stat.size > MAX_INDEXED_FILE_BYTES) return false
       const content = await fs.promises.readFile(absolute, 'utf8')
       for (const sym of scanSymbols(rel, content)) {
         this.trie.insert({ path: rel, line: sym.line, kind: sym.kind, name: sym.name })
       }
+      return true
     } catch {
       // Unreadable file: skip. The index reports what it can see, only that.
+      return false
     }
   }
 }
@@ -435,6 +494,19 @@ export function getSymbolIndex(root: string): WorkspaceSymbolIndex {
     indexes.set(root, index)
   }
   return index
+}
+
+/** Start indexing when enabled (+ on-startup, or always if `force`). */
+export function warmUpSymbolIndex(options: {
+  enabled: boolean
+  onStartup: boolean
+  force?: boolean
+}): void {
+  const folder = vscode.workspace.workspaceFolders?.[0]
+  if (!folder) return
+  if (!options.enabled) return
+  if (!options.force && !options.onStartup) return
+  void getSymbolIndex(folder.uri.fsPath).warmUp()
 }
 
 /** True for queries like `useTheme` / `parse_tool_call` — the trie fast path. */

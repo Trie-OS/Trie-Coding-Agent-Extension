@@ -5,14 +5,24 @@ import { readConfig, setFrontierSelection, setHybridEnabled, hybridActiveLabel, 
 import { ShadowRepo, type ChangedFileStat } from '../agent/checkpoints'
 import { FrontierAssist, type GuideNote } from '../agent/frontierAssist'
 import { AgentSession } from '../agent/loop'
+import { MultitaskBus } from '../agent/multitaskBus'
 import type { AgentMode } from '../agent/prompts'
 import type { ToolCall } from '../agent/tools'
 import { formatToolRow, toolGroupKey, toolLineDelta } from '../agent/tools'
 import { summaryClaimsFileChanges } from '../agent/taskIntent'
+import { WorktreeManager } from '../agent/worktrees'
 import { DaemonClient } from '../inference/daemonClient'
+import {
+  extensionImageAttachmentSupport,
+  imageAttachmentsBlockedMessage,
+  type ImageAttachmentSupport,
+} from '../inference/modelVision'
 import { OpenAiCompatibleClient } from '../inference/openaiClient'
-import type { InferenceClient } from '../inference/types'
+import type { ChatTurnImage, InferenceClient } from '../inference/types'
 import { ChatStore, type ChatSummary, type TranscriptEntry } from './chatStore'
+import { webviewTheme, type WebviewTheme } from '../theme'
+
+const MULTITASK_MAX_CONCURRENCY = 6
 
 type ToWebview =
   | {
@@ -24,6 +34,8 @@ type ToWebview =
       hybridModels: { label: string; slot: number; modelIndex: number; active: boolean }[]
       busy: boolean
       workElsewhere: number
+      imageSupport: ImageAttachmentSupport
+      theme: WebviewTheme
     }
   | { type: 'tool-call'; id: number; tool: string; args: string; rowLabel: string; thought: string; groupKey?: string; linesAdded?: number; linesDeleted?: number }
   | { type: 'tool-result'; id: number; ok: boolean; summary: string; viaTrie?: boolean; trieMs?: number; scanMs?: number }
@@ -47,7 +59,7 @@ const CHECKPOINT_SCHEME = 'trie-checkpoint'
 
 type FromWebview =
   | { type: 'init' }
-  | { type: 'send'; text: string; mode?: AgentMode }
+  | { type: 'send'; text: string; mode?: AgentMode; images?: ChatTurnImage[] }
   | { type: 'stop' }
   | { type: 'new' }
   | { type: 'connect' }
@@ -75,13 +87,15 @@ interface MultitaskTask {
   mode: AgentMode
   status: MultitaskStatus
   currentAction?: string
-  kind: 'child' | 'coordinator'
+  kind: 'child' | 'coordinator' | 'integrator'
   createdAt: number
   startedAt?: number
   finishedAt?: number
   result?: string
   session?: AgentSession
   chatId: string
+  worktreePath?: string
+  worktreeBranch?: string
 }
 
 type MultitaskTaskView = Omit<MultitaskTask, 'session'>
@@ -93,6 +107,11 @@ interface MultitaskParent {
   chatId: string
   children: MultitaskTask[]
   cancelled: boolean
+  bus?: MultitaskBus
+  worktrees?: WorktreeManager
+  integrateSummary?: string
+  concurrencyNote?: string
+  finalizing?: boolean
 }
 
 interface ChatRuntime {
@@ -109,6 +128,7 @@ interface RunRequest {
   text: string
   mode: AgentMode
   session: AgentSession
+  images?: ChatTurnImage[]
   multitask?: MultitaskTask
   multitaskParent?: MultitaskParent
   internal?: boolean
@@ -130,10 +150,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly runtimes = new Map<string, ChatRuntime>()
   private selectedChatId: string | null = null
   private readonly runQueue: RunRequest[] = []
-  private activeRun: RunRequest | null = null
+  private readonly activeRuns = new Map<string, RunRequest>()
   private readonly multitaskTasks: MultitaskTask[] = []
   private readonly multitaskParents = new Map<string, MultitaskParent>()
-  private activeMultitaskId: string | null = null
 
   private log(message: string): void {
     this.output.appendLine(`[${new Date().toISOString()}] ${message}`)
@@ -146,6 +165,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly extensionUri: vscode.Uri,
     storageUri: vscode.Uri,
     private readonly onStatusChanged: (label: string) => void,
+    private readonly getDaemonClient?: () => DaemonClient,
   ) {
     this.store = new ChatStore(storageUri)
     // Read-only "file as it was at the checkpoint" documents, the left side
@@ -209,7 +229,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private isRuntimeBusy(runtime: ChatRuntime | null): boolean {
-    return !!runtime && (runtime.pendingRuns > 0 || this.activeRun?.runtime.id === runtime.id)
+    if (!runtime) return false
+    if (runtime.pendingRuns > 0) return true
+    for (const request of this.activeRuns.values()) {
+      if (request.runtime.id === runtime.id) return true
+    }
+    return false
+  }
+
+  private maxRunConcurrency(): number {
+    return readConfig().backend === 'daemon' ? 1 : MULTITASK_MAX_CONCURRENCY
   }
 
   private postFor(runtime: ChatRuntime, message: ToWebview): void {
@@ -261,6 +290,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const workElsewhere = [...this.runtimes.values()].filter(
       (runtime) => runtime.id !== this.selectedChatId && this.isRuntimeBusy(runtime),
     ).length
+    const imageSupport = extensionImageAttachmentSupport(
+      cfg.backend,
+      cfg.backend === 'daemon' ? this.daemonClient?.loadedModel() ?? null : null,
+    )
     this.post({
       type: 'state',
       backend: cfg.backend === 'daemon' ? 'Trie IDE daemon' : 'LLM API',
@@ -270,6 +303,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       hybridModels,
       busy: this.isRuntimeBusy(selected),
       workElsewhere,
+      imageSupport,
+      theme: webviewTheme(),
     })
     this.onStatusChanged(model)
   }
@@ -330,61 +365,236 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private childAssignments(count: number): { name: string; focus: string }[] {
     if (count === 1) return [{ name: 'Primary agent', focus: 'Own the requested task end to end.' }]
     const focuses = [
-      'Map the relevant architecture, entry points, state ownership, and cross-file data flow.',
-      'Inspect the core implementation for correctness, races, lifecycle bugs, and unsafe assumptions.',
-      'Audit edge cases, cancellation/error paths, persistence, accessibility, and test coverage.',
-      'Trace integration boundaries and look for regressions or compatibility risks.',
-      'Independently challenge earlier findings and verify the highest-risk claims with concrete evidence.',
-      'Review validation, build, and release concerns; identify gaps that could escape normal testing.',
+      'Map architecture, entry points, and ownership. Prefer read/analysis; claim interface files before light edits. Post findings on the sibling bus immediately.',
+      'Implement or fix core logic. Claim paths before editing; read sibling findings via read_sibling_updates; do not wait for Architecture to finish.',
+      'Audit edge cases and verification. Prefer claiming/editing tests; challenge sibling claims with concrete evidence from the bus.',
+      'Trace integration boundaries for regressions. Coordinate via the bus; claim only paths you will change.',
+      'Adversarially challenge the highest-risk sibling findings with independent evidence. Prefer read-only unless a small proof edit is needed.',
+      'Review validation/build/release gaps. Claim CI/config paths only when necessary; post release risks on the bus.',
     ]
     return Array.from({ length: count }, (_, index) => ({
       name: `Agent ${index + 1} · ${['Architecture', 'Implementation', 'Verification', 'Integration', 'Adversarial review', 'Release'][index]}`,
-      focus: `${focuses[index]} Coordinate by reporting concise structured findings for the next sibling and final coordinator.`,
+      focus: `${focuses[index]} Work in parallel with siblings; communicate via post_finding / claim_paths / read_sibling_updates.`,
     }))
   }
 
   private childPrompt(parent: MultitaskParent, child: MultitaskTask): string {
-    const completed = parent.children
-      .filter((candidate) => candidate.kind === 'child' && candidate.result)
-      .map((candidate) => `${candidate.name}:\n${candidate.result}`)
+    const siblings = parent.children
+      .filter((candidate) => candidate.kind === 'child' && candidate.id !== child.id)
+      .map((candidate) => candidate.name)
+    const busDigest = parent.bus?.digest() ?? 'No sibling bus.'
     return [
-      `You are ${child.name}, one isolated child in a coordinated Multitask run.`,
+      `You are ${child.name}, one parallel child in a coordinated Multitask run.`,
       `Parent request: ${parent.text}`,
       `Your assigned focus: ${child.text}`,
-      completed.length
-        ? `Structured findings from completed siblings (verify and build on them; do not merely repeat):\n${completed.join('\n\n')}`
-        : 'No sibling has completed yet. Establish concrete findings for the agents that follow.',
-      'Finish with a concise structured report: scope examined, evidence (paths/symbols), findings or changes, verification, and handoff notes.',
-    ].join('\n\n')
+      child.worktreeBranch
+        ? `Your isolated git worktree branch: ${child.worktreeBranch}. Edits stay local until integration merges sibling branches.`
+        : 'You share the primary workspace in read-oriented mode — avoid conflicting edits; use the sibling bus.',
+      siblings.length ? `Sibling agents running in parallel: ${siblings.join(', ')}` : 'You are the sole child agent.',
+      parent.concurrencyNote ? `Runtime note: ${parent.concurrencyNote}` : '',
+      `Sibling bus digest:\n${busDigest}`,
+      'Do not wait for siblings to finish. Claim paths before mutating them. Finish with a concise structured report: scope, evidence (paths/symbols), findings or changes, verification, and handoff notes.',
+    ]
+      .filter(Boolean)
+      .join('\n\n')
   }
 
-  private enqueueNextChild(parent: MultitaskParent): void {
-    if (parent.cancelled) return
-    const next = parent.children.find((child) => child.kind === 'child' && child.status === 'waiting')
-    if (next) {
-      if (
-        this.activeRun?.multitask?.id === next.id ||
-        this.runQueue.some((request) => request.multitask?.id === next.id)
-      ) return
+  private enqueueMultitask(text: string, mode: AgentMode): void {
+    void this.startMultitask(text, mode)
+  }
+
+  private async startMultitask(text: string, mode: AgentMode): Promise<void> {
+    const trimmed = text.trim()
+    if (!trimmed) return
+    const folder = vscode.workspace.workspaceFolders?.[0]
+    if (!folder) {
+      this.post({ type: 'error', text: 'Open a folder first — the agent works on a workspace.' })
+      return
+    }
+    if (!this.currentClient()) {
+      this.post({ type: 'error', text: 'No backend configured. Check the Trie Coding Agent settings.' })
+      return
+    }
+
+    const runtime = this.ensureSelectedRuntime(folder)
+    const parent: MultitaskParent = {
+      id: crypto.randomUUID(),
+      text: trimmed,
+      mode,
+      chatId: runtime.id,
+      children: [],
+      cancelled: false,
+      bus: new MultitaskBus(),
+    }
+
+    const daemonSerial = readConfig().backend === 'daemon'
+    parent.concurrencyNote = daemonSerial
+      ? 'Embedded daemon is single-flight — agents are isolated in worktrees but model turns run one at a time.'
+      : 'API/hybrid backend — sibling agents run concurrently.'
+
+    const assignments = this.childAssignments(this.requestedAgentCount(trimmed))
+    // A single child can edit the primary tree; isolation is for parallel siblings.
+    const needsWorktrees = mode === 'code' && assignments.length > 1
+    let worktrees: WorktreeManager | undefined
+
+    if (needsWorktrees) {
+      const repoRoot = await WorktreeManager.resolveRepoRoot(folder.uri.fsPath)
+      if (!repoRoot) {
+        this.post({
+          type: 'error',
+          text: 'Parallel Multitask with edits requires a git repository. Open a git workspace or use Ask/Plan mode.',
+        })
+        return
+      }
+      worktrees = new WorktreeManager(repoRoot, parent.id)
+      try {
+        await worktrees.prepare()
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.post({ type: 'error', text: `Could not start parallel Multitask: ${message}` })
+        return
+      }
+      parent.worktrees = worktrees
+    }
+
+    try {
+      parent.children = []
+      for (const assignment of assignments) {
+        const id = crypto.randomUUID()
+        let root = folder.uri.fsPath
+        let branch: string | undefined
+        if (worktrees) {
+          const childWt = await worktrees.createChild(id, assignment.name)
+          root = childWt.path
+          branch = childWt.branch
+        }
+        const session = new AgentSession(
+          root,
+          folder.name,
+          new FrontierAssist(() => readConfig().frontierAssist),
+        )
+        const child: MultitaskTask = {
+          id,
+          parentId: parent.id,
+          name: assignment.name,
+          text: assignment.focus,
+          mode,
+          status: 'waiting',
+          currentAction: branch ? `Ready on ${branch}` : 'Waiting to start',
+          kind: 'child',
+          createdAt: Date.now(),
+          chatId: runtime.id,
+          session,
+          worktreePath: worktrees ? root : undefined,
+          worktreeBranch: branch,
+        }
+        session.configureMultitask({
+          agentId: child.id,
+          agentName: child.name,
+          bus: parent.bus!,
+          skipDecompose: true,
+          onBusActivity: (summary) => {
+            if (child.status !== 'running') return
+            child.currentAction = summary
+            this.pushMultitaskTasks()
+          },
+        })
+        parent.children.push(child)
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await worktrees?.cleanup(true).catch(() => undefined)
+      this.post({ type: 'error', text: `Failed to provision Multitask worktrees: ${message}` })
+      return
+    }
+
+    this.multitaskParents.set(parent.id, parent)
+    this.multitaskTasks.push(...parent.children)
+    runtime.transcript.push({ role: 'user', text: trimmed })
+    if (parent.concurrencyNote && daemonSerial) {
+      this.postFor(runtime, { type: 'notice', text: parent.concurrencyNote })
+    }
+    void this.saveChat(runtime)
+    this.pushMultitaskTasks()
+
+    // Enqueue every child up front — pumpRuns starts them up to max concurrency.
+    for (const child of parent.children) {
       this.enqueueRun(
-        this.runtimes.get(parent.chatId)!,
-        this.childPrompt(parent, next),
-        next.mode,
-        next.session!,
-        next,
+        runtime,
+        this.childPrompt(parent, child),
+        child.mode,
+        child.session!,
+        child,
         parent,
         true,
       )
+    }
+  }
+
+  private async onMultitaskChildFinished(parent: MultitaskParent): Promise<void> {
+    if (parent.cancelled || parent.finalizing) return
+    const children = parent.children.filter((child) => child.kind === 'child')
+    if (children.some((child) => child.status === 'waiting' || child.status === 'running')) return
+    if (parent.children.some((child) => child.kind === 'coordinator' || child.kind === 'integrator')) {
       return
     }
-    const children = parent.children.filter((child) => child.kind === 'child')
-    if (children.some((child) => child.status === 'running')) return
+
+    parent.finalizing = true
+    const runtime = this.runtimes.get(parent.chatId)
+    const folder = vscode.workspace.workspaceFolders?.[0]
+    if (!runtime || !folder) {
+      parent.finalizing = false
+      return
+    }
+
+    if (parent.worktrees) {
+      for (const child of children) {
+        try {
+          await parent.worktrees.commitChild(child.id, `Multitask: ${child.name}`)
+          const diff = await parent.worktrees.collectDiff(child.id)
+          if (diff) {
+            child.result = [child.result?.trim(), `Diff vs base:\n${diff}`].filter(Boolean).join('\n\n')
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          this.log(`multitask commit ${child.name} FAILED: ${message}`)
+        }
+      }
+
+      const integrate = await parent.worktrees.integrate(children.map((child) => child.id))
+      parent.integrateSummary = integrate.summary
+      const integrator: MultitaskTask = {
+        id: crypto.randomUUID(),
+        parentId: parent.id,
+        name: 'Integrator',
+        text: 'Merge sibling worktree branches into the primary workspace.',
+        mode: 'ask',
+        status: integrate.ok ? 'completed' : 'failed',
+        currentAction: integrate.ok ? 'Merged' : 'Merge conflicts',
+        kind: 'integrator',
+        createdAt: Date.now(),
+        startedAt: Date.now(),
+        finishedAt: Date.now(),
+        result: integrate.summary,
+        chatId: parent.chatId,
+      }
+      parent.children.push(integrator)
+      this.multitaskTasks.push(integrator)
+      this.pushMultitaskTasks()
+      this.postFor(runtime, {
+        type: 'notice',
+        text: integrate.summary,
+      })
+      await parent.worktrees.cleanup(integrate.ok).catch((error) => {
+        this.log(`multitask worktree cleanup FAILED: ${error instanceof Error ? error.message : String(error)}`)
+      })
+      parent.worktrees = undefined
+    }
+
     const findings = children
       .map((child) => `${child.name} [${child.status}]:\n${child.result ?? 'No result.'}`)
       .join('\n\n')
-    const folder = vscode.workspace.workspaceFolders?.[0]
-    const runtime = this.runtimes.get(parent.chatId)
-    if (!folder || !runtime || parent.children.some((child) => child.kind === 'coordinator')) return
+    const busDigest = parent.bus?.digest(40) ?? ''
     const coordinator: MultitaskTask = {
       id: crypto.randomUUID(),
       parentId: parent.id,
@@ -396,7 +606,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       kind: 'coordinator',
       createdAt: Date.now(),
       chatId: parent.chatId,
-      session: new AgentSession(folder.uri.fsPath, folder.name, new FrontierAssist(() => readConfig().frontierAssist)),
+      session: new AgentSession(
+        folder.uri.fsPath,
+        folder.name,
+        new FrontierAssist(() => readConfig().frontierAssist),
+      ),
     }
     parent.children.push(coordinator)
     this.multitaskTasks.push(coordinator)
@@ -406,58 +620,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       [
         'You are the coordinator for a completed Multitask run.',
         `Original request: ${parent.text}`,
+        parent.integrateSummary ? `Integration result:\n${parent.integrateSummary}` : '',
+        busDigest ? `Sibling bus digest:\n${busDigest}` : '',
         `Child reports:\n${findings}`,
         'Synthesize one evidence-based final response. Reconcile conflicts, distinguish completed changes from recommendations, list verification, and state any remaining limitations. Do not modify files.',
-      ].join('\n\n'),
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
       'ask',
       coordinator.session!,
       coordinator,
       parent,
       false,
     )
-  }
-
-  private enqueueMultitask(text: string, mode: AgentMode): void {
-    const trimmed = text.trim()
-    if (!trimmed) return
-    const folder = vscode.workspace.workspaceFolders?.[0]
-    if (!folder) {
-      this.post({ type: 'error', text: 'Open a folder first — the agent works on a workspace.' })
-      return
-    }
-    const runtime = this.ensureSelectedRuntime(folder)
-    const parent: MultitaskParent = {
-      id: crypto.randomUUID(),
-      text: trimmed,
-      mode,
-      chatId: runtime.id,
-      children: [],
-      cancelled: false,
-    }
-    const assignments = this.childAssignments(this.requestedAgentCount(trimmed))
-    parent.children = assignments.map((assignment): MultitaskTask => ({
-      id: crypto.randomUUID(),
-      parentId: parent.id,
-      name: assignment.name,
-      text: assignment.focus,
-      mode,
-      status: 'waiting',
-      currentAction: 'Waiting to start',
-      kind: 'child',
-      createdAt: Date.now(),
-      chatId: runtime.id,
-      session: new AgentSession(
-        folder.uri.fsPath,
-        folder.name,
-        new FrontierAssist(() => readConfig().frontierAssist),
-      ),
-    }))
-    this.multitaskParents.set(parent.id, parent)
-    this.multitaskTasks.push(...parent.children)
-    runtime.transcript.push({ role: 'user', text: trimmed })
-    void this.saveChat(runtime)
-    this.pushMultitaskTasks()
-    this.enqueueNextChild(parent)
   }
 
   private cancelMultitask(id: string): void {
@@ -472,12 +647,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       task.result = 'Cancelled before starting.'
       this.removeQueuedRun(queued)
     }
-    if (this.activeRun?.multitask?.id === id) {
-      this.activeRun.abort.abort()
+    const active = this.activeRuns.get(id)
+    if (active) {
+      active.abort.abort()
       if (readConfig().backend === 'daemon') void this.daemonClient?.cancel()
     }
     if (parent && !parent.cancelled && task.kind === 'child') {
-      queueMicrotask(() => this.enqueueNextChild(parent))
+      queueMicrotask(() => void this.onMultitaskChildFinished(parent))
     }
     this.pushMultitaskTasks()
   }
@@ -499,8 +675,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .map((request) => request.multitask!.id),
     )
     const finishedAt = Date.now()
+    const parents = new Set<MultitaskParent>()
     for (const task of cancellable) {
-      this.multitaskParents.get(task.parentId)!.cancelled = true
+      const parent = this.multitaskParents.get(task.parentId)
+      if (parent) {
+        parent.cancelled = true
+        parents.add(parent)
+      }
       task.status = 'cancelled'
       task.currentAction = 'Stopped'
       task.finishedAt = finishedAt
@@ -509,9 +690,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     for (const request of [...this.runQueue]) {
       if (request.multitask && ids.has(request.multitask.id)) this.removeQueuedRun(request)
     }
-    if (this.activeRun?.multitask && ids.has(this.activeRun.multitask.id)) {
-      this.activeRun.abort.abort()
-      if (readConfig().backend === 'daemon') void this.daemonClient?.cancel()
+    let abortedDaemon = false
+    for (const request of [...this.activeRuns.values()]) {
+      if (!request.multitask || !ids.has(request.multitask.id)) continue
+      request.abort.abort()
+      if (!abortedDaemon && readConfig().backend === 'daemon') {
+        abortedDaemon = true
+        void this.daemonClient?.cancel()
+      }
+    }
+    for (const parent of parents) {
+      void parent.worktrees?.cleanup(false).catch(() => undefined)
+      parent.worktrees = undefined
     }
     this.pushMultitaskTasks()
     this.pushState()
@@ -519,25 +709,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private steerMultitask(id: string): void {
     const selected = this.multitaskTasks.find((candidate) => candidate.id === id)
-    const active = this.activeMultitaskId
-      ? this.multitaskTasks.find((candidate) => candidate.id === this.activeMultitaskId)
-      : undefined
-    if (
-      !selected ||
-      selected.status !== 'waiting' ||
-      !active ||
-      active.status !== 'running' ||
-      selected.chatId !== active.chatId
-    ) return
+    if (!selected || selected.status !== 'waiting') return
+
+    const activeRequest = [...this.activeRuns.values()].find(
+      (request) =>
+        request.multitask &&
+        request.multitask.status === 'running' &&
+        request.multitask.chatId === selected.chatId,
+    )
+    const active = activeRequest?.multitask
+    if (!active || !active.session) return
 
     const selectedRequestIndex = this.runQueue.findIndex(
       (request) => request.multitask?.id === selected.id,
     )
-    if (selectedRequestIndex < 0 || !active.session) return
+    if (selectedRequestIndex < 0) return
 
     // The selected task continues as the same subagent: it inherits all model
     // turns and tool results accumulated by the active task before cancellation.
     selected.session = active.session
+    selected.worktreePath = active.worktreePath
+    selected.worktreeBranch = active.worktreeBranch
     const [selectedRequest] = this.runQueue.splice(selectedRequestIndex, 1)
     selectedRequest.session = active.session
     this.runQueue.unshift(selectedRequest)
@@ -545,16 +737,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     active.finishedAt = Date.now()
     this.pushMultitaskTasks()
 
-    // Cancellation is asynchronous. The pump remains locked by activeMultitaskId
-    // until runTask unwinds, so the one-slot daemon never receives two generations.
-    this.activeRun?.abort.abort()
+    activeRequest.abort.abort()
     if (readConfig().backend === 'daemon') void this.daemonClient?.cancel()
   }
 
   private currentClient(): InferenceClient | null {
     const cfg = readConfig()
     if (cfg.backend === 'daemon') {
-      this.daemonClient ??= new DaemonClient(cfg.daemon.url)
+      this.daemonClient ??= this.getDaemonClient?.() ?? new DaemonClient(cfg.daemon.url)
       return this.daemonClient
     }
     if (!cfg.api.modelName && !cfg.api.baseUrl) return null
@@ -564,7 +754,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Manual memory compaction from the composer gauge. No-op while busy. */
   private async compactMemory(): Promise<void> {
     const runtime = this.selectedRuntime()
-    if (this.activeRun || this.runQueue.length > 0 || !runtime) return
+    if (this.activeRuns.size > 0 || this.runQueue.length > 0 || !runtime) return
     const client = this.currentClient()
     if (!client) return
     const cfg = readConfig()
@@ -602,9 +792,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (request.runtime.id !== selectedId) continue
       this.removeQueuedRun(request, true)
     }
-    if (this.activeRun?.runtime.id === selectedId) {
-      this.activeRun.abort.abort()
-      if (readConfig().backend === 'daemon') void this.daemonClient?.cancel()
+    let abortedDaemon = false
+    for (const request of [...this.activeRuns.values()]) {
+      if (request.runtime.id !== selectedId) continue
+      request.abort.abort()
+      if (!abortedDaemon && readConfig().backend === 'daemon') {
+        abortedDaemon = true
+        void this.daemonClient?.cancel()
+      }
     }
     this.pushState()
   }
@@ -613,6 +808,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     text: string,
     mode: AgentMode = 'code',
     sessionOverride?: AgentSession,
+    images?: ChatTurnImage[],
   ): Promise<boolean> {
     const folder = vscode.workspace.workspaceFolders?.[0]
     if (!folder) {
@@ -624,8 +820,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return false
     }
 
+    const cfg = readConfig()
+    const blocked = imageAttachmentsBlockedMessage(
+      cfg.backend,
+      cfg.backend === 'daemon' ? this.daemonClient?.loadedModel() ?? null : null,
+      images?.length ?? 0,
+    )
+    if (blocked) {
+      this.post({ type: 'error', text: blocked })
+      return false
+    }
+
     const runtime = this.ensureSelectedRuntime(folder)
-    this.enqueueRun(runtime, text, mode, sessionOverride ?? runtime.session)
+    this.enqueueRun(runtime, text, mode, sessionOverride ?? runtime.session, undefined, undefined, false, images)
     return true
   }
 
@@ -637,14 +844,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     multitask?: MultitaskTask,
     multitaskParent?: MultitaskParent,
     internal = false,
+    images?: ChatTurnImage[],
   ): void {
-    if (!internal && !multitaskParent) runtime.transcript.push({ role: 'user', text })
+    if (!internal && !multitaskParent) {
+      runtime.transcript.push({
+        role: 'user',
+        text,
+        ...(images?.length ? { imageNames: images.map((_, index) => `image-${index + 1}`) } : {}),
+      })
+    }
     runtime.pendingRuns++
     this.runQueue.push({
       runtime,
       text,
       mode,
       session,
+      images,
       multitask,
       multitaskParent,
       internal,
@@ -673,34 +888,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private pumpRuns(): void {
-    if (this.activeRun) return
-    const request = this.runQueue.shift()
-    if (!request) {
-      this.pushState()
-      return
-    }
-    this.activeRun = request
-    request.runtime.pendingRuns = Math.max(0, request.runtime.pendingRuns - 1)
-    if (request.multitask) {
-      this.activeMultitaskId = request.multitask.id
-      request.multitask.status = 'running'
-      request.multitask.currentAction =
-        request.multitask.kind === 'coordinator' ? 'Synthesizing child findings' : 'Starting isolated session'
-      request.multitask.startedAt = Date.now()
-      this.pushMultitaskTasks()
+    const limit = this.maxRunConcurrency()
+    while (this.activeRuns.size < limit && this.runQueue.length > 0) {
+      const request = this.runQueue.shift()
+      if (!request) break
+      const key = request.multitask?.id ?? crypto.randomUUID()
+      this.activeRuns.set(key, request)
+      request.runtime.pendingRuns = Math.max(0, request.runtime.pendingRuns - 1)
+      if (request.multitask) {
+        request.multitask.status = 'running'
+        request.multitask.currentAction =
+          request.multitask.kind === 'coordinator'
+            ? 'Synthesizing child findings'
+            : request.multitask.worktreeBranch
+              ? `Starting on ${request.multitask.worktreeBranch}`
+              : 'Starting isolated session'
+        request.multitask.startedAt = Date.now()
+        this.pushMultitaskTasks()
+      }
+      void this.executeRun(request).then(
+        (outcome) => this.finishRun(key, request, outcome),
+        (error) =>
+          this.finishRun(key, request, {
+            ok: false,
+            result: error instanceof Error ? error.message : String(error),
+          }),
+      )
     }
     this.pushState()
-    void this.executeRun(request).then(
-      (outcome) => this.finishRun(request, outcome),
-      (error) =>
-        this.finishRun(request, {
-          ok: false,
-          result: error instanceof Error ? error.message : String(error),
-        }),
-    )
   }
 
-  private finishRun(request: RunRequest, outcome: RunOutcome): void {
+  private finishRun(key: string, request: RunRequest, outcome: RunOutcome): void {
     if (request.multitask) {
       if (request.multitask.status === 'running') {
         request.multitask.status = outcome.ok ? 'completed' : 'failed'
@@ -708,18 +926,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       request.multitask.result = outcome.result
       request.multitask.currentAction =
         request.multitask.status === 'completed' ? 'Completed' :
-          request.multitask.status === 'cancelled' ? 'Stopped' : outcome.result
+          request.multitask.status === 'cancelled' ? 'Stopped' :
+            request.multitask.status === 'interrupted' ? 'Interrupted' : outcome.result
       request.multitask.finishedAt = Date.now()
-      this.activeMultitaskId = null
       if (request.multitask.kind === 'coordinator') {
         request.runtime.session = request.session
       }
       this.pushMultitaskTasks()
       if (request.multitaskParent && request.multitask.kind === 'child') {
-        queueMicrotask(() => this.enqueueNextChild(request.multitaskParent!))
+        queueMicrotask(() => void this.onMultitaskChildFinished(request.multitaskParent!))
       }
     }
-    if (this.activeRun === request) this.activeRun = null
+    if (this.activeRuns.get(key) === request) this.activeRuns.delete(key)
     this.pushState()
     queueMicrotask(() => this.pumpRuns())
   }
@@ -735,12 +953,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Checkpoint before any turn that can mutate the workspace (fail-soft:
     // no git or a snapshot failure just means no review card this turn —
     // but always say why, in the output channel and the chat).
+    // Multitask children checkpoint their isolated worktree, not the primary root.
     let checkpointSha: string | undefined
+    let turnShadow: ShadowRepo | null = null
     if (mode === 'code') {
       try {
-        this.shadowRepo ??= new ShadowRepo(folder.uri.fsPath)
-        if (await this.shadowRepo.isGitAvailable()) {
-          checkpointSha = await this.shadowRepo.snapshot(`before: ${text.slice(0, 72)}`)
+        const checkpointRoot = session.workspaceRoot
+        turnShadow =
+          checkpointRoot === folder.uri.fsPath
+            ? (this.shadowRepo ??= new ShadowRepo(folder.uri.fsPath))
+            : new ShadowRepo(checkpointRoot)
+        if (await turnShadow.isGitAvailable()) {
+          checkpointSha = await turnShadow.snapshot(`before: ${text.slice(0, 72)}`)
           this.log(`checkpoint ${checkpointSha.slice(0, 8)} taken for: ${text.slice(0, 60)}`)
         } else {
           this.log('git not available — no checkpoint, no review card this turn')
@@ -803,11 +1027,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this.postFor(runtime, { type: 'guide', checkpoint: note.checkpoint, verdict: note.verdict, text: note.text }),
         },
         request.abort.signal,
-        checkpointSha && this.shadowRepo
+        checkpointSha && turnShadow
           ? {
-              changedFileStats: () => this.shadowRepo!.changedFileStats(checkpointSha),
+              changedFileStats: () => turnShadow!.changedFileStats(checkpointSha),
             }
           : undefined,
+        request.images,
       )
       if (result.hybridStats) {
         const h = result.hybridStats
@@ -818,9 +1043,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // Cursor-style review card: per-file stats vs the checkpoint, with
       // Keep/Undo. Falls back to the plain restore button if stats fail.
       let reviewFiles: ChangedFileStat[] | null = null
-      if (checkpointSha && this.shadowRepo) {
+      if (checkpointSha && turnShadow) {
         try {
-          reviewFiles = await this.shadowRepo.changedFileStats(checkpointSha)
+          reviewFiles = await turnShadow.changedFileStats(checkpointSha)
           this.log(`diff vs ${checkpointSha.slice(0, 8)}: ${reviewFiles.length} changed file(s)`)
         } catch (error) {
           this.log(`diff stats FAILED: ${error instanceof Error ? error.message : String(error)}`)
@@ -935,7 +1160,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async restoreCheckpoint(sha: string): Promise<void> {
-    if (this.activeRun) {
+    if (this.activeRuns.size > 0) {
       void vscode.window.showInformationMessage('Stop the agent before restoring a checkpoint.')
       return
     }
@@ -974,7 +1199,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.pushMultitaskTasks()
         break
       case 'send':
-        await this.runTask(message.text, message.mode ?? 'code')
+        await this.runTask(message.text, message.mode ?? 'code', undefined, message.images)
         break
       case 'stop':
         this.stop()
@@ -1074,15 +1299,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'main.js'))
     const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'main.css'))
     const logoUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'icon.png'))
+    const theme = webviewTheme()
     return /* html */ `<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="${theme}">
 <head>
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource} 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />
   <style nonce="${nonce}">
-    html, body { background: #ffffff !important; color: #171717 !important; color-scheme: light only; }
-    #header, #messages, #composer, #todos { background: #ffffff !important; }
+    html[data-theme="light"], html[data-theme="light"] body { background: #ffffff; color: #171717; }
+    html[data-theme="dark"], html[data-theme="dark"] body { background: #0a0a0a; color: #fafafa; }
+    #header, #messages, #composer, #todos { background: inherit; }
   </style>
   <link href="${styleUri}" rel="stylesheet" />
 </head>
@@ -1180,6 +1407,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </main>
   <footer id="composer">
+    <div id="image-attachment-chips" class="image-attachment-chips" hidden></div>
+    <div id="image-drop-overlay" class="image-drop-overlay" hidden aria-hidden="true">
+      <span>Drop images to attach</span>
+    </div>
     <textarea id="input" rows="3" placeholder="Describe a task or ask a question…"></textarea>
     <div id="composer-bottom">
       <div id="composer-left">
@@ -1196,6 +1427,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
     </div>
     <div id="composer-plus-menu" class="composer-plus-menu" hidden role="menu">
+      <div class="plus-menu-label">Attach</div>
+      <button class="plus-menu-item" type="button" data-pick="attach-image" role="menuitem">
+        <svg class="plus-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+        <span>Image…</span>
+      </button>
+      <div class="plus-menu-divider"></div>
       <div class="plus-menu-label">Mode</div>
       <button class="plus-menu-item" type="button" data-pick="plan" role="menuitem">
         <svg class="plus-menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 5H3"/><path d="M16 12H3"/><path d="M16 19H3"/><path d="M21 5h.01"/><path d="M21 12h.01"/><path d="M21 19h.01"/></svg>
@@ -1213,6 +1450,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <span class="plus-menu-check" hidden aria-hidden="true">✓</span>
       </button>
     </div>
+    <input id="image-file-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
   </footer>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>

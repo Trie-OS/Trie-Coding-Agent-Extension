@@ -4,7 +4,49 @@
  * LM Studio, Ollama, or any cloud endpoint that speaks the protocol.
  */
 import { readSse } from './sse'
+import { buildOpenAiMessages } from './openAiMessages'
 import type { ChatTurn, GenerateResult, GenerationParams, InferenceClient } from './types'
+
+interface ToolCallDelta {
+  index?: number
+  id?: string
+  function?: { name?: string; arguments?: string }
+}
+
+function accumulateToolCallDeltas(
+  state: Map<number, { name: string; arguments: string }>,
+  deltas: readonly ToolCallDelta[],
+): void {
+  for (const delta of deltas) {
+    const index = typeof delta.index === 'number' ? delta.index : 0
+    const existing = state.get(index) ?? { name: '', arguments: '' }
+    if (typeof delta.function?.name === 'string' && delta.function.name.length > 0) {
+      existing.name = delta.function.name
+    }
+    if (typeof delta.function?.arguments === 'string') {
+      existing.arguments += delta.function.arguments
+    }
+    state.set(index, existing)
+  }
+}
+
+function toolCallsToEnvelope(
+  calls: Array<{ name: string; arguments: string }>,
+  thought: string,
+): string {
+  const call = calls[0]!
+  let args: Record<string, unknown> = {}
+  try {
+    args = JSON.parse(call.arguments || '{}') as Record<string, unknown>
+  } catch {
+    args = {}
+  }
+  return JSON.stringify({
+    thought: thought.trim() || 'Function call',
+    tool: call.name,
+    args,
+  })
+}
 
 export class OpenAiCompatibleClient implements InferenceClient {
   constructor(
@@ -31,7 +73,7 @@ export class OpenAiCompatibleClient implements InferenceClient {
       headers,
       body: JSON.stringify({
         model: this.modelName,
-        messages: turns.map((t) => ({ role: t.role, content: t.content })),
+        messages: buildOpenAiMessages(turns),
         temperature: params.temperature,
         top_p: params.topP,
         max_tokens: params.maxTokens,
@@ -48,12 +90,18 @@ export class OpenAiCompatibleClient implements InferenceClient {
     let text = ''
     let tokensIn = 0
     let tokensOut = 0
+    const toolCallState = new Map<number, { name: string; arguments: string }>()
     await readSse(
       response,
       (data) => {
         if (data.trim() === '[DONE]') return
         let chunk: {
-          choices?: Array<{ delta?: { content?: string | null } }>
+          choices?: Array<{
+            delta?: {
+              content?: string | null
+              tool_calls?: ToolCallDelta[]
+            }
+          }>
           usage?: { prompt_tokens?: number; completion_tokens?: number } | null
         }
         try {
@@ -61,10 +109,13 @@ export class OpenAiCompatibleClient implements InferenceClient {
         } catch {
           return
         }
-        const delta = chunk.choices?.[0]?.delta?.content
-        if (typeof delta === 'string' && delta.length > 0) {
-          text += delta
-          onToken(delta)
+        const delta = chunk.choices?.[0]?.delta
+        if (typeof delta?.content === 'string' && delta.content.length > 0) {
+          text += delta.content
+          onToken(delta.content)
+        }
+        if (Array.isArray(delta?.tool_calls) && delta.tool_calls.length > 0) {
+          accumulateToolCallDeltas(toolCallState, delta.tool_calls)
         }
         if (chunk.usage) {
           tokensIn = chunk.usage.prompt_tokens ?? tokensIn
@@ -73,6 +124,17 @@ export class OpenAiCompatibleClient implements InferenceClient {
       },
       signal,
     )
+
+    const finalizedCalls = [...toolCallState.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([, call]) => call)
+      .filter((call) => call.name.length > 0)
+
+    if (finalizedCalls.length > 0 && text.trim() === '') {
+      text = toolCallsToEnvelope(finalizedCalls, text)
+      onToken(text)
+    }
+
     return { text, tokensIn, tokensOut }
   }
 }

@@ -79,6 +79,11 @@ export class DaemonClient implements InferenceClient {
     return this.loadedModelName !== null
   }
 
+  /** Display name of the loaded local model, if any. */
+  loadedModel(): string | null {
+    return this.loadedModelName
+  }
+
   async handshake(): Promise<DaemonHandshake> {
     const response = await fetch(`${this.baseUrl}/v1/handshake`)
     return jsonOrThrow<DaemonHandshake>(response, 'handshake')
@@ -189,6 +194,11 @@ export class DaemonClient implements InferenceClient {
     onToken: (text: string) => void,
     signal: AbortSignal,
   ): Promise<GenerateResult> {
+    if (turns.some((turn) => turn.images && turn.images.length > 0)) {
+      throw new Error(
+        'Image attachments require an LLM API backend with a vision-capable model. The embedded daemon does not support vision yet.',
+      )
+    }
     const response = await fetch(`${this.baseUrl}/v1/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

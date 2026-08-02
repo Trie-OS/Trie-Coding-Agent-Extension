@@ -9,10 +9,12 @@ export type EditRange =
   | {
       start: number
       end: number
-      kind: 'exact' | 'whitespace'
+      kind: 'exact' | 'whitespace' | 'lines'
       fileIndent: string
       searchIndent: string
       fileEol: '\n' | '\r\n'
+      matchedStartLine?: number
+      matchedEndLine?: number
     }
   | {
       error: 'ambiguous' | 'not_found'
@@ -93,9 +95,58 @@ function nearestCandidates(lines: SourceLine[], wanted: string[], limit = 2): Ed
 }
 
 /**
- * Finds a byte range without guessing. Exact text wins. The only automatic
- * fallback collapses whitespace per line and is accepted when one line window
- * in the file matches; the returned offsets always delimit the original bytes.
+ * Durable edit path: replace an inclusive 1-based line window. The model does
+ * not need to retype file bytes — only the new content and the line range
+ * from a prior read_file.
+ */
+export function findLineRange(
+  content: string,
+  startLine: number,
+  endLine: number,
+): EditRange {
+  const lines = sourceLines(content)
+  if (
+    !Number.isInteger(startLine) ||
+    !Number.isInteger(endLine) ||
+    startLine < 1 ||
+    endLine < startLine ||
+    endLine > lines.length
+  ) {
+    return {
+      error: 'not_found',
+      candidates: [],
+    }
+  }
+
+  const selected = lines.slice(startLine - 1, endLine)
+  const firstFileContent =
+    selected.find((line) => line.text.trim() !== '')?.text ?? selected[0]?.text ?? ''
+  const start = selected[0].start
+  const last = selected[selected.length - 1]
+  // Include the newline after the last line when there is a following line, so
+  // a full-line replacement stays line-aligned.
+  let end = last.start + last.text.length
+  if (endLine < lines.length) {
+    const between = content.slice(end, lines[endLine].start)
+    end += between.length
+  }
+
+  return {
+    start,
+    end,
+    kind: 'lines',
+    fileIndent: indentation(firstFileContent),
+    searchIndent: '',
+    fileEol: content.slice(start, Math.min(end, start + 4)).includes('\r\n') ? '\r\n' : '\n',
+    matchedStartLine: startLine,
+    matchedEndLine: endLine,
+  }
+}
+
+/**
+ * Finds a byte range without guessing. Exact text wins. Whitespace-normalized
+ * unique matches are accepted. Near-misses are returned as candidates so the
+ * harness can steer the model onto the durable line-anchored path.
  */
 export function findEditRange(content: string, search: string): EditRange {
   if (search.length === 0) return { error: 'not_found', candidates: [] }
@@ -151,6 +202,8 @@ export function findEditRange(content: string, search: string): EditRange {
       fileIndent: indentation(firstFileContent),
       searchIndent: indentation(firstSearchContent),
       fileEol: content.slice(start, last.start).includes('\r\n') ? '\r\n' : '\n',
+      matchedStartLine: startLine + 1,
+      matchedEndLine: startLine + count,
     }
   }
 
@@ -173,11 +226,10 @@ export function reindentReplacement(
 ): string {
   const lines = replacement.replace(/\r\n/g, '\n').split('\n')
   const reindented =
-    fileIndent === searchIndent
+    fileIndent === searchIndent || searchIndent === ''
       ? lines
       : lines.map((line) =>
           line.startsWith(searchIndent) ? fileIndent + line.slice(searchIndent.length) : line,
         )
-  return reindented
-    .join(fileEol)
+  return reindented.join(fileEol)
 }

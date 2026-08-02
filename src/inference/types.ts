@@ -2,9 +2,16 @@
 
 export type ChatRole = 'user' | 'assistant' | 'system'
 
+export interface ChatTurnImage {
+  mimeType: string
+  dataBase64: string
+}
+
 export interface ChatTurn {
   role: ChatRole
   content: string
+  /** Present on user turns when the composer attached images. */
+  images?: ChatTurnImage[]
 }
 
 export interface GenerationParams {

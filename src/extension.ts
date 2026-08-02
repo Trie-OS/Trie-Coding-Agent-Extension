@@ -6,7 +6,7 @@ import { runConnectFlow } from './daemon/connectFlow'
 import { runHybridSetup, runWebSearchSetup } from './daemon/hybridSetup'
 import { SettingsPanel } from './chat/SettingsPanel'
 import { DaemonClient } from './inference/daemonClient'
-import { getSymbolIndex } from './agent/symbolIndex'
+import { warmUpSymbolIndex } from './agent/symbolIndex'
 
 let daemonHost: DaemonHost | null = null
 
@@ -23,15 +23,10 @@ export function activate(context: vscode.ExtensionContext): void {
     statusBar.text = `$(sparkle) Trie Coding: ${label}`
   })
 
-  // Codebase indexing: eager build only when opted in — the default stays
-  // lazy (first search) so an idle extension costs nothing.
+  // Codebase indexing: build on activate when enabled + onStartup (default on).
   const warmUpIndexIfConfigured = (): void => {
-    const folder = vscode.workspace.workspaceFolders?.[0]
-    if (!folder) return
     const cfg = readConfig()
-    if (cfg.index.enabled && cfg.index.onStartup) {
-      void getSymbolIndex(folder.uri.fsPath).warmUp()
-    }
+    warmUpSymbolIndex({ enabled: cfg.index.enabled, onStartup: cfg.index.onStartup })
   }
   warmUpIndexIfConfigured()
   context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(warmUpIndexIfConfigured))
@@ -97,6 +92,18 @@ export function activate(context: vscode.ExtensionContext): void {
 
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('trie-ide')) provider.refreshState()
+      // Toggling index.onStartup / index.enabled used to do nothing until reload.
+      if (
+        event.affectsConfiguration('trie-ide.index.onStartup') ||
+        event.affectsConfiguration('trie-ide.index.enabled')
+      ) {
+        warmUpIndexIfConfigured()
+      }
+    }),
+
+    vscode.window.onDidChangeActiveColorTheme(() => {
+      provider.refreshState()
+      SettingsPanel.refreshTheme()
     }),
 
     { dispose: () => daemonHost?.dispose() },

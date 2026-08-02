@@ -13,7 +13,7 @@
  * - Token-uncertainty mid-turn escalation (daemon confidence + heuristics)
  * - MinionS-style frontier decomposition for large tasks
  */
-import type { ChatTurn, GenerationParams, InferenceClient } from '../inference/types'
+import type { ChatTurn, ChatTurnImage, GenerationParams, InferenceClient } from '../inference/types'
 import { isWebSearchConfigured, readConfig } from '../config'
 import type { ChangedFileStat } from './checkpoints'
 import { buildWorkspaceContext } from './context'
@@ -29,6 +29,7 @@ import { FrontierAssist, type GuideNote } from './frontierAssist'
 import {
   agentSystemPrompt,
   agentUserPrompt,
+  buildTaskNotes,
   isReadOnlyMode,
   repairTurn,
   toolResultTurn,
@@ -37,14 +38,23 @@ import {
 import {
   buildWebSearchQuery,
   taskNeedsWebSearch,
-  webSearchTaskNote,
 } from './webSearchIntent'
 import {
+  isLazyStepCompleteSummary,
   isTrivialConversation,
+  NewFeatureDiscoveryGuard,
+  StuckRecoveryGate,
+  taskAsksForRecommendations,
   taskExpectsCodeChanges,
+  taskNeedsCodebaseExploration,
   summaryClaimsFileChanges,
 } from './taskIntent'
+import {
+  finishRecommendationAnswer,
+  isObviouslyFailedRecommendationDraft,
+} from './recommendationAnswer'
 import { VerificationTracker, verificationPolicy } from './verificationPolicy'
+import type { MultitaskBus } from './multitaskBus'
 import {
   parseToolCall,
   summarizeArgs,
@@ -53,7 +63,17 @@ import {
   toolLineDelta,
   WorkspaceTools,
   type ToolCall,
+  type ToolOutcome,
 } from './tools'
+
+export interface MultitaskSessionOptions {
+  agentId: string
+  agentName: string
+  bus: MultitaskBus
+  /** Skip MinionS frontier decompose — Multitask roles are already scoped. */
+  skipDecompose?: boolean
+  onBusActivity?: (summary: string) => void
+}
 
 export interface LoopEvents {
   onGenerating(active: boolean): void
@@ -105,6 +125,7 @@ export interface HybridTurnContext {
 
 const MAX_HISTORY_TURNS = 40
 const SELF_GRADE_THRESHOLD = 0.55
+const GENERATION_TIMEOUT_MS = 3 * 60 * 1000
 /** Compact memory when the estimated context passes this share of the window. */
 const COMPACT_THRESHOLD = 0.75
 /** Recent turns kept verbatim through a compaction. */
@@ -123,6 +144,32 @@ function estimateTokens(turns: readonly ChatTurn[]): number {
   return total
 }
 
+export async function generateWithTimeout(
+  client: InferenceClient,
+  turns: ChatTurn[],
+  params: GenerationParams,
+  signal: AbortSignal,
+  timeoutMs = GENERATION_TIMEOUT_MS,
+): Promise<Awaited<ReturnType<InferenceClient['generate']>>> {
+  const timeout = new AbortController()
+  const timer = setTimeout(() => timeout.abort(), timeoutMs)
+  const combined = AbortSignal.any([signal, timeout.signal])
+  try {
+    return await client.generate(turns, params, () => {}, combined)
+  } catch (error) {
+    if (timeout.signal.aborted && !signal.aborted) {
+      const cancellable = client as InferenceClient & { cancel?: () => Promise<void> }
+      await cancellable.cancel?.().catch(() => {})
+      throw new Error(
+        `Generation timed out after ${Math.round(timeoutMs / 1000)} seconds. The turn was stopped instead of leaving the agent active indefinitely.`,
+      )
+    }
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export class AgentSession {
   private turns: ChatTurn[] = []
   private cachedTokenEstimate = 0
@@ -135,12 +182,25 @@ export class AgentSession {
   private mutatedThisTurn = false
   /** Trivial conversational turns never spend frontier tokens, even if the local model stumbles. */
   private hybridEligibleThisTurn = true
+  /** One sparse Hybrid recovery per stuck episode/turn. */
+  private readonly stuckRecovery = new StuckRecoveryGate()
+  private multitask: MultitaskSessionOptions | null = null
+  private readonly multitaskCursor = { value: 0 }
 
   constructor(
     private readonly root: string,
     private readonly workspaceName: string,
     private readonly frontier: FrontierAssist,
   ) {}
+
+  get workspaceRoot(): string {
+    return this.root
+  }
+
+  configureMultitask(options: MultitaskSessionOptions | null): void {
+    this.multitask = options
+    this.multitaskCursor.value = 0
+  }
 
   reset(): void {
     this.turns = []
@@ -173,11 +233,24 @@ export class AgentSession {
     events: LoopEvents,
     signal: AbortSignal,
     hybridCtx?: HybridTurnContext,
+    turnImages?: ChatTurnImage[],
   ): Promise<LoopResult> {
     this.frontier.resetTurn()
-    const tools = new WorkspaceTools(this.root)
+    const tools = new WorkspaceTools(
+      this.root,
+      this.multitask
+        ? {
+            agentId: this.multitask.agentId,
+            agentName: this.multitask.agentName,
+            bus: this.multitask.bus,
+            cursor: this.multitaskCursor,
+            onActivity: this.multitask.onBusActivity,
+          }
+        : undefined,
+    )
     this.mode = mode
     this.hybridEligibleThisTurn = !isTrivialConversation(task)
+    this.stuckRecovery.reset()
     const uncertainty = new HybridUncertaintyTracker()
     const hybridStats: HybridTurnStats = {
       frontierCalls: 0,
@@ -187,25 +260,44 @@ export class AgentSession {
       evidenceChecks: 0,
     }
     let uncertaintyEscalated = false
-    const searchNote = webSearchTaskNote(task)
+    // Route the prompt up front (web search, recommendations, …) so the model
+    // handles the ask correctly on the first pass — not via post-hoc correction.
+    const taskNotes = buildTaskNotes(task, mode)
+    const promptOptions = { multitask: !!this.multitask }
 
     if (!this.started) {
       const workspaceContext = buildWorkspaceContext(this.root, this.workspaceName)
-      this.turns.push({ role: 'system', content: agentSystemPrompt(mode) })
-      this.turns.push({ role: 'user', content: agentUserPrompt(task, workspaceContext, searchNote) })
+      this.turns.push({ role: 'system', content: agentSystemPrompt(mode, promptOptions) })
+      this.turns.push({
+        role: 'user',
+        content: agentUserPrompt(task, workspaceContext, taskNotes),
+        ...(turnImages?.length ? { images: turnImages } : {}),
+      })
       this.started = true
-      await this.maybeDecompose(task, workspaceContext, mode, events, hybridStats)
-} else {
-      this.turns[0] = { role: 'system', content: agentSystemPrompt(mode) }
+      await this.maybeDecompose(task, workspaceContext, mode, events, hybridStats, signal)
+    } else {
+      this.turns[0] = { role: 'system', content: agentSystemPrompt(mode, promptOptions) }
       const userTurn: ChatTurn = {
         role: 'user',
-        content: searchNote ? `Task: ${task}\n\n${searchNote}` : `Task: ${task}`,
-      };
-      this.turns.push(userTurn);
-      this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
+        content: taskNotes ? `Task: ${task}\n\n${taskNotes}` : `Task: ${task}`,
+        ...(turnImages?.length ? { images: turnImages } : {}),
+      }
+      this.turns.push(userTurn)
+      this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
     }
 
     let webSearchUsedThisTurn = await this.maybePrefetchWebSearch(task, tools, events)
+    let exploredThisTurn = webSearchUsedThisTurn
+    const webSearchAllowedThisTurn = taskNeedsWebSearch(task)
+    const featureDiscovery = new NewFeatureDiscoveryGuard(task)
+    const explorationTools = new Set([
+      'read_file',
+      'list_dir',
+      'glob',
+      'grep',
+      'search_symbols',
+      'web_search',
+    ])
 
     let consecutiveFailures = 0
     this.mutatedThisTurn = false
@@ -218,14 +310,29 @@ export class AgentSession {
       await this.compactIfNeeded(client, params, events, signal)
 
       events.onGenerating(true)
-      let raw: string
-      let genResult: Awaited<ReturnType<InferenceClient['generate']>>
+      let raw = ''
+      let genResult: Awaited<ReturnType<InferenceClient['generate']>> | undefined
+      let generationError: unknown
       try {
-        genResult = await client.generate(this.windowedTurns(), params, () => {}, signal)
+        genResult = await generateWithTimeout(client, this.windowedTurns(), params, signal)
         raw = genResult.text
+      } catch (error) {
+        generationError = error
       } finally {
         events.onGenerating(false)
       }
+      if (generationError !== undefined) {
+        const message =
+          generationError instanceof Error ? generationError.message : String(generationError)
+        if (
+          message.startsWith('Generation timed out') &&
+          await this.maybeStuckRecovery('generation_timeout', events, hybridStats)
+        ) {
+          continue
+        }
+        throw generationError
+      }
+      if (!genResult) throw new Error('Generation ended without a result.')
       if (genResult.tokensIn > 0) {
         events.onContext?.(genResult.tokensIn + genResult.tokensOut, contextLimit())
       }
@@ -319,10 +426,95 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
           continue
         }
         const ok = call.tool === 'step_complete'
-        const summary =
+        let summary =
           (typeof call.args['summary'] === 'string' && (call.args['summary'] as string)) ||
           (typeof call.args['reason'] === 'string' && (call.args['reason'] as string)) ||
           (ok ? 'Done.' : 'Failed.')
+
+        // Recommendation asks: LLM-as-judge on the draft; rewrite once if needed.
+        // No fixed "4–7 bullets" template — the judge scores substance.
+        if (taskAsksForRecommendations(task)) {
+          if (!exploredThisTurn && call.tool === 'step_complete' && summary.trim().length < 200) {
+            const userTurn: ChatTurn = {
+              role: 'user',
+              content: toolResultTurn(
+                'step_complete',
+                false,
+                'Refused: ground recommendations in the codebase first (read_file/grep/search_symbols), then step_complete with your advice.',
+              ),
+            }
+            this.turns.push(userTurn)
+            this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+            consecutiveFailures++
+            continue
+          }
+          const notes = this.transcriptTail()
+          events.onGenerating(true)
+          try {
+            summary = await finishRecommendationAnswer(
+              client,
+              task,
+              summary,
+              notes,
+              params,
+              signal,
+              {
+                forceRewrite:
+                  call.tool === 'step_failed' || isObviouslyFailedRecommendationDraft(summary),
+              },
+            )
+          } finally {
+            events.onGenerating(false)
+          }
+          await this.finishWithHybridReview(
+            client,
+            params,
+            signal,
+            events,
+            hybridStats,
+            hybridCtx,
+          )
+          return {
+            ok: true,
+            summary,
+            mutatedFiles: mutatedFiles.length > 0 ? mutatedFiles : undefined,
+            hybridStats,
+          }
+        }
+
+        if (call.tool === 'step_complete' && isLazyStepCompleteSummary(summary)) {
+          const userTurn: ChatTurn = {
+            role: 'user',
+            content: toolResultTurn(
+              'step_complete',
+              false,
+              'Refused: summary is a placeholder (ellipsis/teaser). Explore the codebase or finish the answer, then call step_complete with a substantive summary.',
+            ),
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+          consecutiveFailures++
+          continue
+        }
+        if (
+          call.tool === 'step_complete' &&
+          taskNeedsCodebaseExploration(task) &&
+          !exploredThisTurn &&
+          summary.trim().length < 200
+        ) {
+          const userTurn: ChatTurn = {
+            role: 'user',
+            content: toolResultTurn(
+              'step_complete',
+              false,
+              'Refused: this task needs codebase exploration first. Use read_file, grep, or search_symbols to inspect the project, then call step_complete with detailed recommendations.',
+            ),
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+          consecutiveFailures++
+          continue
+        }
         if (
           call.tool === 'step_complete' &&
           mode === 'code' &&
@@ -406,12 +598,50 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
         continue
       }
 
+      if (explorationTools.has(call.tool)) exploredThisTurn = true
+
       events.onToolCall(id, call, summarizeArgs(call))
-      const outcome = await tools.execute(call)
+      const localSearchQuery =
+        call.tool === 'search_symbols' && typeof call.args['query'] === 'string'
+          ? call.args['query']
+          : call.tool === 'grep' && typeof call.args['pattern'] === 'string'
+            ? call.args['pattern']
+            : null
+      const repeatedFeatureSearch =
+        localSearchQuery === null ? null : featureDiscovery.beforeSearch(localSearchQuery)
+      let outcome: ToolOutcome =
+        repeatedFeatureSearch !== null
+          ? {
+              ok: true,
+              result: repeatedFeatureSearch,
+              uiSummary: 'pivot to integration points',
+            }
+          : call.tool === 'web_search' && !webSearchAllowedThisTurn
+          ? {
+              ok: false,
+              result:
+                'Web search denied for this turn: the active user request does not require external/current factual information and did not explicitly ask to search, research, or browse the web. Continue from repository files, local package types, and local documentation. A local search returning no matches does not authorize internet access.',
+              uiSummary: 'denied by task intent',
+            }
+          : await tools.execute(call)
+      if (localSearchQuery !== null && repeatedFeatureSearch === null) {
+        outcome = {
+          ...outcome,
+          result: featureDiscovery.afterSearch(localSearchQuery, outcome.result),
+        }
+      }
       events.onToolResult(id, outcome.ok, outcome.uiSummary, outcome.viaTrie, outcome.trieMs, outcome.scanMs)
       this.turns.push({ role: 'user', content: toolResultTurn(call.tool, outcome.ok, outcome.result) })
 
-      if (call.tool === 'web_search') webSearchUsedThisTurn = true
+      if (call.tool === 'web_search' && outcome.ok) webSearchUsedThisTurn = true
+      if (
+        repeatedFeatureSearch !== null ||
+        /Feature-existence discovery is complete/i.test(outcome.result)
+      ) {
+        await this.maybeStuckRecovery('feature_discovery', events, hybridStats)
+      } else if (call.tool === 'web_search' && !webSearchAllowedThisTurn) {
+        await this.maybeStuckRecovery('web_search_denied', events, hybridStats)
+      }
 
       if (
         outcome.ok &&
@@ -548,7 +778,7 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     events.onToolResult(id, outcome.ok, outcome.uiSummary, outcome.viaTrie, outcome.trieMs, outcome.scanMs)
     this.turns.push({ role: 'assistant', content: JSON.stringify(call) })
     this.turns.push({ role: 'user', content: toolResultTurn('web_search', outcome.ok, outcome.result) })
-    return true
+    return outcome.ok
   }
 
   private async maybeDecompose(
@@ -557,16 +787,23 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     mode: AgentMode,
     events: LoopEvents,
     stats: HybridTurnStats,
+    signal?: AbortSignal,
   ): Promise<void> {
     if (
       mode !== 'code' ||
+      this.multitask?.skipDecompose ||
       !this.hybridEligibleThisTurn ||
       !this.frontier.enabled() ||
       !shouldDecompose(task, 0)
     ) return
     events.onHybridChecking(true, 'decompose')
     try {
-      const plan = await frontierDecompose(task, workspaceContext, () => readConfig().frontierAssist)
+      const plan = await frontierDecompose(
+        task,
+        workspaceContext,
+        () => readConfig().frontierAssist,
+        signal,
+      )
       if (!plan) return
       stats.decomposed = true
       stats.frontierCalls++
@@ -626,7 +863,7 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
       selfGrade?: { confidence: number; concerns: string }
       uncertainty?: number
     } = {},
-  ): Promise<void> {
+  ): Promise<boolean> {
     events.onHybridChecking(true, checkpoint)
     let note: GuideNote | null = null
     try {
@@ -638,7 +875,7 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     } finally {
       events.onHybridChecking(false, checkpoint)
     }
-    if (!note) return
+    if (!note) return false
     events.onGuideNote(note)
     // An empty note (e.g. "looks_good" with nothing to add) is shown in the
     // UI but injecting a blank advisory into the conversation helps nobody.
@@ -648,6 +885,21 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
         content: `Guide note from a senior reviewer (advisory): ${note.text}`,
       })
     }
+    return true
+  }
+
+  private async maybeStuckRecovery(
+    reason: 'feature_discovery' | 'web_search_denied' | 'generation_timeout',
+    events: LoopEvents,
+    stats: HybridTurnStats,
+  ): Promise<boolean> {
+    if (
+      !this.hybridEligibleThisTurn ||
+      !this.stuckRecovery.claim(this.frontier.enabled())
+    ) return false
+    return this.consultFrontier('stuck_hint', events, stats, {
+      evidence: `Recovery trigger: ${reason.replaceAll('_', ' ')}. Give a concrete repository-local next step that moves this task toward implementation.`,
+    })
   }
 
   private async maybeStuckHint(
@@ -655,11 +907,13 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     events: LoopEvents,
     stats: HybridTurnStats,
   ): Promise<void> {
+    if (consecutiveFailures < 2) return
     if (
-      consecutiveFailures < 2 ||
       !this.hybridEligibleThisTurn ||
-      !this.frontier.enabled()
-    ) return
+      !this.stuckRecovery.claim(this.frontier.enabled())
+    ) {
+      return
+    }
     await this.consultFrontier('stuck_hint', events, stats)
   }
 

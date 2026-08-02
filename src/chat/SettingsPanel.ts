@@ -6,7 +6,8 @@
 import * as crypto from 'node:crypto'
 import * as vscode from 'vscode'
 import { readConfig, updateWorkspaceScopedSetting } from '../config'
-import { getSymbolIndex, onIndexStatusChange } from '../agent/symbolIndex'
+import { getSymbolIndex, onIndexStatusChange, warmUpSymbolIndex } from '../agent/symbolIndex'
+import { webviewTheme } from '../theme'
 
 type FromWebview =
   | { type: 'init' }
@@ -65,6 +66,10 @@ export class SettingsPanel {
     SettingsPanel.current = new SettingsPanel(extensionUri, onConfigured)
   }
 
+  static refreshTheme(): void {
+    SettingsPanel.current?.postTheme()
+  }
+
   private constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly onConfigured: () => void,
@@ -94,6 +99,7 @@ export class SettingsPanel {
 
   private postConfig(): void {
     const cfg = readConfig()
+    this.postTheme()
     void this.panel.webview.postMessage({
       type: 'config',
       values: {
@@ -122,6 +128,10 @@ export class SettingsPanel {
         'index.scoreThreshold': cfg.index.scoreThreshold,
       },
     })
+  }
+
+  private postTheme(): void {
+    void this.panel.webview.postMessage({ type: 'theme', theme: webviewTheme() })
   }
 
   private postIndexStatus(): void {
@@ -154,6 +164,17 @@ export class SettingsPanel {
         }
         this.onConfigured()
         void this.panel.webview.postMessage({ type: 'saved', key: message.key })
+        // Enabling indexing / on-startup should start building immediately —
+        // not wait for a window reload or the agent's first search_symbols.
+        if (message.key === 'index.enabled' || message.key === 'index.onStartup') {
+          const cfg = readConfig()
+          warmUpSymbolIndex({
+            enabled: cfg.index.enabled,
+            onStartup: cfg.index.onStartup,
+            force: message.key === 'index.enabled' && cfg.index.enabled,
+          })
+          this.postIndexStatus()
+        }
         break
       }
       case 'openNative':
@@ -191,14 +212,16 @@ export class SettingsPanel {
     const nonce = crypto.randomBytes(16).toString('hex')
     const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'main.css'))
     const logoUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'icon.png'))
+    const theme = webviewTheme()
     return /* html */ `<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="${theme}">
 <head>
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource} 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />
   <style nonce="${nonce}">
-    html, body { background: #ffffff !important; color: #171717 !important; color-scheme: light only; }
+    html[data-theme="light"], html[data-theme="light"] body { background: #ffffff; color: #171717; }
+    html[data-theme="dark"], html[data-theme="dark"] body { background: #0a0a0a; color: #fafafa; }
   </style>
   <link href="${styleUri}" rel="stylesheet" />
 </head>
@@ -349,7 +372,7 @@ export class SettingsPanel {
         </div>
         <div class="row check">
           <input id="f-idx-startup" data-key="index.onStartup" data-type="boolean" type="checkbox" />
-          <label for="f-idx-startup">Index when the workspace opens <span class="opt">default: lazily on first search</span></label>
+          <label for="f-idx-startup">Index when the workspace opens <span class="opt">default: on</span></label>
         </div>
         <div class="row">
           <label for="f-idx-thresh">Search score threshold <span class="opt">1.0 = exact only · lower = fuzzier (typos, initials, substrings)</span></label>
@@ -595,7 +618,9 @@ export class SettingsPanel {
       idxLastState = 'standby'
       dot.className = 'status-dot grey'
       state.textContent = 'Not indexed yet'
-      detail.textContent = 'Builds when the agent first searches symbols'
+      detail.textContent = $('#f-idx-startup').checked
+        ? 'Starting automatically…'
+        : 'Builds when the agent first searches symbols'
     }
 
     let toastTimer = null
@@ -654,7 +679,9 @@ export class SettingsPanel {
 
     window.addEventListener('message', (event) => {
       const msg = event.data
-      if (msg.type === 'config') {
+      if (msg.type === 'theme') {
+        document.documentElement.dataset.theme = msg.theme === 'dark' ? 'dark' : 'light'
+      } else if (msg.type === 'config') {
         for (const [key, value] of Object.entries(msg.values)) {
           const el = controls.find((c) => c.dataset.key === key)
           if (el) writeControl(el, value)

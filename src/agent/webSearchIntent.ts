@@ -1,33 +1,57 @@
 /**
- * Heuristic detection for when a user turn needs internet research.
- * Local 7–14B models often skip web_search even when it is in the tool list,
- * so the loop auto-prefetches when this returns true.
+ * Deterministic policy for whether the active user turn authorizes internet
+ * access. This is intentionally narrower than "the model could benefit from
+ * docs": ordinary coding work must proceed from repository evidence even when
+ * local searches find nothing.
  */
 
-const EXTERNAL_SIGNALS = [
-  /\b(research|paper|papers|academic|scholar|arxiv|pubmed|cite|citation|literature)\b/i,
-  /\b(search the (web|internet)|look up online|find online|on the internet)\b/i,
-  /\b(latest|current|recent|up[- ]to[- ]date)\b.*\b(docs?|documentation|version|release|api)\b/i,
-  /\b(documentation for|docs for)\b/i,
-  /\bwhat (are|is) the best\b/i,
-  /\b(benchmark|compare|comparison|versus|vs\.?)\b/i,
-  /\b(news|announcement|changelog)\b/i,
-  /\b(stack overflow|github discussions?)\b/i,
+const EXPLICIT_WEB_REQUEST = [
+  /\b(?:search|browse)\s+(?:the\s+)?(?:web|internet)\b/i,
+  /\b(?:search|find|look\s+up|check)\b[^.!?\n]{0,80}\b(?:online|on\s+the\s+(?:web|internet))\b/i,
+  /\b(?:use|do|perform|conduct)\s+(?:an?\s+)?(?:online|web|internet)\s+(?:search|research)\b/i,
+  /\b(?:research|investigate)\s+(?:this\s+)?(?:online|on\s+the\s+(?:web|internet))\b/i,
+  /^\s*(?:please\s+)?(?:research|investigate)\b/i,
 ]
 
-/** Obvious repo-local questions — skip auto web search. */
-const LOCAL_ONLY = [
-  /\b(this (file|function|class|module|repo|codebase))\b/i,
-  /\bwhere is .+ (defined|declared|implemented)\b/i,
-  /\bexplain (this|the) (code|function|class)\b/i,
-  /\bwhat does .+ do in (this|the) (project|codebase|repo)\b/i,
+const CURRENT_EXTERNAL_FACT = [
+  /\b(?:latest|newest|current|recent|today(?:'s)?|right\s+now|up[- ]to[- ]date|as\s+of\s+\w+)\b[^.!?\n]{0,100}\b(?:version|release|changelog|announcement|news|status|availability|price|pricing|weather|law|regulation|advisory|vulnerabilit(?:y|ies)|benchmark|documentation|docs?|api)\b/i,
+  /\b(?:version|release|changelog|announcement|news|status|availability|price|pricing|weather|law|regulation|advisory|vulnerabilit(?:y|ies)|benchmark|documentation|docs?|api)\b[^.!?\n]{0,100}\b(?:latest|newest|current|recent|today(?:'s)?|right\s+now|up[- ]to[- ]date)\b/i,
 ]
+
+const EXTERNAL_DOCUMENTATION = [
+  /\b(?:consult|read|check|find|search|look\s+up|show\s+me)\s+(?:the\s+)?(?:official\s+)?(?:docs?|documentation|api\s+reference)\b/i,
+  /\baccording\s+to\s+(?:the\s+)?(?:official\s+)?(?:docs?|documentation|api\s+reference)\b/i,
+]
+
+const SOURCED_RESEARCH = [
+  /\b(?:cite|citation|citations|sources?|references?|bibliography|literature\s+review|arxiv|pubmed|academic\s+(?:paper|research)|research\s+papers?)\b/i,
+  /\b(?:stack\s+overflow|github\s+discussions?)\b/i,
+]
+
+const LOCAL_CONTEXT = /\b(?:this|the|our|my)\s+(?:file|function|class|module|repo|repository|codebase|project|implementation|extension|app)\b/i
+const EXTERNAL_ADVICE = /\b(?:best\s+practices?|compare|comparison|versus|vs\.?|benchmark)\b/i
+
+export type WebSearchIntent =
+  | { allowed: true; reason: 'explicit' | 'current' | 'documentation' | 'research' | 'external-advice' }
+  | { allowed: false; reason: 'local-default' }
+
+export function classifyWebSearchIntent(task: string): WebSearchIntent {
+  const t = task.trim()
+  if (t.length < 4) return { allowed: false, reason: 'local-default' }
+  if (EXPLICIT_WEB_REQUEST.some((re) => re.test(t))) return { allowed: true, reason: 'explicit' }
+  if (CURRENT_EXTERNAL_FACT.some((re) => re.test(t))) return { allowed: true, reason: 'current' }
+  if (EXTERNAL_DOCUMENTATION.some((re) => re.test(t))) {
+    return { allowed: true, reason: 'documentation' }
+  }
+  if (SOURCED_RESEARCH.some((re) => re.test(t))) return { allowed: true, reason: 'research' }
+  if (!LOCAL_CONTEXT.test(t) && EXTERNAL_ADVICE.test(t)) {
+    return { allowed: true, reason: 'external-advice' }
+  }
+  return { allowed: false, reason: 'local-default' }
+}
 
 export function taskNeedsWebSearch(task: string): boolean {
-  const t = task.trim()
-  if (t.length < 8) return false
-  if (LOCAL_ONLY.some((re) => re.test(t))) return false
-  return EXTERNAL_SIGNALS.some((re) => re.test(t))
+  return classifyWebSearchIntent(task).allowed
 }
 
 /** Ceramic limits queries to ~50 words; keep the user's wording. */

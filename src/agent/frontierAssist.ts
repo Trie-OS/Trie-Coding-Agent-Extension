@@ -30,6 +30,7 @@ export interface ConsultContext {
 const MAX_CALLS_PER_TURN = 6
 const RATE_LIMIT_COOLDOWN_MS = 3 * 60 * 1000
 const MAX_CONTEXT_CHARS = 8000
+const REQUEST_TIMEOUT_MS = 30_000
 
 const SYSTEM = [
   'You are a senior engineer reviewing the work of a smaller local coding model.',
@@ -41,7 +42,7 @@ const SYSTEM = [
 function checkpointQuestion(checkpoint: Checkpoint): string {
   switch (checkpoint) {
     case 'stuck_hint':
-      return 'The local model appears stuck (failed tool calls or malformed output). What should it try next?'
+      return 'The local model appears stuck (failed calls, repeated no-result exploration, denied unnecessary web search, or a generation stall). Give one concrete repository-local next step toward implementation.'
     case 'uncertainty':
       return 'The local model looks uncertain (low token confidence or repeated flailing). Give one concrete next step.'
     case 'self_grade':
@@ -131,6 +132,7 @@ export class FrontierAssist {
         max_tokens: 400,
         temperature: 0.2,
       }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
     if (response.status === 429) {
       this.cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS
@@ -155,6 +157,7 @@ export class FrontierAssist {
         messages: [{ role: 'user', content }],
         max_tokens: 400,
       }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
     if (response.status === 429) {
       this.cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS
