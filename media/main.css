@@ -1602,6 +1602,27 @@ button.multitask-steer[hidden] {
   opacity: 0.85;
 }
 
+.acc-thought-block {
+  margin: 2px 0 4px 0;
+}
+
+.acc-thought-summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--muted-foreground);
+  list-style: none;
+  user-select: none;
+}
+
+.acc-thought-summary::-webkit-details-marker {
+  display: none;
+}
+
+.acc-thought-block[open] .acc-thought-summary {
+  margin-bottom: 4px;
+}
+
 .acc-row.planning {
   font-style: italic;
   opacity: 0.7;
@@ -1614,6 +1635,14 @@ button.multitask-steer[hidden] {
   color: var(--muted-foreground);
   opacity: 0.8;
   line-height: 1.35;
+}
+
+.acc-thought-block.live .acc-thought-summary {
+  color: var(--foreground);
+}
+
+.live-reasoning {
+  white-space: pre-wrap;
 }
 
 .acc-row.tool {
@@ -1644,6 +1673,81 @@ button.multitask-steer[hidden] {
 
 .acc-row.tool.failed .acc-status {
   color: var(--destructive);
+}
+
+.acc-row.tool.muted {
+  color: var(--muted-foreground);
+}
+
+.acc-row.tool.muted .acc-status {
+  color: var(--muted-foreground);
+}
+
+.acc-expand {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.acc-tool-detail {
+  margin: 2px 0 6px 20px;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--background);
+  color: var(--foreground);
+  max-height: 220px;
+  overflow: auto;
+}
+
+.acc-tool-diff .diff-del {
+  color: var(--destructive);
+  background: color-mix(in srgb, var(--destructive) 8%, transparent);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  padding: 0 4px;
+}
+
+.acc-tool-diff .diff-add {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 8%, transparent);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  padding: 0 4px;
+}
+
+.acc-tool-diff .diff-context {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  padding: 0 4px;
+}
+
+.acc-tool-args {
+  margin: 0 0 6px 0;
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+
+.acc-row.compaction-note {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.acc-error.muted-error {
+  color: var(--muted-foreground);
 }
 
 .acc-error {
@@ -2466,6 +2570,264 @@ button.review-more:hover {
 
 #stop-btn:hover {
   background: #b91c1c;
+}
+
+/* ── In-chat question card ─────────────────────────────────────────── */
+
+.question-card {
+  margin: 8px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+}
+
+.question-block + .question-block {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.question-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.question-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.question-option {
+  border: 1px solid var(--border);
+  background: var(--background);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.question-option.selected {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
+
+.question-other input {
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: inherit;
+}
+
+.question-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.question-card.resolved {
+  opacity: 0.85;
+}
+
+.question-answers {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.question-answer-row {
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--background);
+  border: 1px solid var(--border);
+}
+
+.question-answer-q {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  margin-bottom: 2px;
+}
+
+.question-answer-a {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.question-error {
+  font-size: 11px;
+  color: var(--destructive);
+  margin-bottom: 6px;
+}
+
+/* ── Permission card ─────────────────────────────────────────────────── */
+
+.permission-card {
+  margin: 8px 0;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--destructive) 35%, var(--border));
+  border-radius: 8px;
+  background: var(--card);
+}
+
+.permission-head {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.permission-hint {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  margin-bottom: 8px;
+}
+
+.permission-preview {
+  max-height: 120px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 12px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--background);
+  border: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+
+.permission-shell {
+  margin-bottom: 10px;
+}
+
+.permission-shell-command {
+  white-space: pre-wrap;
+  font-size: 12px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--background);
+  border: 1px solid var(--border);
+  margin: 0;
+}
+
+.permission-shell-cwd {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
+.permission-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.permission-diff-before,
+.permission-diff-after {
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 11px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  padding: 8px;
+  border-radius: 6px;
+  margin: 0;
+}
+
+.permission-diff-before {
+  border: 1px solid color-mix(in srgb, var(--destructive) 35%, var(--border));
+  background: color-mix(in srgb, var(--destructive) 6%, var(--background));
+}
+
+.permission-diff-after {
+  border: 1px solid color-mix(in srgb, var(--success) 35%, var(--border));
+  background: color-mix(in srgb, var(--success) 6%, var(--background));
+}
+
+.permission-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.permission-btn {
+  border: 1px solid var(--border);
+  background: var(--background);
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.permission-btn.ghost {
+  color: var(--muted-foreground);
+}
+
+.permission-card.resolved {
+  opacity: 0.75;
+}
+
+/* ── Plan handoff card ─────────────────────────────────────────────── */
+
+.plan-handoff-card {
+  margin: 8px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+}
+
+.plan-handoff-head {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.plan-handoff-path {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  margin-bottom: 8px;
+}
+
+.plan-handoff-preview {
+  max-height: 280px;
+  overflow: auto;
+  font-size: 12px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--background);
+  border: 1px solid var(--border);
+}
+
+.plan-handoff-preview.reply-markdown {
+  white-space: normal;
+}
+
+.plan-handoff-resolved-note {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+  font-style: italic;
+}
+
+.plan-handoff-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.plan-handoff-btn.primary {
+  background: var(--primary);
+  color: var(--primary-foreground, #fff);
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.plan-handoff-card.resolved {
+  opacity: 0.75;
 }
 
 /* ── Spinner ────────────────────────────────────────────────────────── */

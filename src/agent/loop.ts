@@ -16,7 +16,18 @@
 import type { ChatTurn, ChatTurnImage, GenerationParams, InferenceClient } from '../inference/types'
 import { isWebSearchConfigured, readConfig } from '../config'
 import type { ChangedFileStat } from './checkpoints'
+import {
+  collectPreviousUserTasks,
+  COMPACTION_SUMMARY_PROMPT,
+  dropOldestRound,
+  estimateTokens,
+  extractSummary,
+  KEEP_RECENT_TURNS,
+  renderCompactionEnvelope,
+} from './compaction'
 import { buildWorkspaceContext } from './context'
+import { PersistentPermissionStore } from './permissions'
+import { clearScratchpad, ensureScratchpad } from './scratchpad'
 import {
   formatDecomposeInjection,
   frontierDecompose,
@@ -26,10 +37,15 @@ import { formatEvidenceForFrontier, gatherReviewEvidence } from './hybridEvidenc
 import { localSelfGrade } from './hybridSelfGrade'
 import { heuristicUncertainty, HybridUncertaintyTracker } from './hybridUncertainty'
 import { FrontierAssist, type GuideNote } from './frontierAssist'
+import { HookManager } from './hooks'
+import { PlanSession } from './planSession'
+import { PermissionBroker } from './permissionBroker'
+import { QuestionBroker } from './questionBroker'
 import {
   agentSystemPrompt,
   agentUserPrompt,
   buildTaskNotes,
+  isPlanAllowedMutatingTool,
   isReadOnlyMode,
   repairTurn,
   toolResultTurn,
@@ -77,6 +93,8 @@ export interface MultitaskSessionOptions {
 
 export interface LoopEvents {
   onGenerating(active: boolean): void
+  onReasoningChunk?(text: string): void
+  onReasoningDone?(): void
   onToolCall(id: number, call: ToolCall, argsSummary: string): void
   onToolResult(
     id: number,
@@ -85,6 +103,8 @@ export interface LoopEvents {
     viaTrie?: boolean,
     trieMs?: number,
     scanMs?: number,
+    detail?: string,
+    userSkipped?: boolean,
   ): void
   onTodos(todo: string[], done: string[]): void
   /** Frontier model is consulting (stuck hint or final review). */
@@ -95,7 +115,14 @@ export interface LoopEvents {
   /** Context usage after each generation — real token counts from the backend. */
   onContext?(usedTokens: number, limitTokens: number): void
   /** Memory compaction started/finished; `savedTokens` on finish. */
-  onCompaction?(active: boolean, savedTokens?: number): void
+  onCompaction?(active: boolean, savedTokens?: number, keptTurns?: number): void
+  /** Plan mode handoff — user approves switching to Code. */
+  onPlanHandoff?(payload: { path: string; content: string }): Promise<'execute' | 'stay'>
+}
+
+export interface PlanExecutePayload {
+  path: string
+  content: string
 }
 
 /** Events subset needed by compaction (manual trigger passes just these). */
@@ -108,6 +135,8 @@ export interface LoopResult {
   mutatedFiles?: ChangedFileStat[]
   /** Hybrid telemetry for this turn (README / diagnostics). */
   hybridStats?: HybridTurnStats
+  /** User approved plan — host should enqueue a Code turn. */
+  planExecute?: PlanExecutePayload
 }
 
 export interface HybridTurnStats {
@@ -128,8 +157,8 @@ const SELF_GRADE_THRESHOLD = 0.55
 const GENERATION_TIMEOUT_MS = 3 * 60 * 1000
 /** Compact memory when the estimated context passes this share of the window. */
 const COMPACT_THRESHOLD = 0.75
-/** Recent turns kept verbatim through a compaction. */
-const KEEP_RECENT_TURNS = 8
+const STALL_GUARD_CALLS = 6
+const STALL_GUARD_MAX_NUDGES = 2
 
 /** Context window we budget against: daemon knows its length; API backends assume 32k. */
 function contextLimit(): number {
@@ -137,17 +166,21 @@ function contextLimit(): number {
   return cfg.backend === 'daemon' ? Math.max(2048, cfg.daemon.contextLength) : 32768
 }
 
-/** Cheap token estimate (~4 chars/token) plus per-turn overhead. */
-function estimateTokens(turns: readonly ChatTurn[]): number {
-  let total = 0
-  for (const turn of turns) total += Math.ceil(turn.content.length / 4) + 8
-  return total
+const UI_TOOL_DETAIL_MAX = 4000
+
+function toolUiDetail(result: string): string | undefined {
+  const trimmed = result.trim()
+  if (!trimmed) return undefined
+  return trimmed.length <= UI_TOOL_DETAIL_MAX
+    ? trimmed
+    : trimmed.slice(0, UI_TOOL_DETAIL_MAX) + '\n…'
 }
 
 export async function generateWithTimeout(
   client: InferenceClient,
   turns: ChatTurn[],
   params: GenerationParams,
+  onToken: (text: string) => void,
   signal: AbortSignal,
   timeoutMs = GENERATION_TIMEOUT_MS,
 ): Promise<Awaited<ReturnType<InferenceClient['generate']>>> {
@@ -155,7 +188,7 @@ export async function generateWithTimeout(
   const timer = setTimeout(() => timeout.abort(), timeoutMs)
   const combined = AbortSignal.any([signal, timeout.signal])
   try {
-    return await client.generate(turns, params, () => {}, combined)
+    return await client.generate(turns, params, onToken, combined)
   } catch (error) {
     if (timeout.signal.aborted && !signal.aborted) {
       const cancellable = client as InferenceClient & { cancel?: () => Promise<void> }
@@ -186,15 +219,37 @@ export class AgentSession {
   private readonly stuckRecovery = new StuckRecoveryGate()
   private multitask: MultitaskSessionOptions | null = null
   private readonly multitaskCursor = { value: 0 }
+  /** Session-scoped shell approvals (Allow once / for session). */
+  readonly permissions: PersistentPermissionStore
+  readonly questionBroker = new QuestionBroker()
+  readonly permissionBroker = new PermissionBroker()
+  readonly planSession: PlanSession
+  readonly hooks: HookManager
+  /** Stable id for scratchpad paths; set by the chat host. */
+  private sessionId = 'default'
+  /** Last backend-reported token count (preferred for compaction threshold). */
+  private lastReportedTokens = 0
 
   constructor(
     private readonly root: string,
     private readonly workspaceName: string,
     private readonly frontier: FrontierAssist,
-  ) {}
+  ) {
+    this.planSession = new PlanSession(root)
+    this.permissions = new PersistentPermissionStore(root)
+    this.hooks = new HookManager(root)
+  }
 
   get workspaceRoot(): string {
     return this.root
+  }
+
+  setSessionId(id: string): void {
+    this.sessionId = id
+  }
+
+  getSessionId(): string {
+    return this.sessionId
   }
 
   configureMultitask(options: MultitaskSessionOptions | null): void {
@@ -203,11 +258,13 @@ export class AgentSession {
   }
 
   reset(): void {
+    clearScratchpad(this.root, this.sessionId)
     this.turns = []
     this.cachedTokenEstimate = 0
     this.todo = []
     this.done = []
     this.started = false
+    this.permissions.clear()
   }
 
   /** Raw LLM turns, for chat-history persistence. */
@@ -224,6 +281,19 @@ export class AgentSession {
     this.done = []
   }
 
+  /**
+   * Rewind model history to a prior boundary (used with checkpoint file restore).
+   * Keeps the system prompt when present; clears todos.
+   */
+  rewindTurns(toLength: number): void {
+    const keep = Math.max(0, Math.min(toLength, this.turns.length))
+    this.turns = this.turns.slice(0, keep)
+    this.cachedTokenEstimate = estimateTokens(this.turns)
+    this.started = this.turns.length > 0
+    this.todo = []
+    this.done = []
+  }
+
   async runTurn(
     task: string,
     mode: AgentMode,
@@ -236,6 +306,7 @@ export class AgentSession {
     turnImages?: ChatTurnImage[],
   ): Promise<LoopResult> {
     this.frontier.resetTurn()
+    ensureScratchpad(this.root, this.sessionId)
     const tools = new WorkspaceTools(
       this.root,
       this.multitask
@@ -247,6 +318,14 @@ export class AgentSession {
             onActivity: this.multitask.onBusActivity,
           }
         : undefined,
+      {
+        permissions: this.permissions,
+        sessionId: this.sessionId,
+        questionBroker: this.questionBroker,
+        permissionBroker: this.permissionBroker,
+        planSession: mode === 'plan' ? this.planSession : undefined,
+        profile: readConfig().agent.profile,
+      },
     )
     this.mode = mode
     this.hybridEligibleThisTurn = !isTrivialConversation(task)
@@ -300,6 +379,8 @@ export class AgentSession {
     ])
 
     let consecutiveFailures = 0
+    let callsSinceProgress = 0
+    let stallNudges = 0
     this.mutatedThisTurn = false
     const mutatedFiles: ChangedFileStat[] = []
     const verification = new VerificationTracker()
@@ -314,12 +395,22 @@ export class AgentSession {
       let genResult: Awaited<ReturnType<InferenceClient['generate']>> | undefined
       let generationError: unknown
       try {
-        genResult = await generateWithTimeout(client, this.windowedTurns(), params, signal)
+        genResult = await generateWithTimeout(
+          client,
+          this.windowedTurns(),
+          params,
+          (token) => {
+            if (!token) return
+            events.onReasoningChunk?.(token)
+          },
+          signal,
+        )
         raw = genResult.text
       } catch (error) {
         generationError = error
       } finally {
         events.onGenerating(false)
+        events.onReasoningDone?.()
       }
       if (generationError !== undefined) {
         const message =
@@ -334,7 +425,8 @@ export class AgentSession {
       }
       if (!genResult) throw new Error('Generation ended without a result.')
       if (genResult.tokensIn > 0) {
-        events.onContext?.(genResult.tokensIn + genResult.tokensOut, contextLimit())
+        this.lastReportedTokens = genResult.tokensIn + genResult.tokensOut
+        events.onContext?.(this.lastReportedTokens, contextLimit())
       }
 
       const parsed = parseToolCall(raw)
@@ -381,10 +473,58 @@ export class AgentSession {
         continue
       }
 
-      const call = parsed
+      let call = parsed
       uncertainty.noteToolCall(call)
       this.turns.push({ role: 'assistant', content: JSON.stringify(call) })
       const id = ++this.callId
+
+      if (call.tool === 'exit_plan_mode') {
+        if (mode !== 'plan') {
+          this.turns.push({
+            role: 'user',
+            content: toolResultTurn('exit_plan_mode', false, 'Refused: exit_plan_mode is only valid in Plan mode.'),
+          })
+          consecutiveFailures++
+          continue
+        }
+        const planPath = tools.planSession?.relativePath
+        const planContent = tools.planSession?.read()?.trim() ?? ''
+        if (!planPath || planContent.length < 40) {
+          this.turns.push({
+            role: 'user',
+            content: toolResultTurn(
+              'exit_plan_mode',
+              false,
+              'Refused: write a substantive plan with update_plan before calling exit_plan_mode.',
+            ),
+          })
+          consecutiveFailures++
+          continue
+        }
+        events.onToolCall(id, call, summarizeArgs(call))
+        events.onToolResult(id, true, planPath)
+        const decision = events.onPlanHandoff
+          ? await events.onPlanHandoff({ path: planPath, content: planContent })
+          : 'stay'
+        if (decision === 'execute') {
+          return {
+            ok: true,
+            summary: 'Plan approved — implementing in Code mode.',
+            hybridStats,
+            planExecute: { path: planPath, content: planContent },
+          }
+        }
+        this.turns.push({
+          role: 'user',
+          content: toolResultTurn(
+            'exit_plan_mode',
+            false,
+            'User chose to stay in Plan mode. Revise the plan with update_plan if needed, then call exit_plan_mode again.',
+          ),
+        })
+        consecutiveFailures = 0
+        continue
+      }
 
       if (call.tool === 'step_complete' || call.tool === 'step_failed') {
         if (
@@ -430,6 +570,18 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
           (typeof call.args['summary'] === 'string' && (call.args['summary'] as string)) ||
           (typeof call.args['reason'] === 'string' && (call.args['reason'] as string)) ||
           (ok ? 'Done.' : 'Failed.')
+        const postAgent = this.hooks.postAgent(call.tool, summary)
+        if (postAgent.denied) {
+          const userTurn: ChatTurn = {
+            role: 'user',
+            content: toolResultTurn(call.tool, false, `Refused by hook: ${postAgent.denied}`),
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+          consecutiveFailures++
+          continue
+        }
+        summary = postAgent.summary
 
         // Recommendation asks: LLM-as-judge on the draft; rewrite once if needed.
         // No fixed "4–7 bullets" template — the judge scores substance.
@@ -577,14 +729,26 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
       }
 
       const spec0 = TOOL_SPECS.find((t) => t.name === call.tool)
-      if (spec0?.mutating && isReadOnlyMode(this.mode)) {
+      if (spec0?.mutating && readConfig().agent.profile === 'explore') {
+        this.turns.push({
+          role: 'user',
+          content: toolResultTurn(
+            call.tool,
+            false,
+            `Refused: profile "explore" is read-first and blocks mutating tools. Switch trie-ide.agent.profile to default/accept-edits/auto-approve for edits.`,
+          ),
+        })
+        consecutiveFailures++
+        continue
+      }
+      if (spec0?.mutating && isReadOnlyMode(this.mode) && !isPlanAllowedMutatingTool(call.tool)) {
         const modeName = this.mode === 'plan' ? 'PLAN' : 'ASK'
         this.turns.push({
           role: 'user',
           content: toolResultTurn(
             call.tool,
             false,
-            `Refused: ${call.tool} modifies the workspace, but you are in ${modeName} mode (read-only). Finish with step_complete instead.`,
+            `Refused: ${call.tool} modifies the workspace, but you are in ${modeName} mode. Use update_plan in Plan mode, or switch to Code mode.`,
           ),
         })
         consecutiveFailures++
@@ -598,6 +762,8 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
         continue
       }
 
+      const preHook = this.hooks.preTool(call)
+      call = preHook.rewritten
       if (explorationTools.has(call.tool)) exploredThisTurn = true
 
       events.onToolCall(id, call, summarizeArgs(call))
@@ -610,7 +776,13 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
       const repeatedFeatureSearch =
         localSearchQuery === null ? null : featureDiscovery.beforeSearch(localSearchQuery)
       let outcome: ToolOutcome =
-        repeatedFeatureSearch !== null
+        preHook.denied
+          ? {
+              ok: false,
+              result: `Error: ${preHook.denied}`,
+              uiSummary: 'denied by hook',
+            }
+        : repeatedFeatureSearch !== null
           ? {
               ok: true,
               result: repeatedFeatureSearch,
@@ -624,14 +796,55 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
               uiSummary: 'denied by task intent',
             }
           : await tools.execute(call)
+      outcome = this.hooks.postTool(call, outcome)
       if (localSearchQuery !== null && repeatedFeatureSearch === null) {
         outcome = {
           ...outcome,
           result: featureDiscovery.afterSearch(localSearchQuery, outcome.result),
         }
       }
-      events.onToolResult(id, outcome.ok, outcome.uiSummary, outcome.viaTrie, outcome.trieMs, outcome.scanMs)
+      events.onToolResult(
+        id,
+        outcome.ok,
+        outcome.uiSummary,
+        outcome.viaTrie,
+        outcome.trieMs,
+        outcome.scanMs,
+        outcome.uiDetail ?? toolUiDetail(outcome.result),
+        outcome.userSkipped,
+      )
       this.turns.push({ role: 'user', content: toolResultTurn(call.tool, outcome.ok, outcome.result) })
+
+      const progressTool =
+        call.tool === 'edit_file' ||
+        call.tool === 'write_file' ||
+        call.tool === 'run_command' ||
+        call.tool === 'run_verification' ||
+        call.tool === 'update_todos' ||
+        call.tool === 'ask_user_question'
+      if (outcome.ok && progressTool) {
+        callsSinceProgress = 0
+      } else {
+        callsSinceProgress += 1
+      }
+      if (
+        mode === 'code' &&
+        stallNudges < STALL_GUARD_MAX_NUDGES &&
+        callsSinceProgress >= STALL_GUARD_CALLS
+      ) {
+        const guard: ChatTurn = {
+          role: 'user',
+          content: toolResultTurn(
+            call.tool,
+            false,
+            'Stall guard: progress is unclear after several tool calls. Narrow scope now: update_todos with 2-5 concrete steps OR ask_user_question to resolve ambiguity, then execute one step end-to-end.',
+          ),
+        }
+        this.turns.push(guard)
+        this.cachedTokenEstimate += Math.ceil(guard.content.length / 4) + 8
+        callsSinceProgress = 0
+        stallNudges += 1
+      }
 
       if (call.tool === 'web_search' && outcome.ok) webSearchUsedThisTurn = true
       if (
@@ -689,9 +902,9 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     }
   }
 
-  /** Estimated tokens currently in the conversation (chars/4 heuristic). */
+  /** Estimated tokens currently in the conversation. */
   estimatedContextTokens(): number {
-    return estimateTokens(this.turns)
+    return this.lastReportedTokens > 0 ? this.lastReportedTokens : estimateTokens(this.turns)
   }
 
   private async compactIfNeeded(
@@ -700,14 +913,16 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     events: CompactionEvents,
     signal: AbortSignal,
   ): Promise<void> {
-    if (estimateTokens(this.turns) < contextLimit() * COMPACT_THRESHOLD) return
+    const used = this.estimatedContextTokens()
+    if (used < contextLimit() * COMPACT_THRESHOLD) return
     await this.compactNow(client, params, events, signal)
   }
 
   /**
-   * Memory compaction: summarize everything between the system prompt and the
-   * last few turns with the local model, then splice the summary in their
-   * place. Falls back to hard truncation if summarization fails.
+   * Transactional memory compaction (Vibe-style): summarize a *copy* of history,
+   * preserve recent user tasks verbatim, and only replace live turns on success.
+   * On summarizer failure, drop whole oldest rounds until under budget — never
+   * leave a half-mutated transcript.
    */
   async compactNow(
     client: InferenceClient,
@@ -718,45 +933,66 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     if (this.turns.length < KEEP_RECENT_TURNS + 4) return
     const before = estimateTokens(this.turns)
     events.onCompaction?.(true)
-    const head = this.turns[0]
-    const middle = this.turns.slice(1, -KEEP_RECENT_TURNS)
-    const tail = this.turns.slice(-KEEP_RECENT_TURNS)
-    let summaryTurn: ChatTurn
+    let committed = false
     try {
-      const transcript = middle
-        .map((t) => `[${t.role}] ${t.content}`)
-        .join('\n')
-        .slice(0, 24_000)
-      const res = await client.generate(
-        [
-          {
-            role: 'system',
-            content:
-              'Summarize this coding-agent transcript in under 300 words. Keep: the original task, files read/edited (exact paths), key findings, decisions made, and current todo state. Drop: raw file contents, tool call syntax, repeated attempts. Write plain prose.',
-          },
-          { role: 'user', content: transcript },
-        ],
-        { ...params, temperature: 0.1, maxTokens: 512 },
-        () => {},
-        signal,
-      )
-      const summary = res.text.trim()
-      if (!summary) throw new Error('empty summary')
-      summaryTurn = {
-        role: 'user',
-        content: `[Memory compacted] Summary of the earlier conversation:\n${summary}`,
+      const head = this.turns[0]
+      const middle = this.turns.slice(1, -KEEP_RECENT_TURNS)
+      const tail = this.turns.slice(-KEEP_RECENT_TURNS)
+      const previousTasks = collectPreviousUserTasks(middle)
+      let summary: string | null = null
+      try {
+        const transcript = middle
+          .map((t) => `[${t.role}] ${t.content}`)
+          .join('\n')
+          .slice(0, 24_000)
+        const res = await client.generate(
+          [
+            { role: 'system', content: COMPACTION_SUMMARY_PROMPT },
+            { role: 'user', content: transcript },
+          ],
+          { ...params, temperature: 0.1, maxTokens: 512 },
+          () => {},
+          signal,
+        )
+        summary = extractSummary(res.text)
+      } catch {
+        summary = null
       }
-    } catch {
-      summaryTurn = {
-        role: 'user',
-        content:
-          '[Memory compacted] Older turns were dropped to fit the context window. Re-read files if earlier details are needed.',
+
+      let next: ChatTurn[]
+      if (summary) {
+        next = [
+          head,
+          { role: 'user', content: renderCompactionEnvelope(summary, previousTasks) },
+          ...tail,
+        ]
+      } else {
+        // Fallback: drop oldest rounds on a copy until under threshold or stuck.
+        let candidate = [...this.turns]
+        const limit = contextLimit() * COMPACT_THRESHOLD
+        while (estimateTokens(candidate) > limit) {
+          const dropped = dropOldestRound(candidate)
+          if (!dropped) break
+          candidate = dropped
+        }
+        if (candidate.length >= this.turns.length) {
+          // Nothing to reclaim — leave live history untouched.
+          return
+        }
+        next = candidate
       }
+
+      // Commit only after a successful candidate is built.
+      this.turns = next
+      this.lastReportedTokens = 0
+      this.cachedTokenEstimate = estimateTokens(this.turns)
+      const after = this.cachedTokenEstimate
+      committed = true
+      events.onCompaction?.(false, Math.max(0, before - after), KEEP_RECENT_TURNS)
+      events.onContext?.(after, contextLimit())
+    } finally {
+      if (!committed) events.onCompaction?.(false)
     }
-    this.turns = [head, summaryTurn, ...tail]
-    const after = estimateTokens(this.turns)
-    events.onCompaction?.(false, Math.max(0, before - after))
-    events.onContext?.(after, contextLimit())
   }
 
   /** Auto-run web_search when the task clearly needs external info — local models often skip it. */
@@ -775,7 +1011,16 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     const id = ++this.callId
     events.onToolCall(id, call, summarizeArgs(call))
     const outcome = await tools.execute(call)
-    events.onToolResult(id, outcome.ok, outcome.uiSummary, outcome.viaTrie, outcome.trieMs, outcome.scanMs)
+    events.onToolResult(
+      id,
+      outcome.ok,
+      outcome.uiSummary,
+      outcome.viaTrie,
+      outcome.trieMs,
+      outcome.scanMs,
+      outcome.uiDetail ?? toolUiDetail(outcome.result),
+      outcome.userSkipped,
+    )
     this.turns.push({ role: 'assistant', content: JSON.stringify(call) })
     this.turns.push({ role: 'user', content: toolResultTurn('web_search', outcome.ok, outcome.result) })
     return outcome.ok

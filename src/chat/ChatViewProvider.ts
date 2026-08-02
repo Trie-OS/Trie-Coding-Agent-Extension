@@ -5,11 +5,14 @@ import { readConfig, setFrontierSelection, setHybridEnabled, hybridActiveLabel, 
 import { ShadowRepo, type ChangedFileStat } from '../agent/checkpoints'
 import { FrontierAssist, type GuideNote } from '../agent/frontierAssist'
 import { AgentSession } from '../agent/loop'
+import type { PermissionChoice, PermissionRequest } from '../agent/permissionBroker'
+import type { QuestionAnswer, UserQuestionPayload } from '../agent/questionBroker'
 import { MultitaskBus } from '../agent/multitaskBus'
 import type { AgentMode } from '../agent/prompts'
 import type { ToolCall } from '../agent/tools'
 import { formatToolRow, toolGroupKey, toolLineDelta } from '../agent/tools'
 import { summaryClaimsFileChanges } from '../agent/taskIntent'
+import { clearScratchpad } from '../agent/scratchpad'
 import { WorktreeManager } from '../agent/worktrees'
 import { DaemonClient } from '../inference/daemonClient'
 import {
@@ -38,22 +41,28 @@ type ToWebview =
       theme: WebviewTheme
     }
   | { type: 'tool-call'; id: number; tool: string; args: string; rowLabel: string; thought: string; groupKey?: string; linesAdded?: number; linesDeleted?: number }
-  | { type: 'tool-result'; id: number; ok: boolean; summary: string; viaTrie?: boolean; trieMs?: number; scanMs?: number }
+  | { type: 'reasoning'; chunk?: string; done?: boolean }
+  | { type: 'tool-result'; id: number; ok: boolean; summary: string; viaTrie?: boolean; trieMs?: number; scanMs?: number; detail?: string; userSkipped?: boolean }
   | { type: 'todos'; todo: string[]; done: string[] }
   | { type: 'hybrid-check'; active: boolean; checkpoint?: string }
   | { type: 'hybrid-plan'; subtasks: string[]; rationale?: string }
   | { type: 'guide'; checkpoint: string; verdict: string; text: string }
   | { type: 'context'; used: number; limit: number }
-  | { type: 'compaction'; active: boolean; saved?: number }
+  | { type: 'compaction'; active: boolean; saved?: number; keptTurns?: number }
   | { type: 'final'; ok: boolean; text: string; checkpoint?: string }
   | { type: 'review'; checkpoint: string; files: ChangedFileStat[] }
   | { type: 'error'; text: string }
   | { type: 'notice'; text: string }
-  | { type: 'restored'; sha: string; files: number }
+  | { type: 'restored'; sha: string; files: number; conversationRewound?: boolean }
   | { type: 'reset' }
   | { type: 'history'; chats: (ChatSummary & { current: boolean })[] }
   | { type: 'chat-loaded'; transcript: TranscriptEntry[] }
   | { type: 'multitask-list'; tasks: MultitaskTaskView[] }
+  | { type: 'question'; requestId: string; questions: UserQuestionPayload[] }
+  | { type: 'question-resolved'; requestId: string; answers: QuestionAnswer[] }
+  | { type: 'plan-handoff'; id: string; path: string; content: string }
+  | { type: 'plan-handoff-resolved'; id: string; action: 'execute' | 'stay' | 'open' }
+  | { type: 'permission'; requestId: string; request: PermissionRequest }
 
 const CHECKPOINT_SCHEME = 'trie-checkpoint'
 
@@ -76,6 +85,10 @@ type FromWebview =
   | { type: 'multitask-cancel'; id: string }
   | { type: 'multitask-cancel-all' }
   | { type: 'multitask-steer'; id: string }
+  | { type: 'question-answer'; requestId: string; answers: QuestionAnswer[] }
+  | { type: 'question-cancel'; requestId: string }
+  | { type: 'plan-handoff-action'; id: string; action: 'execute' | 'stay' | 'open' }
+  | { type: 'permission-answer'; requestId: string; choice: PermissionChoice }
 
 type MultitaskStatus = 'waiting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
 
@@ -112,6 +125,13 @@ interface MultitaskParent {
   integrateSummary?: string
   concurrencyNote?: string
   finalizing?: boolean
+}
+
+/** File + conversation rewind point captured with each turn checkpoint. */
+interface CheckpointBookmark {
+  turnsLen: number
+  transcriptLen: number
+  chatId: string
 }
 
 interface ChatRuntime {
@@ -153,6 +173,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly activeRuns = new Map<string, RunRequest>()
   private readonly multitaskTasks: MultitaskTask[] = []
   private readonly multitaskParents = new Map<string, MultitaskParent>()
+  /** checkpoint sha → rewind boundary for files + conversation */
+  private readonly checkpointBookmarks = new Map<string, CheckpointBookmark>()
+  private readonly pendingQuestions = new Map<
+    string,
+    { resolve: (answers: QuestionAnswer[] | null) => void }
+  >()
+  private readonly pendingPlanHandoffs = new Map<
+    string,
+    { resolve: (decision: 'execute' | 'stay') => void; path: string }
+  >()
+  private readonly pendingPermissions = new Map<
+    string,
+    { resolve: (choice: PermissionChoice | null) => void }
+  >()
 
   private log(message: string): void {
     this.output.appendLine(`[${new Date().toISOString()}] ${message}`)
@@ -200,16 +234,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     createdAt = Date.now(),
     transcript: TranscriptEntry[] = [],
   ): ChatRuntime {
+    const session = new AgentSession(
+      folder.uri.fsPath,
+      folder.name,
+      new FrontierAssist(() => readConfig().frontierAssist),
+    )
+    session.setSessionId(id)
     const runtime: ChatRuntime = {
       id,
       createdAt,
       workspace: folder.uri.fsPath,
       transcript: [...transcript],
-      session: new AgentSession(
-        folder.uri.fsPath,
-        folder.name,
-        new FrontierAssist(() => readConfig().frontierAssist),
-      ),
+      session,
       pendingRuns: 0,
     }
     this.runtimes.set(id, runtime)
@@ -264,6 +300,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'review':
       case 'notice':
       case 'multitask-list':
+      case 'question':
+      case 'question-resolved':
+      case 'plan-handoff':
+      case 'plan-handoff-resolved':
         return true
       default:
         return false
@@ -272,6 +312,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private post(message: ToWebview): void {
     void this.view?.webview.postMessage(message)
+  }
+
+  private requestQuestion(
+    runtime: ChatRuntime,
+    requestId: string,
+    questions: UserQuestionPayload[],
+  ): Promise<QuestionAnswer[] | null> {
+    return new Promise((resolve) => {
+      this.pendingQuestions.set(requestId, { resolve })
+      this.postFor(runtime, { type: 'question', requestId, questions })
+    })
+  }
+
+  private requestPlanHandoff(
+    runtime: ChatRuntime,
+    payload: { path: string; content: string },
+  ): Promise<'execute' | 'stay'> {
+    const id = crypto.randomUUID()
+    return new Promise((resolve) => {
+      this.pendingPlanHandoffs.set(id, { resolve, path: payload.path })
+      this.postFor(runtime, { type: 'plan-handoff', id, path: payload.path, content: payload.content })
+    })
+  }
+
+  private requestPermission(
+    runtime: ChatRuntime,
+    requestId: string,
+    request: PermissionRequest,
+  ): Promise<PermissionChoice | null> {
+    return new Promise((resolve) => {
+      this.pendingPermissions.set(requestId, { resolve })
+      this.postFor(runtime, { type: 'permission', requestId, request })
+    })
   }
 
   private pushState(): void {
@@ -764,7 +837,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         { temperature: cfg.agent.temperature, topP: 0.95, maxTokens: cfg.agent.maxTokens },
         {
           onContext: (used, limit) => this.postFor(runtime, { type: 'context', used, limit }),
-          onCompaction: (active, saved) => this.postFor(runtime, { type: 'compaction', active, saved }),
+          onCompaction: (active, saved, keptTurns) =>
+            this.postFor(runtime, { type: 'compaction', active, saved, keptTurns }),
         },
         new AbortController().signal,
       )
@@ -966,6 +1040,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (await turnShadow.isGitAvailable()) {
           checkpointSha = await turnShadow.snapshot(`before: ${text.slice(0, 72)}`)
           this.log(`checkpoint ${checkpointSha.slice(0, 8)} taken for: ${text.slice(0, 60)}`)
+          // Capture rewind boundary before runTurn mutates model history.
+          // Transcript already includes this turn's user bubble (enqueueRun).
+          if (!request.internal && !request.multitask) {
+            this.checkpointBookmarks.set(checkpointSha, {
+              turnsLen: session.exportTurns().length,
+              transcriptLen: Math.max(0, runtime.transcript.length - 1),
+              chatId: runtime.id,
+            })
+          }
         } else {
           this.log('git not available — no checkpoint, no review card this turn')
           this.postFor(runtime, { type: 'notice', text: 'git not found — changes this turn cannot be reviewed or undone.' })
@@ -978,6 +1061,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     try {
+      session.questionBroker.setHandler((requestId, questions) =>
+        this.requestQuestion(runtime, requestId, questions),
+      )
+      session.permissionBroker.setHandler((requestId, request) =>
+        this.requestPermission(runtime, requestId, request),
+      )
       const result = await session.runTurn(
         text,
         mode,
@@ -990,6 +1079,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             request.multitask.currentAction =
               request.multitask.kind === 'coordinator' ? 'Synthesizing child findings' : 'Thinking'
             this.pushMultitaskTasks()
+          },
+          onReasoningChunk: (text) => {
+            if (request.internal) return
+            this.postFor(runtime, { type: 'reasoning', chunk: text })
+          },
+          onReasoningDone: () => {
+            if (request.internal) return
+            this.postFor(runtime, { type: 'reasoning', done: true })
           },
           onToolCall: (id: number, call: ToolCall, argsSummary: string) => {
             const delta = toolLineDelta(call)
@@ -1010,10 +1107,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               linesDeleted: delta.deleted,
             })
           },
-          onToolResult: (id: number, ok: boolean, summary: string, viaTrie?: boolean, trieMs?: number, scanMs?: number) =>
+          onToolResult: (
+            id: number,
+            ok: boolean,
+            summary: string,
+            viaTrie?: boolean,
+            trieMs?: number,
+            scanMs?: number,
+            detail?: string,
+            userSkipped?: boolean,
+          ) =>
             request.internal
               ? undefined
-              : this.postFor(runtime, { type: 'tool-result', id, ok, summary, viaTrie, trieMs, scanMs }),
+              : this.postFor(runtime, {
+                  type: 'tool-result',
+                  id,
+                  ok,
+                  summary,
+                  viaTrie,
+                  trieMs,
+                  scanMs,
+                  detail,
+                  userSkipped,
+                }),
           onTodos: (todo: string[], done: string[]) => {
             if (!request.internal) this.postFor(runtime, { type: 'todos', todo, done })
           },
@@ -1022,9 +1138,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           onHybridPlan: (subtasks, rationale) =>
             this.postFor(runtime, { type: 'hybrid-plan', subtasks, rationale }),
           onContext: (used, limit) => this.postFor(runtime, { type: 'context', used, limit }),
-          onCompaction: (active, saved) => this.postFor(runtime, { type: 'compaction', active, saved }),
+          onCompaction: (active, saved, keptTurns) =>
+            this.postFor(runtime, { type: 'compaction', active, saved, keptTurns }),
           onGuideNote: (note: GuideNote) =>
             this.postFor(runtime, { type: 'guide', checkpoint: note.checkpoint, verdict: note.verdict, text: note.text }),
+          onPlanHandoff: (payload) => this.requestPlanHandoff(runtime, payload),
         },
         request.abort.signal,
         checkpointSha && turnShadow
@@ -1039,6 +1157,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.log(
           `hybrid: ${h.frontierCalls} frontier call(s), decomposed=${h.decomposed}, uncertainty=${h.uncertaintyEscalations}, selfGrade=${h.selfGradeConfidence ?? 'n/a'}, evidenceFiles=${h.evidenceChecks}`,
         )
+      }
+      if (result.planExecute && !request.internal) {
+        const { path: planPath, content: planContent } = result.planExecute
+        this.postFor(runtime, {
+          type: 'final',
+          ok: true,
+          text: result.summary,
+        })
+        runtime.transcript.push({ role: 'reply', text: result.summary, failed: false })
+        const implText = `Implement the approved plan at ${planPath}:\n\n${planContent}`
+        this.enqueueRun(runtime, implText, 'code', runtime.session, undefined, undefined, false)
+        return { ok: true, result: result.summary }
       }
       // Cursor-style review card: per-file stats vs the checkpoint, with
       // Keep/Undo. Falls back to the plain restore button if stats fail.
@@ -1109,6 +1239,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return { ok: false, result: friendly }
       }
     } finally {
+      session.questionBroker.setHandler(null)
+      session.permissionBroker.setHandler(null)
       void this.saveChat(runtime)
     }
   }
@@ -1165,18 +1297,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return
     }
     if (!this.shadowRepo) return
+    const bookmark = this.checkpointBookmarks.get(sha)
     const choice = await vscode.window.showWarningMessage(
-      `Restore the workspace to the checkpoint taken before this turn? Files changed since (checkpoint ${sha.slice(0, 8)}) will be reverted.`,
+      bookmark
+        ? `Undo this turn? Files will revert to checkpoint ${sha.slice(0, 8)} and the conversation will rewind to before the turn.`
+        : `Restore the workspace to the checkpoint taken before this turn? Files changed since (checkpoint ${sha.slice(0, 8)}) will be reverted.`,
       { modal: true },
-      'Restore',
+      'Undo turn',
     )
-    if (choice !== 'Restore') return
+    if (choice !== 'Undo turn') return
     try {
       const changed = await this.shadowRepo.changedPaths(sha)
       await this.shadowRepo.restore(sha)
-      this.post({ type: 'restored', sha, files: changed.length })
+      let conversationRewound = false
+      if (bookmark) {
+        const runtime = this.runtimes.get(bookmark.chatId) ?? this.selectedRuntime()
+        if (runtime) {
+          runtime.session.rewindTurns(bookmark.turnsLen)
+          runtime.transcript = runtime.transcript.slice(0, bookmark.transcriptLen)
+          conversationRewound = true
+          void this.saveChat(runtime)
+          if (runtime.id === this.selectedChatId) {
+            this.post({ type: 'chat-loaded', transcript: runtime.transcript })
+          }
+        }
+        this.checkpointBookmarks.delete(sha)
+      }
+      this.post({ type: 'restored', sha, files: changed.length, conversationRewound })
       void vscode.window.showInformationMessage(
-        `Restored checkpoint ${sha.slice(0, 8)} (${changed.length} file${changed.length === 1 ? '' : 's'} reverted).`,
+        conversationRewound
+          ? `Undid turn ${sha.slice(0, 8)} (${changed.length} file${changed.length === 1 ? '' : 's'} reverted; conversation rewound).`
+          : `Restored checkpoint ${sha.slice(0, 8)} (${changed.length} file${changed.length === 1 ? '' : 's'} reverted).`,
       )
     } catch (error) {
       this.post({
@@ -1216,6 +1367,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           void vscode.window.showInformationMessage('This chat still has queued or running work.')
           break
         }
+        const folder = vscode.workspace.workspaceFolders?.[0]
+        if (folder) clearScratchpad(folder.uri.fsPath, message.id)
         await this.store.delete(message.id)
         this.runtimes.delete(message.id)
         if (message.id === this.selectedChatId) {
@@ -1265,6 +1418,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'multitask-steer':
         this.steerMultitask(message.id)
         break
+      case 'question-answer': {
+        const pending = this.pendingQuestions.get(message.requestId)
+        if (pending) {
+          this.pendingQuestions.delete(message.requestId)
+          pending.resolve(message.answers)
+          const runtime = this.selectedRuntime()
+          if (runtime) {
+            this.postFor(runtime, {
+              type: 'question-resolved',
+              requestId: message.requestId,
+              answers: message.answers,
+            })
+          }
+        }
+        break
+      }
+      case 'question-cancel': {
+        const pending = this.pendingQuestions.get(message.requestId)
+        if (pending) {
+          this.pendingQuestions.delete(message.requestId)
+          pending.resolve(null)
+        }
+        break
+      }
+      case 'plan-handoff-action': {
+        const handoff = this.pendingPlanHandoffs.get(message.id)
+        if (!handoff) break
+        if (message.action === 'open') {
+          const folder = vscode.workspace.workspaceFolders?.[0]
+          if (folder) {
+            const uri = vscode.Uri.joinPath(folder.uri, handoff.path)
+            void vscode.window.showTextDocument(uri)
+          }
+          break
+        }
+        this.pendingPlanHandoffs.delete(message.id)
+        handoff.resolve(message.action === 'execute' ? 'execute' : 'stay')
+        const runtime = this.selectedRuntime()
+        if (runtime) {
+          this.postFor(runtime, {
+            type: 'plan-handoff-resolved',
+            id: message.id,
+            action: message.action,
+          })
+        }
+        break
+      }
+      case 'permission-answer': {
+        const pending = this.pendingPermissions.get(message.requestId)
+        if (pending) {
+          this.pendingPermissions.delete(message.requestId)
+          pending.resolve(message.choice)
+        }
+        break
+      }
     }
   }
 

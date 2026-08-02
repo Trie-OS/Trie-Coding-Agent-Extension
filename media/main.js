@@ -180,6 +180,40 @@
       });
     }
     let turnSession = null;
+    let liveReasoningEl = null;
+    let liveReasoningBodyEl = null;
+    function ensureLiveReasoning() {
+      if (liveReasoningEl && liveReasoningBodyEl) return liveReasoningBodyEl;
+      const details = document.createElement("details");
+      details.className = "acc-thought-block live";
+      details.open = true;
+      const summary = document.createElement("summary");
+      summary.className = "acc-thought-summary";
+      summary.textContent = "Thinking\u2026";
+      const body = document.createElement("div");
+      body.className = "acc-thought live-reasoning";
+      details.append(summary, body);
+      const session = ensureTurnSession();
+      session.body.appendChild(details);
+      liveReasoningEl = details;
+      liveReasoningBodyEl = body;
+      return body;
+    }
+    function appendLiveReasoning(chunk) {
+      if (!chunk) return;
+      const body = ensureLiveReasoning();
+      body.textContent = (body.textContent ?? "") + chunk;
+      scrollDown();
+    }
+    function settleLiveReasoning() {
+      if (!liveReasoningEl) return;
+      liveReasoningEl.classList.remove("live");
+      liveReasoningEl.open = false;
+      const summary = liveReasoningEl.querySelector(".acc-thought-summary");
+      if (summary) summary.textContent = "Thought";
+      liveReasoningEl = null;
+      liveReasoningBodyEl = null;
+    }
     function turnSummaryText(session, finished) {
       const parts = [];
       if (session.editedPaths.size > 0) {
@@ -297,26 +331,98 @@
     }
     function addThoughtRow(group, thought, sinceMs) {
       if (!thought || !thought.trim()) return;
-      const row = document.createElement("div");
-      row.className = "acc-row thought";
-      const prefix = sinceMs >= 800 ? "Thought for " + formatElapsed(sinceMs) : "Thought";
-      row.textContent = prefix;
-      const detail = document.createElement("div");
-      detail.className = "acc-thought";
-      detail.textContent = thought;
-      group.body.appendChild(row);
-      group.body.appendChild(detail);
+      const details = document.createElement("details");
+      details.className = "acc-thought-block";
+      const summary = document.createElement("summary");
+      summary.className = "acc-thought-summary";
+      summary.textContent = sinceMs >= 800 ? "Thought for " + formatElapsed(sinceMs) : "Thought";
+      const body = document.createElement("div");
+      body.className = "acc-thought";
+      body.textContent = thought;
+      details.append(summary, body);
+      group.body.appendChild(details);
     }
-    function addToolRow(group, id, rowLabel, thought, sinceMs) {
+    function addToolRow(group, id, rowLabel, thought, sinceMs, argsPreview, toolName) {
       addThoughtRow(group, thought, sinceMs);
       const row = document.createElement("div");
       row.className = "acc-row tool running";
       row.dataset.id = String(id);
-      row.innerHTML = '<span class="acc-status">\xB7</span><span class="acc-label"></span>';
+      if (argsPreview) row.dataset.args = argsPreview;
+      if (toolName) row.dataset.tool = toolName;
+      row.innerHTML = '<button type="button" class="acc-expand" hidden aria-label="Show details">\u23F5</button><span class="acc-status">\xB7</span><span class="acc-label"></span>';
       row.querySelector(".acc-label").textContent = rowLabel;
       group.body.appendChild(row);
       bumpGroupMeta(group);
+      if (argsPreview) {
+        const expand = row.querySelector(".acc-expand");
+        expand.hidden = false;
+      }
       return row;
+    }
+    function renderDiffDetailPanel(text) {
+      const panel = document.createElement("div");
+      panel.className = "acc-tool-detail acc-tool-diff";
+      for (const line of text.split("\n")) {
+        const row = document.createElement("div");
+        if (line.startsWith("\u2212")) {
+          row.className = "diff-del";
+          row.textContent = line;
+        } else if (line.startsWith("+")) {
+          row.className = "diff-add";
+          row.textContent = line;
+        } else {
+          row.className = "diff-context";
+          row.textContent = line;
+        }
+        panel.appendChild(row);
+      }
+      return panel;
+    }
+    function attachToolDetail(row, argsPreview, detail) {
+      if (!argsPreview && !detail) return;
+      const expand = row.querySelector(".acc-expand");
+      if (expand) expand.hidden = false;
+      let panel = null;
+      const toggle = () => {
+        if (panel) {
+          panel.remove();
+          panel = null;
+          if (expand) expand.textContent = "\u23F5";
+          row.classList.remove("expanded");
+          return;
+        }
+        const parts = [];
+        if (argsPreview) parts.push(argsPreview);
+        if (detail) parts.push(detail);
+        const combined = parts.join("\n\n");
+        const isDiff = detail !== void 0 && detail.split("\n").some((line) => line.startsWith("\u2212") || line.startsWith("+"));
+        if (isDiff && !argsPreview) {
+          panel = renderDiffDetailPanel(detail);
+        } else if (isDiff) {
+          panel = document.createElement("div");
+          panel.className = "acc-tool-detail";
+          if (argsPreview) {
+            const argsEl = document.createElement("pre");
+            argsEl.className = "acc-tool-args";
+            argsEl.textContent = argsPreview;
+            panel.appendChild(argsEl);
+          }
+          panel.appendChild(renderDiffDetailPanel(detail));
+        } else {
+          panel = document.createElement("pre");
+          panel.className = "acc-tool-detail";
+          panel.textContent = combined;
+        }
+        row.after(panel);
+        row.classList.add("expanded");
+        if (expand) expand.textContent = "\u23F7";
+        scrollDown();
+      };
+      expand?.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggle();
+      });
+      if (detail) row.dataset.detail = detail;
     }
     function trackToolCall(msg) {
       const session = ensureTurnSession();
@@ -344,7 +450,7 @@
         group = ensureAccordionGroup("edit", msg.tool);
       }
       refreshTurnSummary();
-      return addToolRow(group, msg.id, msg.rowLabel, msg.thought, sinceMs);
+      return addToolRow(group, msg.id, msg.rowLabel, msg.thought, sinceMs, msg.args, msg.tool);
     }
     let todoCard = null;
     let todoCardSeen = false;
@@ -391,6 +497,14 @@
     }
     function finishTurnSession() {
       if (!turnSession) return;
+      for (const row of Array.from(
+        turnSession.body.querySelectorAll(".acc-row.tool.muted:not([data-skipped])")
+      )) {
+        row.classList.remove("muted");
+        row.classList.add("failed");
+        const status = row.querySelector(".acc-status");
+        if (status) status.textContent = "\u2717";
+      }
       refreshTurnSummary();
       const session = turnSession;
       session.labelEl.textContent = turnSummaryText(session, true);
@@ -421,6 +535,8 @@
       planningEl = null;
     }
     const reviewCards = /* @__PURE__ */ new Map();
+    const questionSnapshots = /* @__PURE__ */ new Map();
+    const planHandoffSnapshots = /* @__PURE__ */ new Map();
     function fileBadge(name) {
       const ext = name.split(".").pop()?.toLowerCase() ?? "";
       if (ext === "ts" || ext === "tsx") return { text: "TS", cls: "ts" };
@@ -584,7 +700,7 @@
       const undoBtn2 = document.createElement("button");
       undoBtn2.className = "review-btn undo";
       undoBtn2.textContent = "\u21BA Undo";
-      undoBtn2.title = "Revert the workspace to how it was before this turn";
+      undoBtn2.title = "Revert files and rewind the conversation to before this turn";
       undoBtn2.addEventListener("click", () => {
         vscode.postMessage({ type: "restore", sha });
       });
@@ -736,26 +852,286 @@
         el.remove();
       }
     }
-    function mountModeIcons() {
-      for (const btn of document.querySelectorAll("#mode-picker .mode")) {
-        const mode = btn.dataset.mode;
-        if (!mode || !(mode in MODE_ICONS)) continue;
-        btn.querySelector(".mode-icon")?.remove();
-        const svg = createElement(MODE_ICONS[mode], {
-          width: 13,
-          height: 13,
-          "stroke-width": 2,
-          class: "mode-icon"
-        });
-        btn.prepend(svg);
-      }
+    function renderCompactionNote(saved, keptTurns) {
+      const session = ensureTurnSession();
+      const row = document.createElement("div");
+      row.className = "acc-row compaction-note";
+      const kept = typeof keptTurns === "number" ? ` \xB7 kept last ${keptTurns} turns` : "";
+      row.textContent = `Compacted conversation history \xB7 freed ~${fmtTokens(saved)}${kept}`;
+      session.body.appendChild(row);
+      scrollDown();
     }
-    mountModeIcons();
-    const modeButtons = Array.from(document.querySelectorAll("#mode-picker .mode"));
-    for (const btn of modeButtons) {
-      btn.addEventListener("click", () => {
-        setMode(btn.dataset.mode || "code");
+    function renderPermissionCard(requestId, request) {
+      hideSpinner();
+      const card = document.createElement("div");
+      card.className = "permission-card";
+      card.dataset.requestId = requestId;
+      const head = document.createElement("div");
+      head.className = "permission-head";
+      head.textContent = request.title;
+      const hint = document.createElement("div");
+      hint.className = "permission-hint";
+      hint.textContent = request.kind === "shell" ? "Shell commands can modify your system. Review before allowing." : request.kind === "scope" ? "This action expands tool scope beyond the workspace." : "This path may contain secrets or credentials.";
+      card.append(head, hint);
+      if (request.kind === "shell" && request.command) {
+        const shellBox = document.createElement("div");
+        shellBox.className = "permission-shell";
+        const command = document.createElement("pre");
+        command.className = "permission-shell-command";
+        command.textContent = request.command;
+        shellBox.appendChild(command);
+        if (request.cwd) {
+          const cwd = document.createElement("div");
+          cwd.className = "permission-shell-cwd";
+          cwd.textContent = "cwd: " + request.cwd;
+          shellBox.appendChild(cwd);
+        }
+        card.appendChild(shellBox);
+      }
+      if (request.diff?.before !== void 0 || request.diff?.after !== void 0) {
+        const diffWrap = document.createElement("div");
+        diffWrap.className = "permission-diff";
+        if (request.diff.before !== void 0) {
+          const beforeBlock = document.createElement("pre");
+          beforeBlock.className = "permission-diff-before";
+          beforeBlock.textContent = request.diff.before;
+          diffWrap.appendChild(beforeBlock);
+        }
+        if (request.diff.after !== void 0) {
+          const afterBlock = document.createElement("pre");
+          afterBlock.className = "permission-diff-after";
+          afterBlock.textContent = request.diff.after;
+          diffWrap.appendChild(afterBlock);
+        }
+        card.appendChild(diffWrap);
+      } else if (!(request.kind === "shell" && request.command)) {
+        const preview = document.createElement("pre");
+        preview.className = "permission-preview";
+        preview.textContent = request.preview;
+        card.appendChild(preview);
+      }
+      const actions = document.createElement("div");
+      actions.className = "permission-actions";
+      const buttons = [];
+      const once = document.createElement("button");
+      once.className = "permission-btn";
+      once.textContent = "Allow once";
+      once.disabled = true;
+      buttons.push(once);
+      const sessionBtn = document.createElement("button");
+      sessionBtn.className = "permission-btn";
+      sessionBtn.textContent = "Allow for session";
+      sessionBtn.disabled = true;
+      buttons.push(sessionBtn);
+      const alwaysBtn = document.createElement("button");
+      alwaysBtn.className = "permission-btn";
+      alwaysBtn.textContent = "Always allow";
+      alwaysBtn.disabled = true;
+      buttons.push(alwaysBtn);
+      const deny = document.createElement("button");
+      deny.className = "permission-btn ghost";
+      deny.textContent = "Deny";
+      deny.disabled = true;
+      buttons.push(deny);
+      const resolve = (choice) => {
+        card.classList.add("resolved");
+        for (const btn of buttons) btn.disabled = true;
+        vscode.postMessage({ type: "permission-answer", requestId, choice });
+      };
+      once.addEventListener("click", () => resolve("once"));
+      sessionBtn.addEventListener("click", () => resolve("session"));
+      alwaysBtn.addEventListener("click", () => resolve("always"));
+      deny.addEventListener("click", () => resolve("deny"));
+      actions.append(once, sessionBtn, alwaysBtn, deny);
+      card.appendChild(actions);
+      messagesEl.appendChild(card);
+      scrollDown();
+      setTimeout(() => {
+        for (const btn of buttons) btn.disabled = false;
+      }, 400);
+    }
+    function showQuestionAnswers(card, answers) {
+      card.querySelectorAll(".question-options, .question-other, .question-actions, .question-error").forEach(
+        (el) => el.remove()
+      );
+      const summary = document.createElement("div");
+      summary.className = "question-answers";
+      for (const answer of answers) {
+        const row = document.createElement("div");
+        row.className = "question-answer-row";
+        const q = document.createElement("div");
+        q.className = "question-answer-q";
+        q.textContent = answer.question;
+        const a = document.createElement("div");
+        a.className = "question-answer-a";
+        a.textContent = answer.answer;
+        row.append(q, a);
+        summary.appendChild(row);
+      }
+      card.appendChild(summary);
+      card.classList.add("resolved");
+    }
+    function renderQuestionCard(requestId, questions, resolvedAnswers) {
+      if (resolvedAnswers?.length) {
+        const card2 = document.createElement("div");
+        card2.className = "question-card resolved";
+        card2.dataset.requestId = requestId;
+        for (const q of questions) {
+          const block = document.createElement("div");
+          block.className = "question-block";
+          const title = document.createElement("div");
+          title.className = "question-title";
+          title.textContent = q.question;
+          block.appendChild(title);
+          card2.appendChild(block);
+        }
+        showQuestionAnswers(card2, resolvedAnswers);
+        messagesEl.appendChild(card2);
+        scrollDown();
+        return;
+      }
+      hideSpinner();
+      const card = document.createElement("div");
+      card.className = "question-card";
+      card.dataset.requestId = requestId;
+      const selections = /* @__PURE__ */ new Map();
+      const otherTexts = /* @__PURE__ */ new Map();
+      for (const [qIndex, q] of questions.entries()) {
+        const block = document.createElement("div");
+        block.className = "question-block";
+        const title = document.createElement("div");
+        title.className = "question-title";
+        title.textContent = q.question;
+        block.appendChild(title);
+        const opts = document.createElement("div");
+        opts.className = "question-options";
+        selections.set(qIndex, /* @__PURE__ */ new Set());
+        for (const option of q.options) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "question-option";
+          btn.textContent = option;
+          btn.addEventListener("click", () => {
+            const set = selections.get(qIndex);
+            if (q.multiSelect) {
+              if (set.has(option)) set.delete(option);
+              else set.add(option);
+              btn.classList.toggle("selected", set.has(option));
+            } else {
+              set.clear();
+              set.add(option);
+              for (const sibling of opts.querySelectorAll(".question-option")) {
+                sibling.classList.remove("selected");
+              }
+              btn.classList.add("selected");
+            }
+          });
+          opts.appendChild(btn);
+        }
+        const otherRow = document.createElement("div");
+        otherRow.className = "question-other";
+        const otherInput = document.createElement("input");
+        otherInput.type = "text";
+        otherInput.placeholder = "Other\u2026";
+        otherInput.addEventListener("input", () => {
+          otherTexts.set(qIndex, otherInput.value.trim());
+        });
+        otherRow.appendChild(otherInput);
+        block.appendChild(opts);
+        block.appendChild(otherRow);
+        card.appendChild(block);
+      }
+      const actions = document.createElement("div");
+      actions.className = "question-actions";
+      const submit = document.createElement("button");
+      submit.className = "question-submit";
+      submit.textContent = "Submit";
+      submit.addEventListener("click", () => {
+        const answers = [];
+        for (const [i, q] of questions.entries()) {
+          const other = otherTexts.get(i) ?? "";
+          if (other) {
+            answers.push({ question: q.question, answer: other, isOther: true });
+            continue;
+          }
+          const selected = [...selections.get(i) ?? []];
+          if (selected.length === 0) {
+            let err = card.querySelector(".question-error");
+            if (!err) {
+              err = document.createElement("div");
+              err.className = "question-error";
+              actions.before(err);
+            }
+            err.textContent = "Answer every question before submitting.";
+            return;
+          }
+          answers.push({ question: q.question, answer: selected.join(", ") });
+        }
+        showQuestionAnswers(card, answers);
+        vscode.postMessage({ type: "question-answer", requestId, answers });
       });
+      const cancel = document.createElement("button");
+      cancel.className = "question-cancel ghost";
+      cancel.textContent = "Cancel";
+      cancel.addEventListener("click", () => {
+        card.remove();
+        vscode.postMessage({ type: "question-cancel", requestId });
+      });
+      actions.appendChild(submit);
+      actions.appendChild(cancel);
+      card.appendChild(actions);
+      messagesEl.appendChild(card);
+      scrollDown();
+    }
+    function renderPlanHandoffCard(id, path, content, resolvedAction) {
+      hideSpinner();
+      const card = document.createElement("div");
+      card.className = "plan-handoff-card" + (resolvedAction ? " resolved" : "");
+      card.dataset.handoffId = id;
+      const head = document.createElement("div");
+      head.className = "plan-handoff-head";
+      head.textContent = "Plan ready for review";
+      const meta = document.createElement("div");
+      meta.className = "plan-handoff-path";
+      meta.textContent = path;
+      const preview = document.createElement("div");
+      preview.className = "plan-handoff-preview reply-markdown";
+      preview.appendChild(formatReplyMarkdown(content.length > 8e3 ? content.slice(0, 8e3) + "\u2026" : content));
+      if (resolvedAction) {
+        const note = document.createElement("div");
+        note.className = "plan-handoff-resolved-note";
+        note.textContent = resolvedAction === "execute" ? "Approved \u2014 implementing in Code mode." : resolvedAction === "stay" ? "Staying in Plan mode." : "Opened in editor.";
+        card.append(head, meta, preview, note);
+        messagesEl.appendChild(card);
+        scrollDown();
+        return;
+      }
+      const actions = document.createElement("div");
+      actions.className = "plan-handoff-actions";
+      const execute = document.createElement("button");
+      execute.className = "plan-handoff-btn primary";
+      execute.textContent = "Execute";
+      execute.addEventListener("click", () => {
+        card.classList.add("resolved");
+        vscode.postMessage({ type: "plan-handoff-action", id, action: "execute" });
+      });
+      const stay = document.createElement("button");
+      stay.className = "plan-handoff-btn ghost";
+      stay.textContent = "Stay in Plan";
+      stay.addEventListener("click", () => {
+        card.classList.add("resolved");
+        vscode.postMessage({ type: "plan-handoff-action", id, action: "stay" });
+      });
+      const open = document.createElement("button");
+      open.className = "plan-handoff-btn ghost";
+      open.textContent = "Open plan";
+      open.addEventListener("click", () => {
+        vscode.postMessage({ type: "plan-handoff-action", id, action: "open" });
+      });
+      actions.append(execute, stay, open);
+      card.append(head, meta, preview, actions);
+      messagesEl.appendChild(card);
+      scrollDown();
     }
     function hideWelcome() {
       document.getElementById("welcome")?.classList.add("hidden");
@@ -1825,6 +2201,8 @@
       updateComposerChrome();
       closePlusMenu();
       clearHybridGroups();
+      liveReasoningEl = null;
+      liveReasoningBodyEl = null;
       hideSpinner();
       backgroundWorkEl = null;
     }
@@ -1874,6 +2252,7 @@
           break;
         }
         case "tool-call": {
+          settleLiveReasoning();
           hideSpinner();
           const row = trackToolCall(msg);
           toolCards.set(msg.id, row);
@@ -1889,17 +2268,26 @@
           const row = toolCards.get(msg.id);
           if (!row) break;
           row.classList.remove("running");
-          row.classList.add(msg.ok ? "ok" : "failed");
           const status = row.querySelector(".acc-status");
-          if (status) status.textContent = msg.ok ? "\u2713" : "\u2717";
+          if (msg.userSkipped) {
+            row.classList.add("muted");
+            row.dataset.skipped = "1";
+            if (status) status.textContent = "\u25A1";
+          } else if (msg.ok) {
+            row.classList.add("ok");
+            if (status) status.textContent = "\u2713";
+          } else {
+            row.classList.add("muted");
+            if (status) status.textContent = "\u25A1";
+          }
+          attachToolDetail(row, row.dataset.args, msg.detail ?? row.dataset.detail);
           if (msg.viaTrie && typeof msg.trieMs === "number") {
             attachTrieBadge(row, msg.trieMs, msg.scanMs);
           }
-          if (!msg.ok) {
-            row.classList.add("failed");
+          if (!msg.ok && !msg.userSkipped) {
             if (msg.summary) {
               const err = document.createElement("div");
-              err.className = "acc-error";
+              err.className = "acc-error muted-error";
               err.textContent = msg.summary;
               row.after(err);
             }
@@ -1911,6 +2299,11 @@
               refreshTurnSummary();
             }
           }
+          break;
+        }
+        case "reasoning": {
+          if (typeof msg.chunk === "string" && msg.chunk) appendLiveReasoning(msg.chunk);
+          if (msg.done) settleLiveReasoning();
           break;
         }
         case "todos": {
@@ -1937,6 +2330,7 @@
           } else if (typeof msg.saved === "number" && msg.saved > 0) {
             ctxGauge.classList.remove("compacting");
             ctxGauge.textContent = "freed " + fmtTokens(msg.saved);
+            renderCompactionNote(msg.saved, msg.keptTurns);
             ctxFlashTimer = setTimeout(() => {
               ctxFlashTimer = null;
               renderCtxGauge();
@@ -1959,7 +2353,57 @@
           showHybridGuide(msg.checkpoint ?? "final_review", msg.verdict, msg.text);
           break;
         }
+        case "question": {
+          questionSnapshots.set(msg.requestId, msg.questions ?? []);
+          renderQuestionCard(msg.requestId, msg.questions ?? []);
+          break;
+        }
+        case "question-resolved": {
+          const existing = messagesEl.querySelector(
+            `.question-card[data-request-id="${msg.requestId}"]`
+          );
+          if (existing) {
+            showQuestionAnswers(existing, msg.answers ?? []);
+          } else {
+            renderQuestionCard(
+              msg.requestId,
+              questionSnapshots.get(msg.requestId) ?? [],
+              msg.answers ?? []
+            );
+          }
+          break;
+        }
+        case "plan-handoff": {
+          planHandoffSnapshots.set(msg.id, { path: msg.path ?? "", content: msg.content ?? "" });
+          renderPlanHandoffCard(msg.id, msg.path ?? "", msg.content ?? "");
+          break;
+        }
+        case "plan-handoff-resolved": {
+          const existing = messagesEl.querySelector(
+            `.plan-handoff-card[data-handoff-id="${msg.id}"]`
+          );
+          const snap = planHandoffSnapshots.get(msg.id);
+          if (existing && snap) {
+            existing.classList.add("resolved");
+            existing.querySelector(".plan-handoff-actions")?.remove();
+            let note = existing.querySelector(".plan-handoff-resolved-note");
+            if (!note) {
+              note = document.createElement("div");
+              note.className = "plan-handoff-resolved-note";
+              existing.appendChild(note);
+            }
+            note.textContent = msg.action === "execute" ? "Approved \u2014 implementing in Code mode." : msg.action === "stay" ? "Staying in Plan mode." : "Opened in editor.";
+          } else if (snap) {
+            renderPlanHandoffCard(msg.id, snap.path, snap.content, msg.action);
+          }
+          break;
+        }
+        case "permission": {
+          renderPermissionCard(msg.requestId, msg.request);
+          break;
+        }
         case "final": {
+          settleLiveReasoning();
           hideSpinner();
           finishTurnSession();
           addReply(msg.text, !msg.ok);
@@ -1991,9 +2435,9 @@
           const card = reviewCards.get(msg.sha);
           if (card) {
             resolveReviewCard(card, "undone");
-          } else {
+          } else if (!msg.conversationRewound) {
             addReply(
-              "Workspace restored to checkpoint " + msg.sha.slice(0, 8) + " (" + msg.files + " files reverted)."
+              "Undid turn " + msg.sha.slice(0, 8) + " (" + msg.files + " files reverted)."
             );
           }
           break;

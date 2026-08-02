@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.95
+
+- **Stall guard:** after several tool calls without progress on ambiguous Code-mode tasks, the loop nudges the model to `update_todos` or `ask_user_question` instead of continuing search loops.
+- **Noisy-repo guidance:** prompts steer toward `search_symbols` first and narrowly scoped `grep` globs before broad tree scans.
+- **Multitask claim enforcement:** sibling agents must call `claim_paths` before `edit_file`/`write_file`; unclaimed paths are refused.
+
+## 0.4.94
+
+- **Permission model breadth:** added agent profiles (`default`, `accept-edits`, `auto-approve`, `explore`) with per-tool permission defaults, wildcard command/path approvals, and outside-workspace access as an explicit approval scope (instead of hard refusal).
+- **Tool-specific approval widgets:** shell approvals now render a command preview widget with cwd context; edit/write approvals keep dedicated diff previews.
+- **Hooks pipeline:** added `.trie-ide/hooks.json` support for `preTool`, `postTool`, and `postAgent` hooks (deny, rewrite input args, replace outputs, rewrite/deny final summaries).
+- **Streaming reasoning:** the webview now streams live reasoning chunks during generation and settles into a collapsed thought block when the model finishes.
+
+## 0.4.93
+
+- **Permanent permission rules:** Always allow writes to `.trie-ide/permissions.json` per workspace (commands and sensitive paths); session denies still take precedence.
+- **Diff-aware approval cards:** sensitive write prompts show before/after content blocks instead of path-only previews.
+- **Inline edit diffs:** expandable tool rows color −/+ lines for edit_file and write_file results.
+- **Collapsible reasoning:** model thoughts render in a collapsed Thinking block by default.
+- **Windows shell:** run_command uses cmd.exe on win32; `%VAR%` treated as a shell metachar on Windows.
+
+## 0.4.91
+
+- **In-chat permission cards:** shell commands and sensitive-path writes prompt in the chat (Allow once / Allow for session / Deny) instead of VS Code modal dialogs.
+- **Expandable tool rows:** tool activity rows expand to show args and truncated output on demand.
+- **Muted tool failures:** recoverable failures start as skipped (□) and escalate to ✗ only when the turn ends; user-denied actions stay skipped.
+- **Question & plan persistence:** question answers and plan handoff decisions persist in the transcript and replay on chat reload; submitted answers show on the card.
+- **Plan markdown preview:** plan handoff cards render markdown instead of plain preformatted text.
+- **Compaction continuity:** a note in the turn accordion shows tokens freed and recent turns kept after compaction.
+
+## 0.4.90
+
+- **Sensitive-path write gate:** normal workspace edits auto-allow; `.env`, keys, credentials, and `.git/hooks` prompt Allow once / Allow for session / Deny with exact-path session memory.
+- **Safer shell session allow:** commands with shell metacharacters (`&&`, `|`, `;`, etc.) require exact session match; simple commands use argv-safe prefix matching so approving `npm test` cannot cover `npm test && …`.
+- **Diff-only hybrid evidence:** final-review evidence no longer auto-runs package scripts; the model uses `run_verification` explicitly when checks are needed.
+- **In-chat ask_user_question:** multiple-choice questions render as chat cards (with Other) instead of VS Code Quick Pick modals.
+- **Full plan mode:** persisted plans under `.trie-ide/plans/` via `update_plan`; `exit_plan_mode` shows a plan card (Execute / Stay in Plan / Open plan) and Execute enqueues a Code turn with the approved plan.
+- **Compaction tokens:** compaction threshold prefers backend-reported token counts when available.
+
+## 0.4.89
+
+- **Transactional compaction:** memory compaction summarizes a copy of history and only commits on success; recent user tasks stay verbatim; failed summarization drops whole oldest rounds instead of hard-clobbering the live transcript.
+- **Truncation protocol:** `read_file` / `grep` / `run_command` results include total-lines, caps, and `next:` paging hints so the model can continue instead of re-reading blindly. Large files default to a 400-line first page.
+- **ask_user_question:** new tool for multiple-choice clarifications (Quick Pick) when product intent or ambiguity blocks progress.
+- **Session shell permissions:** `run_command` offers Allow once / Allow for session / Deny; session decisions are remembered by command pattern.
+- **Create-only write_file + scratchpad:** `write_file` refuses to overwrite existing project files (use `edit_file`); `.trie-ide/scratchpad/<session>/` allows throwaway overwrites.
+- **Lazy AGENTS.md:** reading a file injects undiscovered nested `AGENTS.md` instructions for that directory tree once per session.
+- **Undo = files + conversation:** restoring a turn checkpoint also rewinds model turns and the chat transcript to before that turn.
+- **Safer hybrid evidence:** final-review verification runs package scripts via `execFile` (no `/bin/sh -lc`).
+
 ## 0.4.88
 
 - **Release packaging:** ships LLM-as-judge recommendation finishes (light intent routing, judge + one feedback rewrite, no fixed recommendation template).

@@ -8,6 +8,7 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as vscode from 'vscode'
 import { readConfig, type WebSearchProvider } from '../config'
+import { buildAddPreview, buildUnifiedDiffPreview, capLines } from './diffPreview'
 import {
   findEditRange,
   findLineRange,
@@ -21,7 +22,14 @@ import {
   type MultitaskToolContext,
 } from './multitaskBus'
 import { parseToolCall as parseToolCallInner, extractJsonObject as extractJsonObjectInner } from './toolParse'
+import { PersistentPermissionStore, isSensitivePath } from './permissions'
+import type { PlanSession } from './planSession'
+import type { PermissionBroker, PermissionChoice, PermissionRequest } from './permissionBroker'
+import type { QuestionBroker, UserQuestionPayload } from './questionBroker'
+import { shellExec } from './shellExec'
+import { ensureScratchpad, isScratchpadPath } from './scratchpad'
 import { getSymbolIndex, isIdentifierPattern } from './symbolIndex'
+import { normalizeAgentProfile, type AgentProfileName } from './agentProfiles'
 
 export interface ToolSpec {
   name: string
@@ -79,15 +87,23 @@ export const TOOL_SPECS: ToolSpec[] = [
   {
     name: 'write_file',
     signature: '{"path": string, "content": string}',
-    description: 'Create or overwrite a file with the given content.',
+    description:
+      'Create a new file with the given content. Fails if the file already exists — use edit_file for existing files. Scratchpad paths under .trie-ide/scratchpad/<session>/ may be overwritten.',
     mutating: true,
   },
   {
     name: 'run_command',
     signature: '{"command": string}',
     description:
-      'Run a shell command in the workspace root (requires user approval). Use for tests, builds, git.',
+      'Run a shell command in the workspace root (requires user approval; session allow/deny is remembered). Use for tests, builds, git.',
     mutating: true,
+  },
+  {
+    name: 'ask_user_question',
+    signature:
+      '{"questions": [{"question": string, "options": string[], "multiSelect"?: boolean}]}',
+    description:
+      'Ask the user one or more multiple-choice questions when a decision blocks progress (product intent, destructive choice, credentials, ambiguous requirements). Prefer this over guessing.',
   },
   {
     name: 'run_verification',
@@ -96,6 +112,20 @@ export const TOOL_SPECS: ToolSpec[] = [
     description:
       'Autonomously run one focused test/typecheck/lint/build or UI/e2e/visual harness package script without a shell. The script must exist in package.json and have a verification-like name. artifactPaths can report generated screenshots/text reports inside the workspace. Prefer the narrowest relevant check; use skipReason only when verification is disproportionate.',
     mutating: true,
+  },
+  {
+    name: 'update_plan',
+    signature: '{"content": string}',
+    description:
+      'Write or replace the persisted plan markdown file (Plan mode only). Put the full numbered implementation plan here.',
+    mutating: true,
+  },
+  {
+    name: 'exit_plan_mode',
+    signature: '{}',
+    description:
+      'Request user approval to finish planning and switch to Code mode to implement the plan. Call after update_plan when the plan is ready.',
+    control: true,
   },
   {
     name: 'update_todos',
@@ -128,6 +158,8 @@ export const TOOL_SPECS: ToolSpec[] = [
 const TOOL_NAMES = new Set(TOOL_SPECS.map((t) => t.name))
 const MAX_RESULT_CHARS = 6000
 const MAX_FILE_READ_BYTES = 512 * 1024
+const MAX_GREP_HITS = 60
+const DEFAULT_READ_LINE_LIMIT = 400
 const GREP_EXCLUDE = '**/{node_modules,.git,dist,out,build,.next,coverage}/**'
 
 export type ToolCall = import('./toolParse').ParsedToolCall
@@ -146,6 +178,10 @@ export interface ToolOutcome {
   result: string
   /** One-line human summary for the UI card. */
   uiSummary: string
+  /** Truncated detail for expandable tool rows in the webview. */
+  uiDetail?: string
+  /** User declined — show muted/skipped status instead of hard error until turn ends. */
+  userSkipped?: boolean
   /** True when the prefix-trie symbol index answered the query — UI celebrates. */
   viaTrie?: boolean
   /** Measured trie lookup time (ms), when the trie was consulted. */
@@ -174,8 +210,37 @@ function optNum(args: Record<string, unknown>, key: string): number | undefined 
   return value
 }
 
-function truncate(text: string, max = MAX_RESULT_CHARS): string {
-  return text.length <= max ? text : `${text.slice(0, max)}\n… [truncated ${text.length - max} chars]`
+interface TruncationMeta {
+  totalLines?: number
+  startLine?: number
+  endLine?: number
+  matchCount?: number
+  matchCap?: number
+  hint?: string
+}
+
+/** Bound tool output and return enough metadata for the model to continue (Vibe-style). */
+function truncate(text: string, max = MAX_RESULT_CHARS, meta?: TruncationMeta): string {
+  const truncated = text.length > max
+  const body = truncated ? text.slice(0, max) : text
+  if (!truncated && !meta) return body
+  const parts: string[] = []
+  if (truncated) {
+    parts.push(`[truncated] showing ${body.length} of ${text.length} chars`)
+  }
+  if (meta?.totalLines !== undefined) {
+    const range =
+      meta.startLine !== undefined
+        ? ` lines ${meta.startLine}-${meta.endLine ?? meta.totalLines} of ${meta.totalLines}`
+        : ` total_lines=${meta.totalLines}`
+    parts.push(range.trim())
+  }
+  if (meta?.matchCount !== undefined && meta.matchCap !== undefined && meta.matchCount >= meta.matchCap) {
+    parts.push(`matches capped at ${meta.matchCap}`)
+  }
+  if (meta?.hint) parts.push(meta.hint)
+  if (parts.length === 0) return body
+  return `${body}\n---\n${parts.join('; ')}.`
 }
 
 function formatEditCandidates(candidates: EditCandidate[]): string {
@@ -192,28 +257,207 @@ function formatEditCandidates(candidates: EditCandidate[]): string {
     .join('\n\n')
 }
 
+export interface WorkspaceToolsOptions {
+  permissions?: PersistentPermissionStore
+  sessionId?: string
+  questionBroker?: QuestionBroker
+  permissionBroker?: PermissionBroker
+  planSession?: PlanSession
+  profile?: AgentProfileName
+}
+
 export class WorkspaceTools {
+  private readonly permissions: PersistentPermissionStore
+  private readonly sessionId: string
+  private readonly questionBroker: QuestionBroker | null
+  private readonly permissionBroker: PermissionBroker | null
+  readonly planSession: PlanSession | null
+  private readonly profile: AgentProfileName
+  /** Directories whose AGENTS.md has already been injected this session. */
+  private readonly injectedAgentsMd = new Set<string>()
+
   constructor(
     private readonly root: string,
     private readonly multitask?: MultitaskToolContext,
-  ) {}
+    options: WorkspaceToolsOptions = {},
+  ) {
+    this.permissions = options.permissions ?? new PersistentPermissionStore(root)
+    this.sessionId = options.sessionId ?? 'default'
+    this.questionBroker = options.questionBroker ?? null
+    this.permissionBroker = options.permissionBroker ?? null
+    this.planSession = options.planSession ?? null
+    this.profile = normalizeAgentProfile(options.profile)
+  }
 
   /** Resolve a workspace-relative path; escapes are refused (Trie IDE's PATH_OUTSIDE_WORKSPACE policy). */
   private resolve(relPath: string): string {
     if (path.isAbsolute(relPath)) throw new Error(`Absolute paths are not allowed: ${relPath}`)
     const absolute = path.resolve(this.root, relPath)
     const rel = path.relative(this.root, absolute)
-    if (rel.startsWith('..')) throw new Error(`Path escapes the workspace: ${relPath}`)
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`Path escapes the workspace: ${relPath}`)
+    }
     return absolute
+  }
+
+  /**
+   * Outside-workspace access is a permission scope instead of an unconditional hard-refusal.
+   * Safe defaults still require approval unless profile/default overrides allow it.
+   */
+  private async resolveWithScope(relPath: string, toolName: string): Promise<string> {
+    const absolute = path.isAbsolute(relPath) ? path.resolve(relPath) : path.resolve(this.root, relPath)
+    const rel = path.relative(this.root, absolute)
+    const inside = !(rel.startsWith('..') || path.isAbsolute(rel))
+    if (inside) return absolute
+
+    const defaultPolicy = this.permissions.toolDefault('outside_workspace', this.profile, 'ask')
+    if (defaultPolicy === 'deny') {
+      throw new Error(`Path resolves outside workspace and is denied by profile: ${relPath}`)
+    }
+    if (defaultPolicy === 'allow') return absolute
+
+    const remembered = this.permissions.lookupOutsideWorkspace(absolute)
+    if (remembered === 'allow') return absolute
+    if (remembered === 'deny') {
+      throw new Error(`Outside-workspace access denied for path: ${absolute}`)
+    }
+    const choice = await this.requestPermission({
+      kind: 'scope',
+      scope: 'outside-workspace',
+      toolName,
+      title: 'Allow tool access outside workspace?',
+      preview: absolute,
+      path: absolute,
+    })
+    if (choice === 'always') {
+      this.permissions.rememberOutsideWorkspaceAlways(absolute)
+      return absolute
+    }
+    if (choice === 'session' || choice === 'once') {
+      this.permissions.rememberOutsideWorkspace(absolute, 'allow')
+      return absolute
+    }
+    if (choice === 'deny') this.permissions.rememberOutsideWorkspace(absolute, 'deny')
+    throw new Error(`Outside-workspace access denied for path: ${absolute}`)
+  }
+
+  /** Nested AGENTS.md files between workspace root and the read path (Vibe lazy injection). */
+  private async collectAgentsMdExtras(fileAbs: string): Promise<string> {
+    const sections: string[] = []
+    let dir = path.dirname(fileAbs)
+    const rootReal = await fs.promises.realpath(this.root).catch(() => this.root)
+    while (true) {
+      const agentsPath = path.join(dir, 'AGENTS.md')
+      const key = path.resolve(agentsPath)
+      if (!this.injectedAgentsMd.has(key)) {
+        try {
+          const stat = await fs.promises.stat(agentsPath)
+          if (stat.isFile() && stat.size <= 64 * 1024) {
+            const text = (await fs.promises.readFile(agentsPath, 'utf8')).trim()
+            if (text) {
+              this.injectedAgentsMd.add(key)
+              const relDir = path.relative(this.root, dir) || '.'
+              sections.push(
+                `Contents of ${relDir}/AGENTS.md (project instructions for this directory):\n\n${text}`,
+              )
+            }
+          }
+        } catch {
+          /* no AGENTS.md here */
+        }
+      }
+      if (path.resolve(dir) === path.resolve(this.root) || path.resolve(dir) === rootReal) break
+      const parent = path.dirname(dir)
+      if (parent === dir) break
+      // Stop if we walked above the workspace.
+      const rel = path.relative(this.root, parent)
+      if (rel.startsWith('..') || path.isAbsolute(rel)) break
+      dir = parent
+    }
+    return sections.length > 0 ? `\n\n---\n${sections.join('\n\n')}` : ''
   }
 
   private assertPathWritable(relPath: string): void {
     if (!this.multitask) return
+    const claim = this.multitask.bus.claimFor(relPath)
+    if (!claim) {
+      throw new Error(
+        `Path "${relPath}" is unclaimed in Multitask mode. Claim it first with claim_paths before edit_file/write_file.`,
+      )
+    }
+    if (claim.ownerId === this.multitask.agentId) return
     const owner = this.multitask.bus.ownerOf(relPath, this.multitask.agentId)
     if (!owner) return
     throw new Error(
       `Path "${relPath}" is claimed by sibling ${owner.ownerName}. Use claim_paths only for unclaimed files, or pick a different path.`,
     )
+  }
+
+  /** Cursor-like gate: auto-allow normal paths; ask for sensitive ones. */
+  private async requestPermission(request: PermissionRequest): Promise<PermissionChoice | null> {
+    if (this.permissionBroker) {
+      return this.permissionBroker.ask(request)
+    }
+    const labels = ['Allow once', 'Allow for session', 'Always allow', 'Deny'] as const
+    const choice = await vscode.window.showWarningMessage(request.title, { modal: true }, ...labels)
+    if (choice === 'Allow once') return 'once'
+    if (choice === 'Allow for session') return 'session'
+    if (choice === 'Always allow') return 'always'
+    if (choice === 'Deny') return 'deny'
+    return null
+  }
+
+  private applyWritePermission(relPath: string, choice: PermissionChoice | null): void {
+    if (choice === 'always') {
+      this.permissions.rememberPathAlways(relPath)
+      this.permissions.rememberPathPatternAlways(parentWildcard(relPath))
+      return
+    }
+    if (choice === 'session') {
+      this.permissions.rememberPath(relPath, 'allow')
+      this.permissions.rememberPathPattern(parentWildcard(relPath), 'allow')
+      return
+    }
+    if (choice === 'once') return
+    if (choice === 'deny') {
+      this.permissions.rememberPath(relPath, 'deny')
+      throw new Error(`Write to sensitive path "${relPath}" denied by the user.`)
+    }
+    throw new Error(`Write to sensitive path "${relPath}" denied by the user.`)
+  }
+
+  private async assertWriteAllowed(
+    relPath: string,
+    action: 'edit' | 'write',
+    diff?: { before?: string; after?: string },
+  ): Promise<void> {
+    if (isScratchpadPath(relPath, this.sessionId)) return
+    if (!isSensitivePath(relPath)) return
+    const defaultPolicy = this.permissions.toolDefault('sensitive_write', this.profile, 'ask')
+    if (defaultPolicy === 'allow') return
+    if (defaultPolicy === 'deny') {
+      throw new Error(`Write to sensitive path "${relPath}" denied by active profile.`)
+    }
+    const remembered = this.permissions.lookupPath(relPath)
+    if (remembered === 'allow') return
+    if (remembered === 'deny') {
+      throw new Error(`Write to sensitive path "${relPath}" was denied for this session.`)
+    }
+    const choice = await this.requestPermission({
+      kind: 'write',
+      title: `Allow ${action} on sensitive file?`,
+      preview: relPath,
+      path: relPath,
+      action,
+      toolName: action === 'edit' ? 'edit_file' : 'write_file',
+      diff: diff
+        ? {
+            before: diff.before !== undefined ? capLines(diff.before, 40) : undefined,
+            after: diff.after !== undefined ? capLines(diff.after, 40) : undefined,
+          }
+        : undefined,
+    })
+    this.applyWritePermission(relPath, choice)
   }
 
   async execute(call: ToolCall): Promise<ToolOutcome> {
@@ -248,6 +492,10 @@ export class WorkspaceTools {
           return await this.runVerification(call.args)
         case 'web_search':
           return await this.webSearch(call.args)
+        case 'ask_user_question':
+          return await this.askUserQuestion(call.args)
+        case 'update_plan':
+          return await this.updatePlan(call.args)
         default:
           throw new Error(`Tool ${call.tool} is not executable here`)
       }
@@ -259,32 +507,46 @@ export class WorkspaceTools {
 
   private async readFile(args: Record<string, unknown>): Promise<ToolOutcome> {
     const relPath = str(args, 'path')
-    const absolute = this.resolve(relPath)
+    const absolute = await this.resolveWithScope(relPath, 'read_file')
     const stat = await fs.promises.stat(absolute)
     if (stat.size > MAX_FILE_READ_BYTES) {
       throw new Error(`File too large to read whole (${stat.size} bytes); use startLine/endLine`)
     }
     const content = await fs.promises.readFile(absolute, 'utf8')
+    const lines = content.split('\n')
+    const lineCount = lines.length
     const startLine = optNum(args, 'startLine')
     const endLine = optNum(args, 'endLine')
-    let selected = content
-    if (startLine !== undefined || endLine !== undefined) {
-      const lines = content.split('\n')
-      const from = Math.max(1, startLine ?? 1)
-      const to = Math.min(lines.length, endLine ?? lines.length)
-      selected = lines.slice(from - 1, to).join('\n')
-    }
-    const lineCount = content.split('\n').length
+    const from = Math.max(1, startLine ?? 1)
+    // Default page size when reading a whole large file without a range.
+    const defaultTo =
+      startLine === undefined && endLine === undefined && lineCount > DEFAULT_READ_LINE_LIMIT
+        ? DEFAULT_READ_LINE_LIMIT
+        : lineCount
+    const to = Math.min(lineCount, endLine ?? defaultTo)
+    const selected = lines.slice(from - 1, to).join('\n')
+    const wasRangeTruncated = to < lineCount || from > 1
+    const hint =
+      to < lineCount
+        ? `next: read_file path="${relPath}" startLine=${to + 1} endLine=${Math.min(lineCount, to + DEFAULT_READ_LINE_LIMIT)}`
+        : undefined
+    const agentsExtra = await this.collectAgentsMdExtras(absolute)
     return {
       ok: true,
-      result: truncate(selected),
-      uiSummary: `${relPath} (${lineCount} lines)`,
+      result:
+        truncate(selected, MAX_RESULT_CHARS, {
+          totalLines: lineCount,
+          startLine: from,
+          endLine: to,
+          hint: wasRangeTruncated ? hint : undefined,
+        }) + agentsExtra,
+      uiSummary: `${relPath} (${from}-${to}/${lineCount} lines)`,
     }
   }
 
   private async listDir(args: Record<string, unknown>): Promise<ToolOutcome> {
     const relPath = typeof args['path'] === 'string' ? (args['path'] as string) : ''
-    const absolute = this.resolve(relPath)
+    const absolute = await this.resolveWithScope(relPath, 'list_dir')
     const entries = await fs.promises.readdir(absolute, { withFileTypes: true })
     const lines = entries
       .filter((e) => e.name !== '.git' && e.name !== 'node_modules')
@@ -361,8 +623,12 @@ export class WorkspaceTools {
     const hits: string[] = symbolHits.map(
       (h) => `${h.path}:${h.line}: [symbol trie] ${h.kind} ${h.name}`,
     )
+    let capped = false
     for (const uri of uris) {
-      if (hits.length >= 60) break
+      if (hits.length >= MAX_GREP_HITS) {
+        capped = true
+        break
+      }
       let content: string
       try {
         const stat = await fs.promises.stat(uri.fsPath)
@@ -373,17 +639,24 @@ export class WorkspaceTools {
       }
       if (content.includes('\u0000')) continue // binary
       const lines = content.split('\n')
-      for (let i = 0; i < lines.length && hits.length < 60; i++) {
+      for (let i = 0; i < lines.length && hits.length < MAX_GREP_HITS; i++) {
         if (regex.test(lines[i])) {
           hits.push(`${path.relative(this.root, uri.fsPath)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`)
         }
       }
+      if (hits.length >= MAX_GREP_HITS) capped = true
     }
     const scanMs = performance.now() - scanStart
     return {
       ok: true,
-      result: truncate(hits.join('\n') || 'No matches.'),
-      uiSummary: `/${pattern}/ — ${hits.length} matches`,
+      result: truncate(hits.join('\n') || 'No matches.', MAX_RESULT_CHARS, {
+        matchCount: hits.length,
+        matchCap: MAX_GREP_HITS,
+        hint: capped
+          ? 'narrow with glob or a more specific pattern; results may be incomplete'
+          : undefined,
+      }),
+      uiSummary: `/${pattern}/ — ${hits.length}${capped ? '+' : ''} matches`,
       viaTrie: symbolHits.length > 0,
       ...(symbolHits.length > 0 ? { trieMs, scanMs } : {}),
     }
@@ -398,14 +671,14 @@ export class WorkspaceTools {
     const hasLineRange = startLine !== undefined && endLine !== undefined
     if (!hasLineRange && !search.trim()) {
       throw new Error(
-        'Provide startLine+endLine+replace (preferred) or search+replace. To create or fully overwrite a file, use write_file.',
+        'Provide startLine+endLine+replace (preferred) or search+replace. To create a new file, use write_file (create-only).',
       )
     }
     if ((startLine !== undefined) !== (endLine !== undefined)) {
       throw new Error('startLine and endLine must be provided together.')
     }
     this.assertPathWritable(relPath)
-    const absolute = this.resolve(relPath)
+    const absolute = await this.resolveWithScope(relPath, 'edit_file')
     const content = await fs.promises.readFile(absolute, 'utf8')
 
     if (hasLineRange) {
@@ -435,6 +708,8 @@ export class WorkspaceTools {
           )
         }
       }
+      const beforeText = content.slice(match.start, match.end).replace(/\r\n/g, '\n').replace(/\n$/, '')
+      await this.assertWriteAllowed(relPath, 'edit', { before: beforeText, after: replace })
       const eol = match.fileEol
       let replacement = replace.replace(/\r\n/g, '\n')
       if (eol === '\r\n') replacement = replacement.replace(/\n/g, '\r\n')
@@ -448,6 +723,7 @@ export class WorkspaceTools {
         ok: true,
         result: `Edited ${relPath} lines ${startLine}-${endLine}.`,
         uiSummary: relPath,
+        uiDetail: buildUnifiedDiffPreview(beforeText, replace),
       }
     }
 
@@ -485,6 +761,8 @@ export class WorkspaceTools {
         ].join('\n\n'),
       )
     }
+    const beforeText = content.slice(match.start, match.end).replace(/\r\n/g, '\n').replace(/\n$/, '')
+    await this.assertWriteAllowed(relPath, 'edit', { before: beforeText, after: replace })
     const replacement =
       match.kind === 'exact'
         ? replace
@@ -501,6 +779,7 @@ export class WorkspaceTools {
       ok: true,
       result: `Edited ${relPath}.${note}`,
       uiSummary: relPath,
+      uiDetail: buildUnifiedDiffPreview(beforeText, replace),
     }
   }
 
@@ -508,10 +787,31 @@ export class WorkspaceTools {
     const relPath = str(args, 'path')
     const content = str(args, 'content')
     this.assertPathWritable(relPath)
-    const absolute = this.resolve(relPath)
+    await this.assertWriteAllowed(relPath, 'write', { after: content })
+    const absolute = await this.resolveWithScope(relPath, 'write_file')
+    const scratch = isScratchpadPath(relPath, this.sessionId)
+    if (scratch) ensureScratchpad(this.root, this.sessionId)
+    let exists = false
+    try {
+      await fs.promises.stat(absolute)
+      exists = true
+    } catch {
+      exists = false
+    }
+    if (exists && !scratch) {
+      throw new Error(
+        `File already exists: ${relPath}. Use edit_file (startLine/endLine + replace) to modify existing files. write_file is create-only.`,
+      )
+    }
     await fs.promises.mkdir(path.dirname(absolute), { recursive: true })
     await fs.promises.writeFile(absolute, content, 'utf8')
-    return { ok: true, result: `Wrote ${relPath} (${content.length} chars).`, uiSummary: relPath }
+    const note = scratch ? ' (scratchpad)' : ''
+    return {
+      ok: true,
+      result: `Wrote ${relPath} (${content.length} chars)${note}.`,
+      uiSummary: relPath,
+      uiDetail: buildAddPreview(content),
+    }
   }
 
   private async webSearch(args: Record<string, unknown>): Promise<ToolOutcome> {
@@ -538,29 +838,167 @@ export class WorkspaceTools {
 
   private async runCommand(args: Record<string, unknown>): Promise<ToolOutcome> {
     const command = str(args, 'command')
-    const choice = await vscode.window.showWarningMessage(
-      `Trie Coding Agent wants to run:\n\n${command}`,
-      { modal: true },
-      'Run',
-    )
-    if (choice !== 'Run') {
-      return { ok: false, result: 'Command denied by the user.', uiSummary: `denied: ${command}` }
+    for (const url of extractUrls(command)) {
+      const rememberedUrl = this.permissions.lookupUrl(url)
+      if (rememberedUrl === 'deny') {
+        return {
+          ok: false,
+          result: `Command denied by URL rule: ${url}`,
+          uiSummary: `denied URL: ${url}`,
+        }
+      }
+      if (rememberedUrl !== 'allow') {
+        const choice = await this.requestPermission({
+          kind: 'scope',
+          scope: 'url-pattern',
+          toolName: 'run_command',
+          title: 'Allow command touching this URL host?',
+          preview: url,
+          command,
+          cwd: this.root,
+        })
+        if (choice === 'always') {
+          this.permissions.rememberUrlPatternAlways(urlPatternForHost(url))
+        } else if (choice === 'session' || choice === 'once') {
+          this.permissions.rememberUrl(url, 'allow')
+        } else {
+          if (choice === 'deny') this.permissions.rememberUrl(url, 'deny')
+          return {
+            ok: false,
+            result: `Command denied for URL: ${url}`,
+            uiSummary: `denied URL: ${url}`,
+            userSkipped: true,
+          }
+        }
+      }
     }
-    const output = await new Promise<{ ok: boolean; text: string }>((resolvePromise) => {
-      execFile(
-        '/bin/sh',
-        ['-c', command],
-        { cwd: this.root, timeout: 120_000, maxBuffer: 1024 * 1024 },
-        (error, stdout, stderr) => {
-          const text = [stdout, stderr].filter(Boolean).join('\n')
-          resolvePromise({ ok: !error, text: text || (error ? String(error) : '(no output)') })
-        },
-      )
+    const defaultPolicy = this.permissions.toolDefault('run_command', this.profile, 'ask')
+    if (defaultPolicy === 'deny') {
+      return {
+        ok: false,
+        result: 'Command denied by active profile.',
+        uiSummary: `denied by profile: ${command}`,
+      }
+    }
+    const remembered = this.permissions.lookupCommand(command)
+    if (remembered === 'deny') {
+      return {
+        ok: false,
+        result: 'Command denied by a prior session decision. Ask the user to re-approve if needed.',
+        uiSummary: `denied (session): ${command}`,
+      }
+    }
+    if (remembered !== 'allow' && defaultPolicy !== 'allow') {
+      const choice = await this.requestPermission({
+        kind: 'shell',
+        title: 'Allow shell command?',
+        preview: command,
+        command,
+        cwd: this.root,
+        toolName: 'run_command',
+      })
+      if (choice === 'always') {
+        this.permissions.rememberCommandAlways(command)
+        this.permissions.rememberCommandPatternAlways(commandHeadWildcard(command))
+      } else if (choice === 'session') {
+        this.permissions.rememberCommand(command, 'allow')
+        this.permissions.rememberCommandPattern(commandHeadWildcard(command), 'allow')
+      } else if (choice === 'once') {
+        // one-shot — do not persist
+      } else {
+        if (choice === 'deny') this.permissions.rememberCommand(command, 'deny')
+        return {
+          ok: false,
+          result: 'Command denied by the user.',
+          uiSummary: `denied: ${command}`,
+          userSkipped: true,
+        }
+      }
+    }
+    const output = await shellExec(command, this.root, 120_000, 1024 * 1024)
+    const body = `${output.ok ? 'Exit 0' : 'Command failed'}\n${output.text}`
+    const detail = truncate(body, 4000, {
+      hint:
+        body.length > 4000
+          ? 'output truncated; re-run with a narrower command or pipe to a scratchpad file and read_file'
+          : undefined,
     })
     return {
       ok: output.ok,
-      result: truncate(`${output.ok ? 'Exit 0' : 'Command failed'}\n${output.text}`),
+      result: truncate(body, MAX_RESULT_CHARS, {
+        hint:
+          body.length > MAX_RESULT_CHARS
+            ? 'output truncated; re-run with a narrower command or pipe to a scratchpad file and read_file'
+            : undefined,
+      }),
       uiSummary: command,
+      uiDetail: detail,
+    }
+  }
+
+  private async askUserQuestion(args: Record<string, unknown>): Promise<ToolOutcome> {
+    const raw = args['questions']
+    if (!Array.isArray(raw) || raw.length === 0) {
+      throw new Error('`questions` must be a non-empty array of {question, options[]}.')
+    }
+    const questions: UserQuestionPayload[] = []
+    for (const item of raw.slice(0, 4)) {
+      if (typeof item !== 'object' || item === null) {
+        throw new Error('Each question must be an object with question and options.')
+      }
+      const q = item as Record<string, unknown>
+      const question = typeof q['question'] === 'string' ? q['question'].trim() : ''
+      if (!question) throw new Error('Each question needs a non-empty `question` string.')
+      const options = Array.isArray(q['options'])
+        ? q['options'].filter((o): o is string => typeof o === 'string' && o.trim().length > 0)
+        : []
+      if (options.length < 2) {
+        throw new Error(`Question "${question}" needs at least 2 options.`)
+      }
+      questions.push({
+        question,
+        options,
+        multiSelect: q['multiSelect'] === true,
+      })
+    }
+
+    if (this.questionBroker) {
+      const answers = await this.questionBroker.ask(questions)
+      if (!answers || answers.length === 0) {
+        return {
+          ok: false,
+          result: 'User cancelled without answering.',
+          uiSummary: 'question cancelled',
+        }
+      }
+      const lines = answers.map(
+        (a) => `"${a.question}" → ${a.isOther ? '(Other) ' : ''}${a.answer}`,
+      )
+      return {
+        ok: true,
+        result: `User answers:\n${lines.join('\n')}`,
+        uiSummary: lines.length === 1 ? lines[0] : `Asked ${lines.length} questions`,
+      }
+    }
+
+    // Fallback when no webview broker is wired (tests / headless).
+    return {
+      ok: false,
+      result: 'Question UI is unavailable. Ask the user in step_complete or try again from the chat panel.',
+      uiSummary: 'question UI unavailable',
+    }
+  }
+
+  private async updatePlan(args: Record<string, unknown>): Promise<ToolOutcome> {
+    if (!this.planSession) {
+      throw new Error('update_plan is only available in Plan mode.')
+    }
+    const content = str(args, 'content')
+    const rel = this.planSession.write(content)
+    return {
+      ok: true,
+      result: `Plan updated at ${rel} (${content.length} chars). Call exit_plan_mode when ready for the user to approve implementation.`,
+      uiSummary: rel,
     }
   }
 
@@ -593,7 +1031,7 @@ export class WorkspaceTools {
       typeof args['packagePath'] === 'string' && args['packagePath'].trim()
         ? args['packagePath'].trim()
         : '.'
-    const packageRoot = this.resolve(packagePath)
+    const packageRoot = await this.resolveWithScope(packagePath, 'run_verification')
     const [realWorkspaceRoot, realPackageRoot] = await Promise.all([
       fs.promises.realpath(this.root),
       fs.promises.realpath(packageRoot),
@@ -825,6 +1263,15 @@ export function summarizeArgs(call: ToolCall): string {
       return typeof a['query'] === 'string' ? (a['query'] as string) : ''
     case 'run_command':
       return typeof a['command'] === 'string' ? (a['command'] as string) : ''
+    case 'ask_user_question': {
+      const qs = Array.isArray(a['questions']) ? a['questions'] : []
+      const first = qs[0] as { question?: string } | undefined
+      return typeof first?.question === 'string' ? first.question : `${qs.length} question(s)`
+    }
+    case 'update_plan':
+      return 'plan file'
+    case 'exit_plan_mode':
+      return 'exit plan'
     case 'run_verification':
       return typeof a['skipReason'] === 'string'
         ? (a['skipReason'] as string)
@@ -843,6 +1290,33 @@ function basename(relPath: string): string {
 
 function countLines(text: string): number {
   return text ? text.split('\n').length : 0
+}
+
+function commandHeadWildcard(command: string): string {
+  const normalized = command.trim().replace(/\s+/g, ' ')
+  const head = normalized.split(' ')[0] ?? normalized
+  return head ? `${head} *` : normalized
+}
+
+function parentWildcard(relPath: string): string {
+  const normalized = relPath.replace(/\\/g, '/').replace(/\/+$/, '')
+  const dir = normalized.includes('/') ? normalized.slice(0, normalized.lastIndexOf('/')) : '.'
+  return `${dir}/*`
+}
+
+function extractUrls(text: string): string[] {
+  const matches = text.match(/https?:\/\/[^\s"'`]+/g)
+  if (!matches) return []
+  return [...new Set(matches)]
+}
+
+function urlPatternForHost(url: string): string {
+  try {
+    const parsed = new URL(url)
+    return `${parsed.protocol}//${parsed.host}/*`
+  } catch {
+    return url
+  }
 }
 
 /** Human row label for the activity accordion (Cursor-style). */
@@ -879,6 +1353,18 @@ export function formatToolRow(call: ToolCall): string {
       const cmd = typeof a['command'] === 'string' ? (a['command'] as string) : ''
       return cmd.length > 72 ? cmd.slice(0, 69) + '…' : cmd
     }
+    case 'ask_user_question': {
+      const qs = Array.isArray(a['questions']) ? a['questions'] : []
+      const first = qs[0] as { question?: string } | undefined
+      if (typeof first?.question === 'string') {
+        return first.question.length > 72 ? `Ask ${first.question.slice(0, 69)}…` : `Ask ${first.question}`
+      }
+      return 'Ask user'
+    }
+    case 'update_plan':
+      return 'Update plan'
+    case 'exit_plan_mode':
+      return 'Exit plan mode'
     case 'run_verification': {
       if (typeof a['skipReason'] === 'string') return 'Skipped verification'
       const script = typeof a['script'] === 'string' ? (a['script'] as string) : 'verification'

@@ -1,4 +1,5 @@
 import * as vscode from 'vscode'
+import { normalizeAgentProfile, type AgentProfileName } from './agent/agentProfiles'
 
 export type BackendKind = 'daemon' | 'openai-compatible'
 export type FrontierProvider = 'openai' | 'anthropic' | 'moonshot'
@@ -43,7 +44,7 @@ export interface ExtensionConfig {
     command: string
   }
   api: { baseUrl: string; modelName: string; apiKey: string }
-  agent: { maxToolCalls: number; temperature: number; maxTokens: number }
+  agent: { maxToolCalls: number; temperature: number; maxTokens: number; profile: AgentProfileName }
   frontierAssist: FrontierAssistConfig
   webSearch: {
     provider: WebSearchProvider
@@ -275,6 +276,7 @@ export function readConfig(): ExtensionConfig {
       maxToolCalls: cfg.get<number>('agent.maxToolCalls', 24),
       temperature: cfg.get<number>('agent.temperature', 0.2),
       maxTokens: cfg.get<number>('agent.maxTokens', 2048),
+      profile: normalizeAgentProfile(cfg.get<string>('agent.profile', 'default')),
     },
     frontierAssist: readFrontierAssist(cfg),
     webSearch: {

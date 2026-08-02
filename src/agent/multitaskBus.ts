@@ -124,6 +124,11 @@ export class MultitaskBus {
     return claim
   }
 
+  /** Returns the claim owner (self or foreign) for a path. */
+  claimFor(path: string): PathClaim | null {
+    return this.claims.get(normalizeRelPath(path)) ?? null
+  }
+
   listClaims(): PathClaim[] {
     return [...this.claims.values()]
   }

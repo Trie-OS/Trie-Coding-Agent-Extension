@@ -18,11 +18,20 @@ export function isReadOnlyMode(mode: AgentMode): boolean {
   return mode !== 'code'
 }
 
+/** Plan mode allows update_plan only among mutating tools. */
+export function isPlanAllowedMutatingTool(toolName: string): boolean {
+  return toolName === 'update_plan'
+}
+
 const MODE_RULES: Record<AgentMode, string[]> = {
   code: [
     '- Read a file before editing it. Keep edits minimal; do not refactor beyond the task.',
     '- For add/implement/build requests, missing matching symbols usually means the feature is new. After at most two targeted no-match searches, inspect likely integration files and architecture, then implement; do not keep broadening feature-name searches.',
     '- Prefer edit_file with startLine/endLine + replace after read_file (durable; no retyping file bytes). search+replace is fine for short unique snippets. If edit_file fails, follow its recovery: use the reported startLine/endLine with replace — do not retry a guessed search.',
+    '- write_file creates new files only; if the path exists, use edit_file. For throwaway scripts/data, write under .trie-ide/scratchpad/ (overwrites allowed there).',
+    '- When truncated tool output includes a "next:" hint, follow it (page with startLine/endLine) instead of re-reading the whole file.',
+    '- If a product decision or ambiguous requirement blocks progress, call ask_user_question instead of guessing.',
+    '- In noisy/large repos, prefer search_symbols first, then grep with a tight glob; avoid repeated broad scans of the whole tree.',
     '- Complex ask (3+ distinct steps)? FIRST call update_todos with the full task list, then work through it. After finishing each item, call update_todos again moving it to `done`. Skip the list for trivial one-step tasks.',
     '- When done, call step_complete — its summary is your answer to the user.',
     '- If the request is a question, answer it in step_complete.summary instead of editing files.',
@@ -36,14 +45,17 @@ const MODE_RULES: Record<AgentMode, string[]> = {
     '- A passing check becomes stale after any later edit; verify the final mutation batch again.',
   ],
   plan: [
-    '- You are in PLAN mode: explore the workspace but never modify anything.',
-    '- Investigate with read_file, grep, glob, list_dir, and web_search as needed until you understand the task.',
-    '- Then call step_complete with a numbered, step-by-step implementation plan in `summary`.',
-    '- Each step names the files to change and what to change. Be specific and concise.',
+    '- You are in PLAN mode: explore the workspace but do not modify project source files.',
+    '- Investigate with read_file, grep, glob, list_dir, search_symbols, and web_search as needed.',
+    '- If a product decision is needed, call ask_user_question.',
+    '- Write the full numbered implementation plan with update_plan (paths and changes per step).',
+    '- When the plan is ready, call exit_plan_mode — the user will approve before Code mode runs it.',
+    '- Do not call edit_file, write_file, or run_command in Plan mode.',
   ],
   ask: [
     '- You are in ASK mode: answer questions about the code but never modify anything.',
     '- Investigate with read_file, grep, glob, list_dir, and web_search as needed.',
+    '- If clarifying product intent would change the answer, call ask_user_question.',
     '- Then call step_complete with your answer in `summary`.',
   ],
 }
@@ -73,15 +85,18 @@ export function agentSystemPrompt(
   const webSearchOn = isWebSearchConfigured(readConfig())
   const specs = TOOL_SPECS.filter(
     (t) =>
-      (!isReadOnlyMode(mode) || !t.mutating) &&
+      (mode !== 'plan'
+        ? !isReadOnlyMode(mode) || !t.mutating
+        : !t.mutating || isPlanAllowedMutatingTool(t.name)) &&
       (t.name !== 'web_search' || webSearchOn) &&
-      (!t.multitaskOnly || options.multitask),
+      (!t.multitaskOnly || options.multitask) &&
+      (mode === 'plan' || (t.name !== 'update_plan' && t.name !== 'exit_plan_mode')),
   )
   const toolLines = specs.map((t) => `- ${t.name} ${t.signature} — ${t.description}`).join('\n')
   const multitaskRules = options.multitask
     ? [
         '- You are one parallel Multitask sibling. Do not wait for other agents to finish.',
-        '- Use post_finding and read_sibling_updates to coordinate. Respect claim_paths ownership before editing.',
+        '- Use post_finding and read_sibling_updates to coordinate. In Multitask mode, you must claim_paths before any edit_file/write_file mutation.',
         '- Edits apply in your isolated worktree; path claims reduce merge conflicts with siblings.',
       ]
     : []
