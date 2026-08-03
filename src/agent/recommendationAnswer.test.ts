@@ -127,31 +127,30 @@ test('judge fails closed when factual-grounding verdict is missing', async () =>
   assert.equal(judgment.factuallyGrounded, false)
 })
 
-test('final answer uses separate synthesis even when draft passes judge', async () => {
+test('passing draft returns directly without rewrite synthesis', async () => {
   const local: InferenceClient = {
     describe: () => 'unused',
     generate: async () => {
       throw new Error('local generation should not run')
     },
   }
-  const responses = [
-    {
-      text: '{"adequate": true, "factuallyGrounded": true, "feedback": "", "rejectedClaims": []}',
-      truncated: false,
-    },
-    {
-      text: '### Final answer\nEvidence-grounded synthesis from `src/agent/loop.ts`.',
-      truncated: false,
-    },
-  ]
+  let frontierCalls = 0
   const frontier = {
     enabled: () => true,
-    completeResult: async () => responses.shift() ?? null,
+    completeResult: async () => {
+      frontierCalls++
+      return {
+        text: '{"adequate": true, "factuallyGrounded": true, "feedback": "", "rejectedClaims": []}',
+        truncated: false,
+      }
+    },
   } as unknown as FrontierAssist
+  const draft =
+    '1. **loop.ts** — Current: serial self-grade before finish. Gap: redundant pass. Fix: skip hybrid finish when no mutations.'
   const answer = await finishRecommendationAnswer(
     local,
     'How can I improve this agent harness?',
-    'Draft answer citing `src/agent/loop.ts`.',
+    draft,
     'notes',
     { temperature: 0.2, topP: 0.95, maxTokens: 2048 },
     new AbortController().signal,
@@ -160,8 +159,8 @@ test('final answer uses separate synthesis even when draft passes judge', async 
       evidence: '[E1] read_file src/agent/loop.ts\nexport class AgentSession {}',
     },
   )
-  assert.match(answer, /Final answer/)
-  assert.doesNotMatch(answer, /^Draft answer/)
+  assert.equal(answer, draft)
+  assert.equal(frontierCalls, 1)
 })
 
 test('truncated frontier synthesis continues from retained partial text', async () => {

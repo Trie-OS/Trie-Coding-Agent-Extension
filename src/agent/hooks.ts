@@ -1,5 +1,6 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import * as vscode from 'vscode'
 import type { ToolCall, ToolOutcome } from './tools'
 
 const HOOKS_REL = path.join('.trie-ide', 'hooks.json')
@@ -53,11 +54,12 @@ export class HookManager {
 
   preTool(call: ToolCall): { denied?: string; rewritten: ToolCall } {
     this.load()
+    const trusted = vscode.workspace.isTrusted
     let rewritten = call
     for (const rule of this.hooks.preTool ?? []) {
       if (!matchesToolRule(rule, rewritten)) continue
       if (rule.deny) return { denied: rule.deny, rewritten }
-      if (rule.rewriteArgs) {
+      if (rule.rewriteArgs && trusted) {
         rewritten = { ...rewritten, args: { ...rewritten.args, ...rule.rewriteArgs } }
       }
     }
@@ -66,6 +68,7 @@ export class HookManager {
 
   postTool(call: ToolCall, outcome: ToolOutcome): ToolOutcome {
     this.load()
+    if (!vscode.workspace.isTrusted) return outcome
     let next = outcome
     for (const rule of this.hooks.postTool ?? []) {
       if (!matchesToolRule(rule, call)) continue
@@ -85,6 +88,7 @@ export class HookManager {
     summary: string,
   ): { denied?: string; summary: string } {
     this.load()
+    if (!vscode.workspace.isTrusted) return { summary }
     let next = summary
     for (const rule of this.hooks.postAgent ?? []) {
       if (rule.when && rule.when !== '*' && rule.when !== when) continue

@@ -7,10 +7,11 @@
  * guide note. It never drives the tool loop and never edits files. The local
  * model does every tool call and self-grades before a finish-line escalation.
  * Trivial or confidently completed turns stay local.
- * disabled/no-key → silent null, max 6 calls per turn, 3-minute cooldown
- * after a 429.
+ * disabled/no-key → silent null, split consult/completion budgets per turn,
+ * 3-minute cooldown after a 429.
  */
 import { getActiveFrontierConfig, type FrontierAssistConfig } from '../config'
+import { readAgentBudgets } from './agentBudgets'
 
 export type Checkpoint = 'stuck_hint' | 'final_review' | 'uncertainty' | 'self_grade'
 
@@ -41,7 +42,6 @@ export interface FrontierCompletionResult {
   tokensOut?: number
 }
 
-const MAX_CALLS_PER_TURN = 6
 const RATE_LIMIT_COOLDOWN_MS = 3 * 60 * 1000
 const MAX_CONTEXT_CHARS = 8000
 const REQUEST_TIMEOUT_MS = 30_000
@@ -67,13 +67,25 @@ function checkpointQuestion(checkpoint: Checkpoint): string {
 }
 
 export class FrontierAssist {
-  private callsThisTurn = 0
+  private consultCallsThisTurn = 0
+  private completionCallsThisTurn = 0
   private cooldownUntil = 0
+  private lastSkipReason: string | undefined
 
   constructor(private readonly getConfig: () => FrontierAssistConfig) {}
 
   resetTurn(): void {
-    this.callsThisTurn = 0
+    this.consultCallsThisTurn = 0
+    this.completionCallsThisTurn = 0
+    this.lastSkipReason = undefined
+  }
+
+  get callsThisTurn(): number {
+    return this.consultCallsThisTurn + this.completionCallsThisTurn
+  }
+
+  getSkipReason(): string | undefined {
+    return this.lastSkipReason
   }
 
   enabled(): boolean {
@@ -106,18 +118,18 @@ export class FrontierAssist {
     parts.push('', 'Transcript:', clipped)
     const userContent = parts.join('\n')
 
-    const raw = await this.complete(SYSTEM, userContent, {
+    const raw = await this.request('consult', SYSTEM, userContent, {
       maxTokens: 400,
       temperature: 0.2,
       signal,
       timeoutMs,
     })
-    return raw === null ? null : this.parseGuideNote(checkpoint, raw)
+    return raw === null ? null : this.parseGuideNote(checkpoint, raw.text)
   }
 
   /**
    * Short frontier completion for high-leverage read-only work (judge/rewrite).
-   * Shares the same per-turn budget, cooldown, and timeout as advisory consults.
+   * Shares cooldown and timeout with advisory consults but uses the completion budget.
    */
   async complete(
     system: string,
@@ -132,34 +144,59 @@ export class FrontierAssist {
     userContent: string,
     options: FrontierCompletionOptions,
   ): Promise<FrontierCompletionResult | null> {
+    return this.request('completion', system, userContent, options)
+  }
+
+  private async request(
+    kind: 'consult' | 'completion',
+    system: string,
+    userContent: string,
+    options: FrontierCompletionOptions,
+  ): Promise<FrontierCompletionResult | null> {
     const fa = this.getConfig()
-    if (!this.enabled()) return null
+    if (!this.enabled()) {
+      this.lastSkipReason = 'hybrid_disabled'
+      return null
+    }
     const cfg = getActiveFrontierConfig(fa)
-    if (!cfg) return null
-    if (Date.now() < this.cooldownUntil) return null
-    if (this.callsThisTurn >= MAX_CALLS_PER_TURN) return null
-    this.callsThisTurn++
+    if (!cfg) {
+      this.lastSkipReason = 'hybrid_not_configured'
+      return null
+    }
+    if (Date.now() < this.cooldownUntil) {
+      this.lastSkipReason = 'rate_limited'
+      return null
+    }
+
+    const budgets = readAgentBudgets()
+    if (kind === 'consult') {
+      if (this.consultCallsThisTurn >= budgets.frontierConsultLimit) {
+        this.lastSkipReason = 'consult_budget_exhausted'
+        return null
+      }
+      this.consultCallsThisTurn++
+    } else if (this.completionCallsThisTurn >= budgets.frontierCompletionLimit) {
+      this.lastSkipReason = 'completion_budget_exhausted'
+      return null
+    } else {
+      this.completionCallsThisTurn++
+    }
 
     try {
       return cfg.provider === 'anthropic'
-          ? await this.callAnthropic(
-              cfg.apiKey,
-              cfg.model,
-              system,
-              userContent,
-              options,
-            )
-          : await this.callOpenAiCompatible(
-              cfg.provider === 'moonshot'
-                ? 'https://api.moonshot.ai/v1/chat/completions'
-                : 'https://api.openai.com/v1/chat/completions',
-              cfg.apiKey,
-              cfg.model,
-              system,
-              userContent,
-              options,
-            )
+        ? await this.callAnthropic(cfg.apiKey, cfg.model, system, userContent, options)
+        : await this.callOpenAiCompatible(
+            cfg.provider === 'moonshot'
+              ? 'https://api.moonshot.ai/v1/chat/completions'
+              : 'https://api.openai.com/v1/chat/completions',
+            cfg.apiKey,
+            cfg.model,
+            system,
+            userContent,
+            options,
+          )
     } catch {
+      this.lastSkipReason = 'frontier_request_failed'
       return null // advisory only — a failed cloud call must never break the loop
     }
   }
@@ -194,6 +231,7 @@ export class FrontierAssist {
     })
     if (response.status === 429) {
       this.cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS
+      this.lastSkipReason = 'rate_limited'
       return null
     }
     if (!response.ok) return null
@@ -202,7 +240,7 @@ export class FrontierAssist {
         message?: { content?: string }
         finish_reason?: string | null
       }>
-      usage?: { prompt_tokens?: number; completion_tokens?: number }
+      usage?: { prompt_tokens?: number; completion_tokens?: number; output_tokens?: number }
     }
     const choice = data.choices?.[0]
     const text = choice?.message?.content
@@ -211,7 +249,7 @@ export class FrontierAssist {
       text,
       truncated: choice?.finish_reason === 'length' || choice?.finish_reason === 'max_tokens',
       tokensIn: data.usage?.prompt_tokens ?? 0,
-      tokensOut: data.usage?.completion_tokens ?? 0,
+      tokensOut: data.usage?.completion_tokens ?? data.usage?.output_tokens ?? 0,
     }
   }
 
@@ -246,6 +284,7 @@ export class FrontierAssist {
     })
     if (response.status === 429) {
       this.cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS
+      this.lastSkipReason = 'rate_limited'
       return null
     }
     if (!response.ok) return null

@@ -1,6 +1,7 @@
 /**
  * Session-scoped and persisted permission decisions for shell commands and sensitive writes.
  */
+import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 
@@ -14,14 +15,32 @@ const PERMISSIONS_REL = path.join('.trie-ide', 'permissions.json')
 /** Shell metacharacters that make pattern-based session allow unsafe. */
 const SHELL_METACHAR_RE = /&&|\|\||[;|`]|>\s|<\s|\$\(|\$\{|\n/
 
-interface PersistedPermissionsFile {
+interface UserPersistedPermissionsFile {
   allowedCommands: string[]
   allowedPaths: string[]
   allowedCommandPatterns?: string[]
   allowedPathPatterns?: string[]
   allowedOutsideWorkspace?: string[]
   allowedUrlPatterns?: string[]
+}
+
+interface RepoRestrictivePermissionsFile {
   toolDefaults?: Record<string, PermissionDefault>
+}
+
+/** True when a persisted wildcard pattern is too broad to store safely. */
+export function isOverbroadPattern(pattern: string): boolean {
+  const normalized = SessionPermissionStore.normalize(pattern)
+  if (normalized === '*') return true
+  if (/^\S+ \*$/.test(normalized)) return true
+  const pathKey = normalizePathKey(pattern)
+  if (pathKey === '*') return true
+  if (/^[^/]+\/\*$/.test(pathKey)) return true
+  return false
+}
+
+function workspaceKey(workspaceRoot: string): string {
+  return createHash('sha256').update(path.resolve(workspaceRoot)).digest('hex').slice(0, 16)
 }
 
 export class SessionPermissionStore {
@@ -123,29 +142,61 @@ export class SessionPermissionStore {
   }
 }
 
-/** Session + workspace-persisted allows (denies remain session-only). */
+/** Session + user-persisted allows; repo file is restrictive-only (deny/ask toolDefaults). */
 export class PersistentPermissionStore {
   private readonly session = new SessionPermissionStore()
-  private persisted: PersistedPermissionsFile = { allowedCommands: [], allowedPaths: [] }
-  private loaded = false
+  private userPersisted: UserPersistedPermissionsFile = { allowedCommands: [], allowedPaths: [] }
+  private repoRestrictive: RepoRestrictivePermissionsFile = {}
+  private userLoaded = false
+  private repoLoaded = false
   private readonly workspaceRoot: string
+  private readonly userStorageDir?: string
 
-  constructor(workspaceRoot: string) {
+  constructor(workspaceRoot: string, userStorageDir?: string) {
     this.workspaceRoot = workspaceRoot
+    this.userStorageDir = userStorageDir
   }
 
-  private filePath(): string {
+  private repoFilePath(): string {
     return path.join(this.workspaceRoot, PERMISSIONS_REL)
   }
 
-  private ensureLoaded(): void {
-    if (this.loaded) return
-    this.loaded = true
-    const abs = this.filePath()
+  private userFilePath(): string | undefined {
+    if (!this.userStorageDir) return undefined
+    return path.join(this.userStorageDir, 'agent-permissions', `${workspaceKey(this.workspaceRoot)}.json`)
+  }
+
+  private ensureRepoLoaded(): void {
+    if (this.repoLoaded) return
+    this.repoLoaded = true
+    const abs = this.repoFilePath()
     try {
       if (!fs.existsSync(abs)) return
-      const raw = JSON.parse(fs.readFileSync(abs, 'utf8')) as Partial<PersistedPermissionsFile>
-      this.persisted = {
+      const raw = JSON.parse(fs.readFileSync(abs, 'utf8')) as Record<string, unknown>
+      const toolDefaults =
+        raw.toolDefaults && typeof raw.toolDefaults === 'object'
+          ? Object.fromEntries(
+              Object.entries(raw.toolDefaults as Record<string, unknown>).filter(
+                (entry): entry is [string, PermissionDefault] =>
+                  entry[1] === 'ask' || entry[1] === 'deny',
+              ),
+            )
+          : {}
+      this.repoRestrictive = { toolDefaults }
+    } catch {
+      this.repoRestrictive = {}
+    }
+  }
+
+  private ensureUserLoaded(): void {
+    if (this.userLoaded) return
+    this.userLoaded = true
+    const abs = this.userFilePath()
+    if (!abs) return
+    try {
+      if (!fs.existsSync(abs)) return
+      const raw = JSON.parse(fs.readFileSync(abs, 'utf8')) as Partial<UserPersistedPermissionsFile>
+      this.userPersisted = {
         allowedCommands: Array.isArray(raw.allowedCommands)
           ? raw.allowedCommands.filter((c): c is string => typeof c === 'string')
           : [],
@@ -164,46 +215,38 @@ export class PersistentPermissionStore {
         allowedUrlPatterns: Array.isArray(raw.allowedUrlPatterns)
           ? raw.allowedUrlPatterns.filter((p): p is string => typeof p === 'string')
           : [],
-        toolDefaults:
-          raw.toolDefaults && typeof raw.toolDefaults === 'object'
-            ? Object.fromEntries(
-                Object.entries(raw.toolDefaults).filter(
-                  (entry): entry is [string, PermissionDefault] =>
-                    entry[1] === 'allow' || entry[1] === 'ask' || entry[1] === 'deny',
-                ),
-              )
-            : {},
       }
     } catch {
-      this.persisted = { allowedCommands: [], allowedPaths: [] }
+      this.userPersisted = { allowedCommands: [], allowedPaths: [] }
     }
   }
 
   private save(): void {
-    const abs = this.filePath()
+    const abs = this.userFilePath()
+    if (!abs) return
     fs.mkdirSync(path.dirname(abs), { recursive: true })
-    fs.writeFileSync(abs, JSON.stringify(this.persisted, null, 2) + '\n', 'utf8')
+    fs.writeFileSync(abs, JSON.stringify(this.userPersisted, null, 2) + '\n', 'utf8')
   }
 
   private lookupPersistedCommand(command: string): PermissionDecision | undefined {
-    this.ensureLoaded()
+    this.ensureUserLoaded()
     const normalized = SessionPermissionStore.normalize(command)
-    if (this.persisted.allowedCommands.includes(normalized)) return 'allow'
-    for (const pattern of this.persisted.allowedCommandPatterns ?? []) {
+    if (this.userPersisted.allowedCommands.includes(normalized)) return 'allow'
+    for (const pattern of this.userPersisted.allowedCommandPatterns ?? []) {
       if (wildcardMatch(pattern, normalized)) return 'allow'
     }
     if (SessionPermissionStore.hasShellMetacharacters(normalized)) return undefined
-    for (const approved of this.persisted.allowedCommands) {
+    for (const approved of this.userPersisted.allowedCommands) {
       if (SessionPermissionStore.argvPrefixMatch(approved, normalized)) return 'allow'
     }
     return undefined
   }
 
   private lookupPersistedPath(relPath: string): PermissionDecision | undefined {
-    this.ensureLoaded()
+    this.ensureUserLoaded()
     const key = normalizePathKey(relPath)
-    if (this.persisted.allowedPaths.includes(key)) return 'allow'
-    for (const pattern of this.persisted.allowedPathPatterns ?? []) {
+    if (this.userPersisted.allowedPaths.includes(key)) return 'allow'
+    for (const pattern of this.userPersisted.allowedPathPatterns ?? []) {
       if (wildcardMatch(pattern, key)) return 'allow'
     }
     return undefined
@@ -218,21 +261,21 @@ export class PersistentPermissionStore {
   }
 
   rememberCommandAlways(command: string): void {
-    this.ensureLoaded()
+    this.ensureUserLoaded()
     const normalized = SessionPermissionStore.normalize(command)
     this.session.rememberCommand(normalized, 'allow')
-    if (!this.persisted.allowedCommands.includes(normalized)) {
-      this.persisted.allowedCommands.push(normalized)
+    if (!this.userPersisted.allowedCommands.includes(normalized)) {
+      this.userPersisted.allowedCommands.push(normalized)
       this.save()
     }
   }
 
   rememberPathAlways(relPath: string): void {
-    this.ensureLoaded()
+    this.ensureUserLoaded()
     const key = normalizePathKey(relPath)
     this.session.rememberPath(key, 'allow')
-    if (!this.persisted.allowedPaths.includes(key)) {
-      this.persisted.allowedPaths.push(key)
+    if (!this.userPersisted.allowedPaths.includes(key)) {
+      this.userPersisted.allowedPaths.push(key)
       this.save()
     }
   }
@@ -246,35 +289,37 @@ export class PersistentPermissionStore {
   }
 
   rememberCommandPatternAlways(pattern: string): void {
-    this.ensureLoaded()
+    if (isOverbroadPattern(pattern)) return
+    this.ensureUserLoaded()
     const normalized = SessionPermissionStore.normalize(pattern)
     this.session.rememberCommandPattern(normalized, 'allow')
-    const current = this.persisted.allowedCommandPatterns ?? []
+    const current = this.userPersisted.allowedCommandPatterns ?? []
     if (!current.includes(normalized)) {
       current.push(normalized)
-      this.persisted.allowedCommandPatterns = current
+      this.userPersisted.allowedCommandPatterns = current
       this.save()
     }
   }
 
   rememberPathPatternAlways(pattern: string): void {
-    this.ensureLoaded()
+    if (isOverbroadPattern(pattern)) return
+    this.ensureUserLoaded()
     const normalized = normalizePathKey(pattern)
     this.session.rememberPathPattern(normalized, 'allow')
-    const current = this.persisted.allowedPathPatterns ?? []
+    const current = this.userPersisted.allowedPathPatterns ?? []
     if (!current.includes(normalized)) {
       current.push(normalized)
-      this.persisted.allowedPathPatterns = current
+      this.userPersisted.allowedPathPatterns = current
       this.save()
     }
   }
 
   lookupOutsideWorkspace(absPath: string): PermissionDecision | undefined {
-    this.ensureLoaded()
+    this.ensureUserLoaded()
     const normalized = normalizePathKey(absPath)
     const session = this.session.lookupPath(normalized)
     if (session) return session
-    for (const pattern of this.persisted.allowedOutsideWorkspace ?? []) {
+    for (const pattern of this.userPersisted.allowedOutsideWorkspace ?? []) {
       if (wildcardMatch(pattern, normalized)) return 'allow'
     }
     return undefined
@@ -285,23 +330,24 @@ export class PersistentPermissionStore {
   }
 
   rememberOutsideWorkspaceAlways(pattern: string): void {
-    this.ensureLoaded()
+    if (isOverbroadPattern(pattern)) return
+    this.ensureUserLoaded()
     const normalized = normalizePathKey(pattern)
     this.session.rememberPathPattern(normalized, 'allow')
-    const current = this.persisted.allowedOutsideWorkspace ?? []
+    const current = this.userPersisted.allowedOutsideWorkspace ?? []
     if (!current.includes(normalized)) {
       current.push(normalized)
-      this.persisted.allowedOutsideWorkspace = current
+      this.userPersisted.allowedOutsideWorkspace = current
       this.save()
     }
   }
 
   lookupUrl(url: string): PermissionDecision | undefined {
-    this.ensureLoaded()
+    this.ensureUserLoaded()
     const normalized = SessionPermissionStore.normalize(url)
     const session = this.session.lookupPath(normalized)
     if (session) return session
-    for (const pattern of this.persisted.allowedUrlPatterns ?? []) {
+    for (const pattern of this.userPersisted.allowedUrlPatterns ?? []) {
       if (wildcardMatch(pattern, normalized)) return 'allow'
     }
     return undefined
@@ -312,20 +358,21 @@ export class PersistentPermissionStore {
   }
 
   rememberUrlPatternAlways(pattern: string): void {
-    this.ensureLoaded()
+    if (isOverbroadPattern(pattern)) return
+    this.ensureUserLoaded()
     const normalized = SessionPermissionStore.normalize(pattern)
     this.session.rememberPathPattern(normalized, 'allow')
-    const current = this.persisted.allowedUrlPatterns ?? []
+    const current = this.userPersisted.allowedUrlPatterns ?? []
     if (!current.includes(normalized)) {
       current.push(normalized)
-      this.persisted.allowedUrlPatterns = current
+      this.userPersisted.allowedUrlPatterns = current
       this.save()
     }
   }
 
   toolDefault(toolName: string, profile: AgentProfileName, fallback: PermissionDefault): PermissionDefault {
-    this.ensureLoaded()
-    const override = this.persisted.toolDefaults?.[toolName]
+    this.ensureRepoLoaded()
+    const override = this.repoRestrictive.toolDefaults?.[toolName]
     if (override) return override
     const profileDefaults = profilePermissionDefaults(profile)
     switch (toolName) {

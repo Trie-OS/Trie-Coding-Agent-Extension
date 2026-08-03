@@ -1,5 +1,5 @@
 import * as vscode from 'vscode'
-import { normalizeAgentProfile, type AgentProfileName } from './agent/agentProfiles'
+import { normalizeAgentProfile, type AgentProfileName } from './agent/agentProfiles.ts'
 
 export type BackendKind = 'daemon' | 'openai-compatible'
 export type FrontierProvider = 'openai' | 'anthropic' | 'moonshot'
@@ -33,6 +33,22 @@ export interface HybridModelOption {
   active: boolean
 }
 
+export interface AgentBudgetSettings {
+  modeDeadlineCodeMs: number
+  modeDeadlinePlanMs: number
+  modeDeadlineAskMs: number
+  modeGenerationsCode: number
+  modeGenerationsPlan: number
+  modeGenerationsAsk: number
+  recommendationDeadlineMs: number
+  recommendationGenerationLimit: number
+  recommendationExplorationCalls: number
+  recommendationExplorationMs: number
+  frontierConsultLimit: number
+  frontierCompletionLimit: number
+  reservedFinishMs: number
+}
+
 export interface ExtensionConfig {
   backend: BackendKind
   daemon: {
@@ -44,7 +60,13 @@ export interface ExtensionConfig {
     command: string
   }
   api: { baseUrl: string; modelName: string; apiKey: string }
-  agent: { maxToolCalls: number; temperature: number; maxTokens: number; profile: AgentProfileName }
+  agent: {
+    maxToolCalls: number
+    temperature: number
+    maxTokens: number
+    profile: AgentProfileName
+    budgets: AgentBudgetSettings
+  }
   frontierAssist: FrontierAssistConfig
   webSearch: {
     provider: WebSearchProvider
@@ -216,6 +238,79 @@ const INDEX_DEFAULTS = {
   scoreThreshold: 0.4,
 } as const
 
+const AGENT_BUDGET_DEFAULTS: AgentBudgetSettings = {
+  modeDeadlineCodeMs: 8 * 60_000,
+  modeDeadlinePlanMs: 4 * 60_000,
+  modeDeadlineAskMs: 2 * 60_000,
+  modeGenerationsCode: 16,
+  modeGenerationsPlan: 10,
+  modeGenerationsAsk: 8,
+  recommendationDeadlineMs: 120_000,
+  recommendationGenerationLimit: 6,
+  recommendationExplorationCalls: 3,
+  recommendationExplorationMs: 90_000,
+  frontierConsultLimit: 4,
+  frontierCompletionLimit: 4,
+  reservedFinishMs: 45_000,
+}
+
+function readAgentBudgetSettings(cfg: vscode.WorkspaceConfiguration): AgentBudgetSettings {
+  return {
+    modeDeadlineCodeMs: cfg.get<number>(
+      'agent.budgets.modeDeadlineCodeMs',
+      AGENT_BUDGET_DEFAULTS.modeDeadlineCodeMs,
+    ),
+    modeDeadlinePlanMs: cfg.get<number>(
+      'agent.budgets.modeDeadlinePlanMs',
+      AGENT_BUDGET_DEFAULTS.modeDeadlinePlanMs,
+    ),
+    modeDeadlineAskMs: cfg.get<number>(
+      'agent.budgets.modeDeadlineAskMs',
+      AGENT_BUDGET_DEFAULTS.modeDeadlineAskMs,
+    ),
+    modeGenerationsCode: cfg.get<number>(
+      'agent.budgets.modeGenerationsCode',
+      AGENT_BUDGET_DEFAULTS.modeGenerationsCode,
+    ),
+    modeGenerationsPlan: cfg.get<number>(
+      'agent.budgets.modeGenerationsPlan',
+      AGENT_BUDGET_DEFAULTS.modeGenerationsPlan,
+    ),
+    modeGenerationsAsk: cfg.get<number>(
+      'agent.budgets.modeGenerationsAsk',
+      AGENT_BUDGET_DEFAULTS.modeGenerationsAsk,
+    ),
+    recommendationDeadlineMs: cfg.get<number>(
+      'agent.budgets.recommendationDeadlineMs',
+      AGENT_BUDGET_DEFAULTS.recommendationDeadlineMs,
+    ),
+    recommendationGenerationLimit: cfg.get<number>(
+      'agent.budgets.recommendationGenerationLimit',
+      AGENT_BUDGET_DEFAULTS.recommendationGenerationLimit,
+    ),
+    recommendationExplorationCalls: cfg.get<number>(
+      'agent.budgets.recommendationExplorationCalls',
+      AGENT_BUDGET_DEFAULTS.recommendationExplorationCalls,
+    ),
+    recommendationExplorationMs: cfg.get<number>(
+      'agent.budgets.recommendationExplorationMs',
+      AGENT_BUDGET_DEFAULTS.recommendationExplorationMs,
+    ),
+    frontierConsultLimit: cfg.get<number>(
+      'agent.budgets.frontierConsultLimit',
+      AGENT_BUDGET_DEFAULTS.frontierConsultLimit,
+    ),
+    frontierCompletionLimit: cfg.get<number>(
+      'agent.budgets.frontierCompletionLimit',
+      AGENT_BUDGET_DEFAULTS.frontierCompletionLimit,
+    ),
+    reservedFinishMs: cfg.get<number>(
+      'agent.budgets.reservedFinishMs',
+      AGENT_BUDGET_DEFAULTS.reservedFinishMs,
+    ),
+  }
+}
+
 /** Read index.* with folder → workspace file → user precedence (matches VS Code settings UI). */
 function readIndexConfig(cfg: vscode.WorkspaceConfiguration): ExtensionConfig['index'] {
   const pick = <T>(key: string, fallback: T): T => {
@@ -277,6 +372,7 @@ export function readConfig(): ExtensionConfig {
       temperature: cfg.get<number>('agent.temperature', 0.2),
       maxTokens: cfg.get<number>('agent.maxTokens', 2048),
       profile: normalizeAgentProfile(cfg.get<string>('agent.profile', 'default')),
+      budgets: readAgentBudgetSettings(cfg),
     },
     frontierAssist: readFrontierAssist(cfg),
     webSearch: {

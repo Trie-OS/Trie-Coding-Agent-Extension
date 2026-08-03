@@ -4,15 +4,22 @@
  */
 import type { ChangedFileStat } from './checkpoints'
 
+export interface VerifyResult {
+  command: string
+  ok: boolean
+  output: string
+}
+
 export interface ReviewEvidence {
   diffSummary: string
   changedFiles: ChangedFileStat[]
-  verifyResults: { command: string; ok: boolean; output: string }[]
+  verifyResults: VerifyResult[]
 }
 
 export async function gatherReviewEvidence(
   _root: string,
   changedFiles: ChangedFileStat[],
+  verifyResults: VerifyResult[] = [],
 ): Promise<ReviewEvidence> {
   const diffSummary =
     changedFiles.length === 0
@@ -25,24 +32,20 @@ export async function gatherReviewEvidence(
   return {
     diffSummary,
     changedFiles,
-    verifyResults: [
-      {
-        command: '(skipped)',
-        ok: true,
-        output:
-          'Automatic verification was not run before frontier review. Use run_verification during the turn when checks are needed.',
-      },
-    ],
+    verifyResults,
   }
 }
 
 export function formatEvidenceForFrontier(evidence: ReviewEvidence): string {
   const lines = ['=== Workspace diff (since turn checkpoint) ===', evidence.diffSummary]
+  lines.push('', '=== Deterministic verification ===')
   if (evidence.verifyResults.length > 0) {
-    lines.push('', '=== Deterministic verification ===')
     for (const v of evidence.verifyResults) {
+      lines.push(`${v.ok ? 'PASS' : 'FAIL'} ${v.command}`)
       lines.push(v.output.slice(0, 800))
     }
+  } else {
+    lines.push('Verification was not run during this turn.')
   }
   return lines.join('\n')
 }

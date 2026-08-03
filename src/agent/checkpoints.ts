@@ -37,11 +37,15 @@ interface GitResult {
 }
 
 export class ShadowRepo {
-  constructor(
-    readonly workspaceRoot: string,
-    private readonly gitBinary = 'git',
-    private readonly timeoutMs = 120_000,
-  ) {}
+  readonly workspaceRoot: string
+  private readonly gitBinary: string
+  private readonly timeoutMs: number
+
+  constructor(workspaceRoot: string, gitBinary = 'git', timeoutMs = 120_000) {
+    this.workspaceRoot = workspaceRoot
+    this.gitBinary = gitBinary
+    this.timeoutMs = timeoutMs
+  }
 
   get gitDir(): string {
     return join(this.workspaceRoot, SHADOW_DIR, SHADOW_GIT_DIRNAME)
@@ -114,8 +118,15 @@ export class ShadowRepo {
   async snapshot(label: string): Promise<string> {
     await this.ensureInitialized()
     await this.runOrThrow(['add', '--all', '.'], 'staging the workspace')
+    const staged = await this.run(['diff', '--cached', '--quiet'])
+    if (staged.exitCode === 0) {
+      const head = await this.run(['rev-parse', 'HEAD'])
+      if (head.exitCode === 0) {
+        return head.stdout.trim()
+      }
+    }
     await this.runOrThrow(
-      ['commit', '--allow-empty', '--quiet', '--no-verify', '-m', label],
+      ['commit', '--quiet', '--no-verify', '-m', label],
       'creating the checkpoint commit',
     )
     return (await this.runOrThrow(['rev-parse', 'HEAD'], 'reading the checkpoint sha')).trim()

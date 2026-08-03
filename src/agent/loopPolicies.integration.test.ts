@@ -35,41 +35,35 @@ test('recommendation exploration stops at three calls or 90 seconds', () => {
   assert.equal(budget.elapsedMs(), 90_000)
 })
 
-test('frontier judge and synthesis consume no local generations', async () => {
+test('frontier judge passes return grounded draft without rewrite', async () => {
   let localCalls = 0
-  const responses = [
-    {
-      text: '{"adequate": true, "factuallyGrounded": true, "feedback": "", "rejectedClaims": []}',
-      truncated: false,
-    },
-    {
-      text: 'Verified final answer with concrete, evidence-backed implementation guidance.',
-      truncated: false,
-    },
-  ]
+  let frontierCalls = 0
   const frontier = {
     enabled: () => true,
     async completeResult() {
-      return responses.shift() ?? null
+      frontierCalls += 1
+      return {
+        text: '{"adequate": true, "factuallyGrounded": true, "feedback": "", "rejectedClaims": []}',
+        truncated: false,
+      }
     },
   } as unknown as FrontierAssist
   const budget = new TurnBudget('ask', true)
+  const draft = 'A grounded repository draft with concrete implementation recommendations.'
   const result = await finishRecommendationAnswer(
     localClient(() => {
       localCalls += 1
     }),
     'Recommend harness improvements',
-    'A grounded repository draft with concrete implementation recommendations.',
+    draft,
     'Evidence notes.',
     { temperature: 0.2, topP: 0.95, maxTokens: 256 },
     new AbortController().signal,
     { frontier, evidence: '[E1] src/agent/loop.ts', budget },
   )
-  assert.equal(
-    result,
-    'Verified final answer with concrete, evidence-backed implementation guidance.',
-  )
+  assert.equal(result, draft)
   assert.equal(localCalls, 0)
+  assert.equal(frontierCalls, 1)
   assert.equal(budget.localGenerations, 0)
 })
 
@@ -139,7 +133,7 @@ test('stop signal cancels frontier judge without local fallback', async () => {
 test('repeatedly truncated synthesis never returns partial text', async () => {
   const responses = [
     {
-      text: '{"adequate": true, "factuallyGrounded": true, "feedback": "", "rejectedClaims": []}',
+      text: '{"adequate": false, "factuallyGrounded": false, "feedback": "Needs rewrite", "rejectedClaims": []}',
       truncated: false,
     },
     { text: 'PARTIAL SECRET', truncated: true },

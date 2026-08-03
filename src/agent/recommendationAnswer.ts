@@ -428,6 +428,9 @@ export async function finishRecommendationAnswer(
       judgment.tokensIn ?? 0,
       judgment.tokensOut ?? 0,
     )
+    if (judgment.adequate && judgment.factuallyGrounded && initial.length >= 40) {
+      return initial
+    }
     const claimFeedback = judgment.rejectedClaims.length
       ? `\nRejected claims:\n${judgment.rejectedClaims
           .map(

@@ -1,8 +1,9 @@
 /**
  * MinionS-style decomposition: the frontier model breaks a large task into
  * atomic single-instruction subtasks; the local model executes them.
+ * Uses the hybrid completion budget via FrontierAssist.
  */
-import { defaultFrontierModel, getActiveFrontierConfig, type FrontierAssistConfig } from '../config'
+import type { FrontierAssist } from './frontierAssist'
 import { DECOMPOSE_TIMEOUT_MS, shouldDecompose } from './hybridDecomposePolicy'
 
 export interface DecomposePlan {
@@ -23,30 +24,20 @@ const DECOMPOSE_SYSTEM = [
 export async function frontierDecompose(
   task: string,
   workspaceHint: string,
-  getConfig: () => FrontierAssistConfig,
+  frontier: FrontierAssist,
   signal?: AbortSignal,
 ): Promise<DecomposePlan | null> {
-  const fa = getConfig()
-  if (!fa.enabled) return null
-  const cfg = getActiveFrontierConfig(fa)
-  if (!cfg) return null
+  if (!frontier.enabled()) return null
 
   const userContent = `Task:\n${task}\n\nWorkspace:\n${workspaceHint.slice(0, 1500)}`
-  const timeout = AbortSignal.timeout(DECOMPOSE_TIMEOUT_MS)
-  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
   try {
-    const raw =
-      cfg.provider === 'anthropic'
-        ? await callAnthropic(cfg.apiKey, cfg.model, userContent, combined)
-        : await callOpenAiCompatible(
-            cfg.provider === 'moonshot'
-              ? 'https://api.moonshot.ai/v1/chat/completions'
-              : 'https://api.openai.com/v1/chat/completions',
-            cfg.apiKey,
-            cfg.model || defaultFrontierModel(cfg.provider),
-            userContent,
-            combined,
-          )
+    const result = await frontier.completeResult(DECOMPOSE_SYSTEM, userContent, {
+      maxTokens: 500,
+      temperature: 0.2,
+      signal,
+      timeoutMs: DECOMPOSE_TIMEOUT_MS,
+    })
+    const raw = result?.text
     if (!raw) return null
     const start = raw.indexOf('{')
     const end = raw.lastIndexOf('}')
@@ -66,58 +57,6 @@ export async function frontierDecompose(
   } catch {
     return null
   }
-}
-
-async function callOpenAiCompatible(
-  url: string,
-  apiKey: string,
-  model: string,
-  content: string,
-  signal: AbortSignal,
-): Promise<string | null> {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: model || 'gpt-4o',
-      messages: [
-        { role: 'system', content: DECOMPOSE_SYSTEM },
-        { role: 'user', content },
-      ],
-      max_tokens: 500,
-      temperature: 0.2,
-    }),
-    signal,
-  })
-  if (!response.ok) return null
-  const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> }
-  return data.choices?.[0]?.message?.content ?? null
-}
-
-async function callAnthropic(
-  apiKey: string,
-  model: string,
-  content: string,
-  signal: AbortSignal,
-): Promise<string | null> {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: model || 'claude-sonnet-4-20250514',
-      system: DECOMPOSE_SYSTEM,
-      messages: [{ role: 'user', content }],
-      max_tokens: 500,
-    }),
-    signal,
-  })
-  if (!response.ok) return null
-  const data = (await response.json()) as { content?: Array<{ type: string; text?: string }> }
-  return data.content?.find((b) => b.type === 'text')?.text ?? null
 }
 
 export function formatDecomposeInjection(plan: DecomposePlan): string {

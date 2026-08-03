@@ -2,7 +2,7 @@
   "name": "trie-ide",
   "displayName": "Trie Coding Agent",
   "description": "Coding agent: local GGUF via embedded trie-daemon, or any LLM API (Ollama, LM Studio, OpenAI, Kimi, and other cloud endpoints). Hybrid mode adds sparing frontier-model guidance.",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "publisher": "Trie",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -177,6 +177,71 @@
           "default": "default",
           "description": "Permission posture preset for the coding agent."
         },
+        "trie-ide.agent.budgets.modeDeadlineCodeMs": {
+          "type": "number",
+          "default": 480000,
+          "description": "End-to-end turn deadline for Code mode (milliseconds)."
+        },
+        "trie-ide.agent.budgets.modeDeadlinePlanMs": {
+          "type": "number",
+          "default": 240000,
+          "description": "End-to-end turn deadline for Plan mode (milliseconds)."
+        },
+        "trie-ide.agent.budgets.modeDeadlineAskMs": {
+          "type": "number",
+          "default": 120000,
+          "description": "End-to-end turn deadline for Ask mode (milliseconds)."
+        },
+        "trie-ide.agent.budgets.modeGenerationsCode": {
+          "type": "number",
+          "default": 16,
+          "description": "Local model generation budget for Code mode tool loops."
+        },
+        "trie-ide.agent.budgets.modeGenerationsPlan": {
+          "type": "number",
+          "default": 10,
+          "description": "Local model generation budget for Plan mode tool loops."
+        },
+        "trie-ide.agent.budgets.modeGenerationsAsk": {
+          "type": "number",
+          "default": 8,
+          "description": "Local model generation budget for Ask mode tool loops."
+        },
+        "trie-ide.agent.budgets.recommendationDeadlineMs": {
+          "type": "number",
+          "default": 120000,
+          "description": "End-to-end deadline for recommendation-ask turns (milliseconds)."
+        },
+        "trie-ide.agent.budgets.recommendationGenerationLimit": {
+          "type": "number",
+          "default": 6,
+          "description": "Local generation budget for recommendation-ask finish paths."
+        },
+        "trie-ide.agent.budgets.recommendationExplorationCalls": {
+          "type": "number",
+          "default": 3,
+          "description": "Exploration tool calls before recommendation synthesis is forced."
+        },
+        "trie-ide.agent.budgets.recommendationExplorationMs": {
+          "type": "number",
+          "default": 90000,
+          "description": "Exploration wall-clock budget before recommendation synthesis (milliseconds)."
+        },
+        "trie-ide.agent.budgets.frontierConsultLimit": {
+          "type": "number",
+          "default": 4,
+          "description": "Hybrid mode: advisory consult calls per turn (stuck hints, final review)."
+        },
+        "trie-ide.agent.budgets.frontierCompletionLimit": {
+          "type": "number",
+          "default": 4,
+          "description": "Hybrid mode: completion calls per turn (judge, rewrite, decompose)."
+        },
+        "trie-ide.agent.budgets.reservedFinishMs": {
+          "type": "number",
+          "default": 45000,
+          "description": "Milliseconds reserved at turn deadline for finish/judge/review phases."
+        },
         "trie-ide.frontierAssist.enabled": {
           "type": "boolean",
           "default": false,
@@ -317,7 +382,8 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/agent/verificationPolicy.test.ts src/agent/tools.test.ts src/agent/editMatcher.test.ts src/agent/webSearchIntent.test.ts src/agent/multitaskBus.test.ts src/agent/worktrees.test.ts src/agent/hybridDecompose.test.ts src/agent/taskIntent.test.ts src/agent/recommendationAnswer.test.ts src/agent/recommendationBudget.test.ts src/agent/loopPolicies.integration.test.ts src/agent/compaction.test.ts src/agent/permissions.test.ts src/agent/hooks.test.ts src/agent/thoughtStream.test.ts src/agent/diffPreview.test.ts src/agent/shellExec.test.ts src/agent/planSession.test.ts src/agent/scratchpad.test.ts src/inference/modelVision.test.ts src/inference/openAiMessages.test.ts src/inference/openaiClient.test.ts src/chat/replyMarkdown.test.ts",
+    "pretest": "node -e \"const fs=require('fs');const p='node_modules/vscode';try{fs.lstatSync(p)}catch{fs.symlinkSync('../test-stubs/vscode',p)}\"",
+    "test": "node --experimental-strip-types --test src/agent/verificationPolicy.test.ts src/agent/tools.test.ts src/agent/editMatcher.test.ts src/agent/webSearchIntent.test.ts src/agent/multitaskBus.test.ts src/agent/worktrees.test.ts src/agent/hybridDecompose.test.ts src/agent/taskIntent.test.ts src/agent/recommendationAnswer.test.ts src/agent/recommendationBudget.test.ts src/agent/loopPolicies.integration.test.ts src/agent/compaction.test.ts src/agent/permissions.test.ts src/agent/hooks.test.ts src/agent/thoughtStream.test.ts src/agent/diffPreview.test.ts src/agent/shellExec.test.ts src/agent/planSession.test.ts src/agent/scratchpad.test.ts src/agent/harnessSecurity.test.ts src/agent/turnBudget.test.ts src/inference/modelVision.test.ts src/inference/openAiMessages.test.ts src/inference/openaiClient.test.ts src/chat/replyMarkdown.test.ts",
     "package": "npm run typecheck && npm run build && vsce package --no-dependencies",
     "package:platform": "node scripts/package-platform.mjs",
     "package:marketplace": "node scripts/package-marketplace.mjs",

@@ -3,7 +3,6 @@
  * to run against the VS Code workspace. Same names and argument shapes so a
  * model tuned on Trie IDE prompts behaves identically here.
  */
-import { execFile } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as vscode from 'vscode'
@@ -22,11 +21,13 @@ import {
   type MultitaskToolContext,
 } from './multitaskBus'
 import { parseToolCall as parseToolCallInner, extractJsonObject as extractJsonObjectInner } from './toolParse'
+import { searchWorkspaceText } from './grepSearch'
+import { assertContainedInWorkspace, relativeFromRoot } from './pathContainment'
 import { PersistentPermissionStore, isSensitivePath } from './permissions'
 import type { PlanSession } from './planSession'
 import type { PermissionBroker, PermissionChoice, PermissionRequest } from './permissionBroker'
 import type { QuestionBroker, UserQuestionPayload } from './questionBroker'
-import { shellExec } from './shellExec'
+import { execFileWithSignal, shellExec } from './shellExec'
 import { ensureScratchpad, isScratchpadPath } from './scratchpad'
 import { getSymbolIndex, isIdentifierPattern } from './symbolIndex'
 import { normalizeAgentProfile, type AgentProfileName } from './agentProfiles'
@@ -265,6 +266,7 @@ export interface WorkspaceToolsOptions {
   planSession?: PlanSession
   profile?: AgentProfileName
   deadlineAt?: number
+  abortSignal?: AbortSignal
 }
 
 export class WorkspaceTools {
@@ -275,6 +277,7 @@ export class WorkspaceTools {
   readonly planSession: PlanSession | null
   private readonly profile: AgentProfileName
   private readonly deadlineAt: number | undefined
+  private readonly abortSignal: AbortSignal | undefined
   /** Directories whose AGENTS.md has already been injected this session. */
   private readonly injectedAgentsMd = new Set<string>()
 
@@ -290,26 +293,30 @@ export class WorkspaceTools {
     this.planSession = options.planSession ?? null
     this.profile = normalizeAgentProfile(options.profile)
     this.deadlineAt = options.deadlineAt
+    this.abortSignal = options.abortSignal
   }
 
-  /** Resolve a workspace-relative path; escapes are refused (Trie IDE's PATH_OUTSIDE_WORKSPACE policy). */
-  private resolve(relPath: string): string {
+  /** Resolve a workspace-relative path; escapes and symlink hops are refused. */
+  private async resolve(relPath: string, allowMissing = false): Promise<string> {
     if (path.isAbsolute(relPath)) throw new Error(`Absolute paths are not allowed: ${relPath}`)
-    const absolute = path.resolve(this.root, relPath)
-    const rel = path.relative(this.root, absolute)
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
-      throw new Error(`Path escapes the workspace: ${relPath}`)
-    }
-    return absolute
+    return assertContainedInWorkspace(this.root, relPath, { allowMissing })
   }
 
   /**
    * Outside-workspace access is a permission scope instead of an unconditional hard-refusal.
    * Safe defaults still require approval unless profile/default overrides allow it.
    */
-  private async resolveWithScope(relPath: string, toolName: string): Promise<string> {
+  private async resolveWithScope(relPath: string, toolName: string, allowMissing = false): Promise<string> {
+    if (!path.isAbsolute(relPath)) {
+      try {
+        return await assertContainedInWorkspace(this.root, relPath, { allowMissing })
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes('escapes the workspace')) throw error
+      }
+    }
     const absolute = path.isAbsolute(relPath) ? path.resolve(relPath) : path.resolve(this.root, relPath)
-    const rel = path.relative(this.root, absolute)
+    const realRoot = await assertContainedInWorkspace(this.root, '.')
+    const rel = path.relative(realRoot, absolute)
     const inside = !(rel.startsWith('..') || path.isAbsolute(rel))
     if (inside) return absolute
 
@@ -413,12 +420,10 @@ export class WorkspaceTools {
   private applyWritePermission(relPath: string, choice: PermissionChoice | null): void {
     if (choice === 'always') {
       this.permissions.rememberPathAlways(relPath)
-      this.permissions.rememberPathPatternAlways(parentWildcard(relPath))
       return
     }
     if (choice === 'session') {
       this.permissions.rememberPath(relPath, 'allow')
-      this.permissions.rememberPathPattern(parentWildcard(relPath), 'allow')
       return
     }
     if (choice === 'once') return
@@ -435,22 +440,27 @@ export class WorkspaceTools {
     diff?: { before?: string; after?: string },
   ): Promise<void> {
     if (isScratchpadPath(relPath, this.sessionId)) return
-    if (!isSensitivePath(relPath)) return
+    const normalized = relPath.replace(/\\/g, '/').replace(/^\.\//, '')
+    if (normalized === '.trie-ide/permissions.json' || normalized === '.trie-ide/hooks.json') {
+      throw new Error(`Writes to ${normalized} are blocked for security.`)
+    }
+    const canonical = relativeFromRoot(this.root, await this.resolve(relPath))
+    if (!isSensitivePath(canonical)) return
     const defaultPolicy = this.permissions.toolDefault('sensitive_write', this.profile, 'ask')
     if (defaultPolicy === 'allow') return
     if (defaultPolicy === 'deny') {
       throw new Error(`Write to sensitive path "${relPath}" denied by active profile.`)
     }
-    const remembered = this.permissions.lookupPath(relPath)
+    const remembered = this.permissions.lookupPath(canonical)
     if (remembered === 'allow') return
     if (remembered === 'deny') {
-      throw new Error(`Write to sensitive path "${relPath}" was denied for this session.`)
+      throw new Error(`Write to sensitive path "${canonical}" was denied for this session.`)
     }
     const choice = await this.requestPermission({
       kind: 'write',
       title: `Allow ${action} on sensitive file?`,
-      preview: relPath,
-      path: relPath,
+      preview: canonical,
+      path: canonical,
       action,
       toolName: action === 'edit' ? 'edit_file' : 'write_file',
       diff: diff
@@ -460,7 +470,7 @@ export class WorkspaceTools {
           }
         : undefined,
     })
-    this.applyWritePermission(relPath, choice)
+    this.applyWritePermission(canonical, choice)
   }
 
   async execute(call: ToolCall): Promise<ToolOutcome> {
@@ -611,10 +621,6 @@ export class WorkspaceTools {
   private async grep(args: Record<string, unknown>): Promise<ToolOutcome> {
     const pattern = str(args, 'pattern')
     const glob = typeof args['glob'] === 'string' && args['glob'] ? (args['glob'] as string) : '**/*'
-    const regex = new RegExp(pattern)
-    // Trie fast path: a bare identifier is usually "where is X declared" —
-    // answer from the symbol index first, then append content matches. Both
-    // paths are timed so the UI can show the honest speed difference.
     const trieStart = performance.now()
     const symbolHits =
       readConfig().index.enabled && isIdentifierPattern(pattern)
@@ -622,34 +628,30 @@ export class WorkspaceTools {
         : []
     const trieMs = performance.now() - trieStart
     const scanStart = performance.now()
-    const uris = await vscode.workspace.findFiles(glob, GREP_EXCLUDE, 2000)
-    const hits: string[] = symbolHits.map(
+    const prefixHits = symbolHits.map(
       (h) => `${h.path}:${h.line}: [symbol trie] ${h.kind} ${h.name}`,
     )
-    let capped = false
-    for (const uri of uris) {
-      if (hits.length >= MAX_GREP_HITS) {
-        capped = true
-        break
-      }
-      let content: string
-      try {
-        const stat = await fs.promises.stat(uri.fsPath)
-        if (stat.size > MAX_FILE_READ_BYTES) continue
-        content = await fs.promises.readFile(uri.fsPath, 'utf8')
-      } catch {
-        continue
-      }
-      if (content.includes('\u0000')) continue // binary
-      const lines = content.split('\n')
-      for (let i = 0; i < lines.length && hits.length < MAX_GREP_HITS; i++) {
-        if (regex.test(lines[i])) {
-          hits.push(`${path.relative(this.root, uri.fsPath)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`)
-        }
-      }
-      if (hits.length >= MAX_GREP_HITS) capped = true
-    }
+    const search = await searchWorkspaceText({
+      root: this.root,
+      pattern,
+      glob,
+      exclude: GREP_EXCLUDE,
+      maxHits: Math.max(0, MAX_GREP_HITS - prefixHits.length),
+      maxFileBytes: MAX_FILE_READ_BYTES,
+      deadlineAt: this.deadlineAt,
+      signal: this.abortSignal,
+    })
     const scanMs = performance.now() - scanStart
+    if (search.cancelled) {
+      return {
+        ok: false,
+        result: 'Cancelled.',
+        uiSummary: `cancelled grep: /${pattern}/`,
+        userSkipped: true,
+      }
+    }
+    const hits = [...prefixHits, ...search.hits.map((h) => h.line)]
+    const capped = search.capped || hits.length >= MAX_GREP_HITS
     return {
       ok: true,
       result: truncate(hits.join('\n') || 'No matches.', MAX_RESULT_CHARS, {
@@ -902,10 +904,8 @@ export class WorkspaceTools {
       })
       if (choice === 'always') {
         this.permissions.rememberCommandAlways(command)
-        this.permissions.rememberCommandPatternAlways(commandHeadWildcard(command))
       } else if (choice === 'session') {
         this.permissions.rememberCommand(command, 'allow')
-        this.permissions.rememberCommandPattern(commandHeadWildcard(command), 'allow')
       } else if (choice === 'once') {
         // one-shot — do not persist
       } else {
@@ -922,7 +922,14 @@ export class WorkspaceTools {
       1,
       Math.min(120_000, this.deadlineAt ? this.deadlineAt - Date.now() : 120_000),
     )
-    const output = await shellExec(command, this.root, timeoutMs, 1024 * 1024)
+    const output = await shellExec(command, this.root, timeoutMs, 1024 * 1024, this.abortSignal)
+    if (output.cancelled) {
+      return {
+        ok: false,
+        result: 'Cancelled.',
+        uiSummary: `cancelled: ${command}`,
+      }
+    }
     const body = `${output.ok ? 'Exit 0' : 'Command failed'}\n${output.text}`
     const detail = truncate(body, 4000, {
       hint:
@@ -1019,6 +1026,20 @@ export class WorkspaceTools {
     const skipReason = typeof args['skipReason'] === 'string' ? args['skipReason'].trim() : ''
     if (skipReason) {
       if (skipReason.length < 12) throw new Error('skipReason must explain why verification is not pragmatic.')
+      const skipChoice = await this.requestPermission({
+        kind: 'verification',
+        title: 'Skip verification?',
+        preview: skipReason,
+        toolName: 'run_verification',
+      })
+      if (skipChoice !== 'once' && skipChoice !== 'session') {
+        return {
+          ok: false,
+          result: 'Verification skip denied by the user.',
+          uiSummary: 'skip denied',
+          userSkipped: true,
+        }
+      }
       return {
         ok: true,
         result: `Verification explicitly skipped: ${skipReason}`,
@@ -1038,14 +1059,44 @@ export class WorkspaceTools {
       typeof args['packagePath'] === 'string' && args['packagePath'].trim()
         ? args['packagePath'].trim()
         : '.'
-    const packageRoot = await this.resolveWithScope(packagePath, 'run_verification')
-    const [realWorkspaceRoot, realPackageRoot] = await Promise.all([
-      fs.promises.realpath(this.root),
-      fs.promises.realpath(packageRoot),
-    ])
-    const packageRelative = path.relative(realWorkspaceRoot, realPackageRoot)
+    const realRoot = await assertContainedInWorkspace(this.root, '.')
+    const realPackageRoot = await assertContainedInWorkspace(this.root, packagePath)
+    const packageRelative = path.relative(realRoot, realPackageRoot).split(path.sep).join('/')
     if (packageRelative.startsWith('..') || path.isAbsolute(packageRelative)) {
       throw new Error('Verification packagePath resolves outside the workspace.')
+    }
+    const verifyKey = `${packageRelative}:${script}`
+    const rememberedVerify = this.permissions.lookupPath(verifyKey)
+    if (rememberedVerify === 'deny') {
+      return {
+        ok: false,
+        result: 'Verification denied by a prior session decision.',
+        uiSummary: `denied: ${script}`,
+      }
+    }
+    if (rememberedVerify !== 'allow') {
+      const runner = await detectPackageRunner(realPackageRoot)
+      const previewDisplay = `${runner} run ${script}`
+      const choice = await this.requestPermission({
+        kind: 'verification',
+        title: 'Allow verification script?',
+        preview: previewDisplay,
+        path: verifyKey,
+        toolName: 'run_verification',
+      })
+      if (choice === 'always') {
+        this.permissions.rememberPathAlways(verifyKey)
+      } else if (choice === 'session' || choice === 'once') {
+        this.permissions.rememberPath(verifyKey, 'allow')
+      } else {
+        if (choice === 'deny') this.permissions.rememberPath(verifyKey, 'deny')
+        return {
+          ok: false,
+          result: 'Verification denied by the user.',
+          uiSummary: `denied: ${script}`,
+          userSkipped: true,
+        }
+      }
     }
     const manifestPath = path.join(realPackageRoot, 'package.json')
     const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8')) as {
@@ -1072,7 +1123,25 @@ export class WorkspaceTools {
           ? ['run', script, ...scriptArgs]
           : ['run', script, ...(scriptArgs.length > 0 ? ['--', ...scriptArgs] : [])]
     const display = `${runner} ${runnerArgs.join(' ')}`
-    const output = await execFileResult(runner, runnerArgs, realPackageRoot)
+    const timeoutMs = Math.max(
+      1,
+      Math.min(120_000, this.deadlineAt ? this.deadlineAt - Date.now() : 120_000),
+    )
+    const output = await execFileWithSignal(
+      runner,
+      runnerArgs,
+      realPackageRoot,
+      timeoutMs,
+      1024 * 1024,
+      this.abortSignal,
+    )
+    if (output.cancelled) {
+      return {
+        ok: false,
+        result: 'Cancelled.',
+        uiSummary: `cancelled: ${display}`,
+      }
+    }
     const artifactPaths = optionalStringArray(args, 'artifactPaths', 10)
     const artifacts = await this.describeVerificationArtifacts(artifactPaths)
     return {
@@ -1088,12 +1157,11 @@ export class WorkspaceTools {
   private async describeVerificationArtifacts(paths: string[]): Promise<string> {
     if (paths.length === 0) return ''
     const descriptions: string[] = []
-    const realWorkspaceRoot = await fs.promises.realpath(this.root)
+    const realWorkspaceRoot = await assertContainedInWorkspace(this.root, '.')
     for (const relPath of paths) {
-      const absolute = this.resolve(relPath)
       try {
-        const realArtifact = await fs.promises.realpath(absolute)
-        const relative = path.relative(realWorkspaceRoot, realArtifact)
+        const realArtifact = await assertContainedInWorkspace(this.root, relPath)
+        const relative = path.relative(realWorkspaceRoot, realArtifact).split(path.sep).join('/')
         if (relative.startsWith('..') || path.isAbsolute(relative)) {
           descriptions.push(`${relPath}: unavailable (resolves outside the workspace)`)
           continue
@@ -1155,24 +1223,6 @@ async function detectPackageRunner(packageRoot: string): Promise<PackageRunner> 
     }
   }
   return 'npm'
-}
-
-function execFileResult(
-  executable: string,
-  args: string[],
-  cwd: string,
-): Promise<{ ok: boolean; text: string }> {
-  return new Promise((resolvePromise) => {
-    execFile(
-      executable,
-      args,
-      { cwd, timeout: 120_000, maxBuffer: 1024 * 1024 },
-      (error, stdout, stderr) => {
-        const text = [stdout, stderr].filter(Boolean).join('\n')
-        resolvePromise({ ok: !error, text: text || (error ? String(error) : '(no output)') })
-      },
-    )
-  })
 }
 
 interface SearchResult {
@@ -1297,18 +1347,6 @@ function basename(relPath: string): string {
 
 function countLines(text: string): number {
   return text ? text.split('\n').length : 0
-}
-
-function commandHeadWildcard(command: string): string {
-  const normalized = command.trim().replace(/\s+/g, ' ')
-  const head = normalized.split(' ')[0] ?? normalized
-  return head ? `${head} *` : normalized
-}
-
-function parentWildcard(relPath: string): string {
-  const normalized = relPath.replace(/\\/g, '/').replace(/\/+$/, '')
-  const dir = normalized.includes('/') ? normalized.slice(0, normalized.lastIndexOf('/')) : '.'
-  return `${dir}/*`
 }
 
 function extractUrls(text: string): string[] {

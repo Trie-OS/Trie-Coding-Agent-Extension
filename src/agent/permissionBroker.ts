@@ -2,7 +2,7 @@
  * In-chat permission broker — shell commands and sensitive writes via the webview.
  */
 
-export type PermissionKind = 'shell' | 'write' | 'scope'
+export type PermissionKind = 'shell' | 'write' | 'scope' | 'verification'
 
 export interface PermissionRequest {
   kind: PermissionKind

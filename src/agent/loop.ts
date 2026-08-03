@@ -9,7 +9,6 @@
  *
  * Hybrid upgrades (research-backed):
  * - Evidence-grounded final review (diff + typecheck/test output first)
- * - AutoMix-style local self-grade before finish
  * - Token-uncertainty mid-turn escalation (daemon confidence + heuristics)
  * - MinionS-style frontier decomposition for large tasks
  */
@@ -33,8 +32,7 @@ import {
   frontierDecompose,
   shouldDecompose,
 } from './hybridDecompose'
-import { formatEvidenceForFrontier, gatherReviewEvidence } from './hybridEvidence'
-import { localSelfGrade } from './hybridSelfGrade'
+import { formatEvidenceForFrontier, gatherReviewEvidence, type VerifyResult } from './hybridEvidence'
 import { heuristicUncertainty, HybridUncertaintyTracker } from './hybridUncertainty'
 import { FrontierAssist, type GuideNote } from './frontierAssist'
 import { HookManager } from './hooks'
@@ -129,6 +127,12 @@ export interface LoopEvents {
   onCompaction?(active: boolean, savedTokens?: number, keptTurns?: number): void
   /** Plan mode handoff — user approves switching to Code. */
   onPlanHandoff?(payload: { path: string; content: string }): Promise<'execute' | 'stay'>
+  /** Lazy checkpoint before the first mutating tool in a code turn. */
+  ensureCheckpoint?: () => Promise<string | undefined>
+}
+
+export interface AgentSessionOptions {
+  userPermissionsDir?: string
 }
 
 export interface TurnTelemetry {
@@ -142,6 +146,9 @@ export interface TurnTelemetry {
   tokensOut: number
   truncationRetries: number
   deadlineRemainingMs: number
+  frontierCalls: number
+  frontierSkippedReason?: string
+  compactionGenerations: number
 }
 
 export interface PlanExecutePayload {
@@ -177,7 +184,6 @@ export interface HybridTurnContext {
 }
 
 const MAX_HISTORY_TURNS = 40
-const SELF_GRADE_THRESHOLD = 0.55
 const GENERATION_TIMEOUT_MS = 3 * 60 * 1000
 /** Compact memory when the estimated context passes this share of the window. */
 const COMPACT_THRESHOLD = 0.75
@@ -316,9 +322,10 @@ export class AgentSession {
     private readonly root: string,
     private readonly workspaceName: string,
     private readonly frontier: FrontierAssist,
+    options?: AgentSessionOptions,
   ) {
     this.planSession = new PlanSession(root)
-    this.permissions = new PersistentPermissionStore(root)
+    this.permissions = new PersistentPermissionStore(root, options?.userPermissionsDir)
     this.hooks = new HookManager(root)
   }
 
@@ -410,6 +417,7 @@ export class AgentSession {
         planSession: mode === 'plan' ? this.planSession : undefined,
         profile: readConfig().agent.profile,
         deadlineAt: budget.deadlineAt,
+        abortSignal: budget.signal(signal),
       },
     )
     this.mode = mode
@@ -483,7 +491,9 @@ export class AgentSession {
     const verification = new VerificationTracker()
     let recommendationExplorationCalls = 0
     let truncatedGenerations = 0
+    let compactionGenerations = 0
     const recommendationEvidence: RecommendationEvidence[] = []
+    const verifyResults: VerifyResult[] = []
     const discoveredPaths = new Set<string>()
     const telemetry: TurnTelemetry = {
       phase: 'starting',
@@ -496,11 +506,17 @@ export class AgentSession {
       tokensOut: 0,
       truncationRetries: 0,
       deadlineRemainingMs: budget.remainingMs(),
+      frontierCalls: 0,
+      compactionGenerations: 0,
     }
     const emitTelemetry = (phase: string): void => {
       telemetry.phase = phase
       telemetry.localGenerations = budget.localGenerations
       telemetry.deadlineRemainingMs = budget.remainingMs()
+      telemetry.frontierCalls = this.frontier.callsThisTurn
+      telemetry.frontierSkippedReason = this.frontier.getSkipReason()
+      telemetry.compactionGenerations = compactionGenerations
+      hybridStats.frontierCalls = this.frontier.callsThisTurn
       events.onTelemetry?.({ ...telemetry })
     }
     emitTelemetry('starting')
@@ -565,7 +581,16 @@ export class AgentSession {
         return await finishRecommendation('', true)
       }
 
-      await this.compactIfNeeded(client, params, events, budget.signal(signal), budget)
+      await this.compactIfNeeded(
+        client,
+        params,
+        events,
+        budget.signal(signal),
+        budget,
+        () => {
+          compactionGenerations += 1
+        },
+      )
 
       if (!budget.claimLocalGeneration()) {
         if (recommendationTurn) return await finishRecommendation('', true)
@@ -586,7 +611,7 @@ export class AgentSession {
       try {
         genResult = await generateWithTimeout(
           client,
-          this.windowedTurns(),
+          this.turns,
           loopParams,
           (token) => {
             if (!token) return
@@ -959,13 +984,12 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
         }
         if (ok) {
           await this.finishWithHybridReview(
-            client,
-            params,
-            signal,
             events,
             hybridStats,
             hybridCtx,
+            signal,
             budget,
+            verifyResults,
           )
         }
         return { ok, summary, mutatedFiles: mutatedFiles.length > 0 ? mutatedFiles : undefined, hybridStats }
@@ -1038,6 +1062,10 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
       const preHook = this.hooks.preTool(call)
       call = preHook.rewritten
       if (explorationTools.has(call.tool)) exploredThisTurn = true
+
+      if (spec0?.mutating && call.tool !== 'update_plan' && !spec0.control) {
+        await events.ensureCheckpoint?.()
+      }
 
       events.onToolCall(id, call, summarizeArgs(call))
       const localSearchQuery =
@@ -1168,9 +1196,22 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
           }
         }
       }
-      if (outcome.ok && call.tool === 'run_verification') {
+      if (call.tool === 'run_verification') {
         const skipReason = call.args['skipReason']
-        verification.noteVerification(typeof skipReason === 'string' && Boolean(skipReason.trim()))
+        const skipped = typeof skipReason === 'string' && Boolean(skipReason.trim())
+        if (outcome.ok) {
+          verification.noteVerification(skipped)
+        }
+        const script = typeof call.args['script'] === 'string' ? call.args['script'] : 'verification'
+        const packagePath =
+          typeof call.args['packagePath'] === 'string' && call.args['packagePath'].trim()
+            ? call.args['packagePath'].trim()
+            : '.'
+        verifyResults.push({
+          command: skipped ? `(skipped) ${skipReason}` : `${packagePath}: ${script}`,
+          ok: outcome.ok && !skipped,
+          output: outcome.result.slice(0, 2000),
+        })
       }
 
       if (outcome.ok) {
@@ -1207,11 +1248,14 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     events: CompactionEvents,
     signal: AbortSignal,
     budget?: TurnBudget,
+    onCompacted?: () => void,
   ): Promise<void> {
     const used = this.estimatedContextTokens()
-    if (used < contextLimit() * COMPACT_THRESHOLD) return
-    if (budget && !budget.claimLocalGeneration()) return
-    await this.compactNow(client, params, events, signal)
+    const overTurnLimit = this.turns.length > MAX_HISTORY_TURNS + KEEP_RECENT_TURNS
+    if (used < contextLimit() * COMPACT_THRESHOLD && !overTurnLimit) return
+    if (budget && !budget.claimCompactionGeneration()) return
+    const compacted = await this.compactNow(client, params, events, signal)
+    if (compacted) onCompacted?.()
   }
 
   /**
@@ -1225,8 +1269,8 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     params: GenerationParams,
     events: CompactionEvents,
     signal: AbortSignal,
-  ): Promise<void> {
-    if (this.turns.length < KEEP_RECENT_TURNS + 4) return
+  ): Promise<boolean> {
+    if (this.turns.length < KEEP_RECENT_TURNS + 4) return false
     const before = estimateTokens(this.turns)
     events.onCompaction?.(true)
     let committed = false
@@ -1273,7 +1317,7 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
         }
         if (candidate.length >= this.turns.length) {
           // Nothing to reclaim — leave live history untouched.
-          return
+          return false
         }
         next = candidate
       }
@@ -1286,9 +1330,11 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
       committed = true
       events.onCompaction?.(false, Math.max(0, before - after), KEEP_RECENT_TURNS)
       events.onContext?.(after, contextLimit())
+      return true
     } finally {
       if (!committed) events.onCompaction?.(false)
     }
+    return false
   }
 
   /** Auto-run web_search when the task clearly needs external info — local models often skip it. */
@@ -1339,15 +1385,10 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     ) return
     events.onHybridChecking(true, 'decompose')
     try {
-      const plan = await frontierDecompose(
-        task,
-        workspaceContext,
-        () => readConfig().frontierAssist,
-        signal,
-      )
+      const plan = await frontierDecompose(task, workspaceContext, this.frontier, signal)
       if (!plan) return
       stats.decomposed = true
-      stats.frontierCalls++
+      stats.frontierCalls = this.frontier.callsThisTurn
       events.onHybridPlan?.(plan.subtasks, plan.rationale)
       this.turns.push({ role: 'user', content: formatDecomposeInjection(plan) })
     } finally {
@@ -1356,52 +1397,15 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
   }
 
   private async finishWithHybridReview(
-    client: InferenceClient,
-    params: GenerationParams,
-    signal: AbortSignal,
     events: LoopEvents,
     stats: HybridTurnStats,
-    hybridCtx?: HybridTurnContext,
-    budget?: TurnBudget,
+    hybridCtx: HybridTurnContext | undefined,
+    signal: AbortSignal,
+    budget: TurnBudget | undefined,
+    verifyResults: VerifyResult[],
   ): Promise<void> {
-    if (!this.hybridEligibleThisTurn || !this.frontier.enabled()) return
-    if (budget && !budget.claimLocalGeneration()) return
-
-    const grade = await localSelfGrade(
-      client,
-      this.windowedTurns(),
-      params,
-      budget?.signal(signal) ?? signal,
-    )
-    if (grade) {
-      stats.selfGradeConfidence = grade.confidence
-      if (grade.confidence < SELF_GRADE_THRESHOLD) {
-        if (this.mutatedThisTurn) {
-          await this.maybeFinalReview(events, stats, hybridCtx, signal, budget)
-        } else {
-          await this.consultFrontier(
-            'self_grade',
-            events,
-            stats,
-            { selfGrade: grade },
-            signal,
-            budget,
-          )
-        }
-      }
-      return
-    }
-
-    // If the local model could not produce a grade, only escalate completed
-    // workspace changes. Plain answers do not justify a speculative cloud call.
-    if (this.mutatedThisTurn) {
-      await this.maybeFinalReview(events, stats, hybridCtx, signal, budget)
-    }
-  }
-
-  private windowedTurns(): ChatTurn[] {
-    if (this.turns.length <= MAX_HISTORY_TURNS + 2) return this.turns
-    return [...this.turns.slice(0, 2), ...this.turns.slice(-(MAX_HISTORY_TURNS))]
+    if (!this.mutatedThisTurn) return
+    await this.maybeFinalReview(events, stats, hybridCtx, signal, budget, verifyResults)
   }
 
   private transcriptTail(): string {
@@ -1430,7 +1434,7 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
         transcript: this.transcriptTail(),
         ...extra,
       }, signal, budget?.remainingMs())
-      if (note) stats.frontierCalls++
+      if (note) stats.frontierCalls = this.frontier.callsThisTurn
     } finally {
       events.onHybridChecking(false, checkpoint)
     }
@@ -1479,22 +1483,26 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
   private async maybeFinalReview(
     events: LoopEvents,
     stats: HybridTurnStats,
-    hybridCtx?: HybridTurnContext,
-    signal?: AbortSignal,
-    budget?: TurnBudget,
+    hybridCtx: HybridTurnContext | undefined,
+    signal: AbortSignal | undefined,
+    budget: TurnBudget | undefined,
+    verifyResults: VerifyResult[],
   ): Promise<void> {
-    if (!this.frontier.enabled()) return
+    if (!this.hybridEligibleThisTurn || !this.frontier.enabled()) return
 
     let evidenceBlock: string | undefined
     if (this.mutatedThisTurn && hybridCtx?.changedFileStats) {
       try {
         const files = await hybridCtx.changedFileStats()
         stats.evidenceChecks = files.length
-        const evidence = await gatherReviewEvidence(this.root, files)
+        const evidence = await gatherReviewEvidence(this.root, files, verifyResults)
         evidenceBlock = formatEvidenceForFrontier(evidence)
       } catch {
         /* evidence is best-effort */
       }
+    } else if (verifyResults.length > 0) {
+      const evidence = await gatherReviewEvidence(this.root, [], verifyResults)
+      evidenceBlock = formatEvidenceForFrontier(evidence)
     }
 
     await this.consultFrontier(

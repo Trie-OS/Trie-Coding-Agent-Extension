@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.5
+
+- **Trust boundaries:** workspace paths are canonicalized before I/O; repo-owned permission/hook files are restrictive-only; user grants persist outside the repository; broad wildcard approvals are rejected; `run_verification` requires explicit approval and confirmed skip reasons.
+- **Cancellation everywhere:** Stop aborts shell, verification, and grep work; pending questions, permissions, and plan handoffs resolve on cancel.
+- **Faster, leaner turns:** lazy shadow-git checkpoints (no empty commits on read-only turns); removed mandatory local self-grade; grounded recommendation drafts skip rewrite; split frontier consult/completion budgets; real verification evidence in final review.
+- **No silent context loss:** removed turn-windowing; compaction uses its own generation budget and also triggers on long histories.
+- **UI and persistence:** chat-scoped live events; debounced per-chat storage; coalesced multitask snapshots; incremental symbol-index updates; configurable agent budgets; extension CI job.
+
 ## 0.5.4
 
 - **Shared turn budgets:** every mode has an end-to-end deadline and local-generation cap; recommendation exploration, judging, synthesis, continuation, and shell execution consume the same deadline.

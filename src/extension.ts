@@ -6,7 +6,7 @@ import { runConnectFlow } from './daemon/connectFlow'
 import { runHybridSetup, runWebSearchSetup } from './daemon/hybridSetup'
 import { SettingsPanel } from './chat/SettingsPanel'
 import { DaemonClient } from './inference/daemonClient'
-import { warmUpSymbolIndex } from './agent/symbolIndex'
+import { warmUpSymbolIndex, disposeSymbolIndex } from './agent/symbolIndex'
 
 let daemonHost: DaemonHost | null = null
 
@@ -26,7 +26,6 @@ export function activate(context: vscode.ExtensionContext): void {
       statusBar.text = `$(sparkle) Trie Coding: ${label}`
     },
     undefined,
-    String(context.extension.packageJSON.version ?? 'unknown'),
   )
 
   // Codebase indexing: build on activate when enabled + onStartup (default on).
@@ -35,7 +34,14 @@ export function activate(context: vscode.ExtensionContext): void {
     warmUpSymbolIndex({ enabled: cfg.index.enabled, onStartup: cfg.index.onStartup })
   }
   warmUpIndexIfConfigured()
-  context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(warmUpIndexIfConfigured))
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders((event) => {
+      for (const folder of event.removed) {
+        disposeSymbolIndex(folder.uri.fsPath)
+      }
+      warmUpIndexIfConfigured()
+    }),
+  )
 
   const getDaemonClient = (): DaemonClient => {
     const cfg = readConfig()

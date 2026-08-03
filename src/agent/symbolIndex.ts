@@ -110,6 +110,8 @@ interface TrieNode {
 export class SymbolTrie {
   private root: TrieNode = { children: new Map(), hits: [] }
   private allHits: SymbolHit[] = []
+  /** Hits grouped by file path for incremental removal. */
+  private pathHits = new Map<string, SymbolHit[]>()
 
   get size(): number {
     return this.allHits.length
@@ -118,10 +120,17 @@ export class SymbolTrie {
   clear(): void {
     this.root = { children: new Map(), hits: [] }
     this.allHits = []
+    this.pathHits.clear()
   }
 
   insert(hit: SymbolHit): void {
     this.allHits.push(hit)
+    let bucket = this.pathHits.get(hit.path)
+    if (!bucket) {
+      bucket = []
+      this.pathHits.set(hit.path, bucket)
+    }
+    bucket.push(hit)
     this.insertIntoTrie(hit)
   }
 
@@ -268,9 +277,35 @@ export class SymbolTrie {
   }
 
   removePath(relPath: string): void {
-    this.allHits = this.allHits.filter((hit) => hit.path !== relPath)
-    this.root = { children: new Map(), hits: [] }
-    for (const hit of this.allHits) this.insertIntoTrie(hit)
+    const removed = this.pathHits.get(relPath)
+    if (!removed?.length) return
+    this.pathHits.delete(relPath)
+    const removedSet = new Set(removed)
+    this.allHits = this.allHits.filter((hit) => !removedSet.has(hit))
+    for (const hit of removed) {
+      this.removeHitFromTrie(hit)
+    }
+  }
+
+  private removeHitFromTrie(hit: SymbolHit): void {
+    let node = this.root
+    const stack: TrieNode[] = [node]
+    for (const ch of hit.name.toLowerCase()) {
+      const child = node.children.get(ch)
+      if (!child) return
+      stack.push(child)
+      node = child
+    }
+    const idx = node.hits.indexOf(hit)
+    if (idx >= 0) node.hits.splice(idx, 1)
+    // Optional prune: drop empty leaf nodes on the path back to root.
+    for (let i = stack.length - 1; i > 0; i--) {
+      const current = stack[i]
+      if (current.hits.length > 0 || current.children.size > 0) break
+      const parent = stack[i - 1]
+      const key = [...parent.children.entries()].find(([, v]) => v === current)?.[0]
+      if (key) parent.children.delete(key)
+    }
   }
 }
 
@@ -330,6 +365,8 @@ export class WorkspaceSymbolIndex {
   private buildMs = 0
   /** Bumps on every rebuild so an older in-flight build cannot finish over a newer one. */
   private generation = 0
+  private readonly refreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly pendingRefreshes = new Set<string>()
 
   constructor(private readonly root: string) {}
 
@@ -390,6 +427,9 @@ export class WorkspaceSymbolIndex {
     this.generation += 1
     for (const d of this.watchers) d.dispose()
     this.watchers = []
+    for (const timer of this.refreshTimers.values()) clearTimeout(timer)
+    this.refreshTimers.clear()
+    this.pendingRefreshes.clear()
   }
 
   private ensureBuilt(): Promise<void> {
@@ -405,7 +445,7 @@ export class WorkspaceSymbolIndex {
     )
     const watcher = vscode.workspace.createFileSystemWatcher(pattern)
     const refresh = (uri: vscode.Uri): void => {
-      void this.refreshPath(uri.fsPath)
+      this.scheduleRefreshPath(uri.fsPath)
     }
     const remove = (uri: vscode.Uri): void => {
       const rel = this.toRel(uri.fsPath)
@@ -423,8 +463,32 @@ export class WorkspaceSymbolIndex {
     ]
   }
 
+  private scheduleRefreshPath(absolute: string): void {
+    const existing = this.refreshTimers.get(absolute)
+    if (existing) clearTimeout(existing)
+    if (this.state === 'indexing') {
+      this.pendingRefreshes.add(absolute)
+      return
+    }
+    this.refreshTimers.set(
+      absolute,
+      setTimeout(() => {
+        this.refreshTimers.delete(absolute)
+        void this.refreshPath(absolute)
+      }, 150),
+    )
+  }
+
+  private async flushPendingRefreshes(): Promise<void> {
+    if (this.pendingRefreshes.size === 0) return
+    const pending = [...this.pendingRefreshes]
+    this.pendingRefreshes.clear()
+    for (const absolute of pending) {
+      await this.refreshPath(absolute)
+    }
+  }
+
   private async refreshPath(absolute: string): Promise<void> {
-    if (this.state === 'indexing') return
     const rel = this.toRel(absolute)
     if (!rel || !this.isIndexable(rel)) return
     this.trie.removePath(rel)
@@ -463,6 +527,7 @@ export class WorkspaceSymbolIndex {
     this.state = 'ready'
     this.notifyStatus()
     this.ensureWatchers()
+    await this.flushPendingRefreshes()
   }
 
   /** Returns true when the file was scanned (even if it had no declarations). */
@@ -494,6 +559,14 @@ export function getSymbolIndex(root: string): WorkspaceSymbolIndex {
     indexes.set(root, index)
   }
   return index
+}
+
+/** Drop and dispose the index for a removed workspace root. */
+export function disposeSymbolIndex(root: string): void {
+  const index = indexes.get(root)
+  if (!index) return
+  index.dispose()
+  indexes.delete(root)
 }
 
 /** Start indexing when enabled (+ on-startup, or always if `force`). */
