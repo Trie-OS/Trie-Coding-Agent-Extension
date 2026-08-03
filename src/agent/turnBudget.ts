@@ -17,12 +17,14 @@ export class TurnBudget {
   readonly deadlineAt: number
   readonly maxLocalGenerations: number
   private localGenerationCount = 0
+  private readonly now: () => number
 
   constructor(
     mode: AgentMode,
     recommendation: boolean,
-    private readonly now: () => number = Date.now,
+    now: () => number = Date.now,
   ) {
+    this.now = now
     this.startedAt = now()
     this.deadlineAt =
       this.startedAt + (recommendation ? 2 * 60_000 : MODE_DEADLINES_MS[mode])

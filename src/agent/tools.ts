@@ -264,6 +264,7 @@ export interface WorkspaceToolsOptions {
   permissionBroker?: PermissionBroker
   planSession?: PlanSession
   profile?: AgentProfileName
+  deadlineAt?: number
 }
 
 export class WorkspaceTools {
@@ -273,6 +274,7 @@ export class WorkspaceTools {
   private readonly permissionBroker: PermissionBroker | null
   readonly planSession: PlanSession | null
   private readonly profile: AgentProfileName
+  private readonly deadlineAt: number | undefined
   /** Directories whose AGENTS.md has already been injected this session. */
   private readonly injectedAgentsMd = new Set<string>()
 
@@ -287,6 +289,7 @@ export class WorkspaceTools {
     this.permissionBroker = options.permissionBroker ?? null
     this.planSession = options.planSession ?? null
     this.profile = normalizeAgentProfile(options.profile)
+    this.deadlineAt = options.deadlineAt
   }
 
   /** Resolve a workspace-relative path; escapes are refused (Trie IDE's PATH_OUTSIDE_WORKSPACE policy). */
@@ -915,7 +918,11 @@ export class WorkspaceTools {
         }
       }
     }
-    const output = await shellExec(command, this.root, 120_000, 1024 * 1024)
+    const timeoutMs = Math.max(
+      1,
+      Math.min(120_000, this.deadlineAt ? this.deadlineAt - Date.now() : 120_000),
+    )
+    const output = await shellExec(command, this.root, timeoutMs, 1024 * 1024)
     const body = `${output.ok ? 'Exit 0' : 'Command failed'}\n${output.text}`
     const detail = truncate(body, 4000, {
       hint:

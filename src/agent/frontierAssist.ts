@@ -37,6 +37,8 @@ export interface FrontierCompletionOptions {
 export interface FrontierCompletionResult {
   text: string
   truncated: boolean
+  tokensIn?: number
+  tokensOut?: number
 }
 
 const MAX_CALLS_PER_TURN = 6
@@ -200,6 +202,7 @@ export class FrontierAssist {
         message?: { content?: string }
         finish_reason?: string | null
       }>
+      usage?: { prompt_tokens?: number; completion_tokens?: number }
     }
     const choice = data.choices?.[0]
     const text = choice?.message?.content
@@ -207,6 +210,8 @@ export class FrontierAssist {
     return {
       text,
       truncated: choice?.finish_reason === 'length' || choice?.finish_reason === 'max_tokens',
+      tokensIn: data.usage?.prompt_tokens ?? 0,
+      tokensOut: data.usage?.completion_tokens ?? 0,
     }
   }
 
@@ -247,12 +252,15 @@ export class FrontierAssist {
     const data = (await response.json()) as {
       content?: Array<{ type: string; text?: string }>
       stop_reason?: string | null
+      usage?: { input_tokens?: number; output_tokens?: number }
     }
     const text = data.content?.find((b) => b.type === 'text')?.text
     if (typeof text !== 'string') return null
     return {
       text,
       truncated: data.stop_reason === 'max_tokens',
+      tokensIn: data.usage?.input_tokens ?? 0,
+      tokensOut: data.usage?.output_tokens ?? 0,
     }
   }
 

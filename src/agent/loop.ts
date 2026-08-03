@@ -409,6 +409,7 @@ export class AgentSession {
         permissionBroker: this.permissionBroker,
         planSession: mode === 'plan' ? this.planSession : undefined,
         profile: readConfig().agent.profile,
+        deadlineAt: budget.deadlineAt,
       },
     )
     this.mode = mode
@@ -522,10 +523,12 @@ export class AgentSession {
             frontier: this.frontier.enabled() ? this.frontier : undefined,
             evidence: formatRecommendationEvidence(recommendationEvidence),
             budget,
-            onPhase: (phase, durationMs, truncationRetries) => {
+            onPhase: (phase, durationMs, truncationRetries, tokensIn, tokensOut) => {
               if (phase === 'judge') telemetry.judgeMs += durationMs
               else telemetry.synthesisMs += durationMs
               telemetry.truncationRetries += truncationRetries
+              telemetry.tokensIn += tokensIn
+              telemetry.tokensOut += tokensOut
               emitTelemetry(phase)
             },
           },
@@ -634,6 +637,14 @@ export class AgentSession {
       telemetry.tokensIn += genResult.tokensIn
       telemetry.tokensOut += genResult.tokensOut
       emitTelemetry('local generation')
+      if (budget.expired()) {
+        events.onReasoningOutcome?.(false)
+        return {
+          ok: false,
+          summary: 'Stopped: the end-to-end turn deadline was reached.',
+          hybridStats,
+        }
+      }
       if (genResult.truncated) {
         events.onReasoningOutcome?.(false)
         if (recommendationTurn) {

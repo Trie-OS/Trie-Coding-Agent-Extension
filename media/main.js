@@ -100,6 +100,8 @@
     const composerPlusMenu = document.getElementById("composer-plus-menu");
     const composerChips = document.getElementById("composer-chips");
     const backendChip = document.getElementById("backend-chip");
+    const versionLabel = document.getElementById("version-label");
+    const turnTelemetry = document.getElementById("turn-telemetry");
     const hybridChip = document.getElementById("hybrid-chip");
     const hybridMenu = document.getElementById("hybrid-menu");
     const hybridMenuEnabled = document.getElementById("hybrid-menu-enabled");
@@ -234,6 +236,12 @@
       if (summary) summary.textContent = "Thought";
       liveReasoningEl = null;
       liveReasoningBodyEl = null;
+    }
+    function discardLiveReasoning() {
+      liveReasoningEl?.remove();
+      liveReasoningEl = null;
+      liveReasoningBodyEl = null;
+      hadLiveReasoningThisStep = false;
     }
     function renderPersistedThought(text) {
       if (!text.trim()) return;
@@ -2285,6 +2293,8 @@
       switch (msg.type) {
         case "state": {
           applyTheme(msg.theme);
+          versionLabel.textContent = `v${msg.extensionVersion ?? "?"}`;
+          versionLabel.title = `Running Trie IDE extension ${msg.extensionVersion ?? "unknown"}`;
           backendChip.hidden = !msg.model;
           backendChip.textContent = msg.model;
           backendChip.title = msg.backend;
@@ -2313,6 +2323,22 @@
             hideWelcome();
             showSpinner();
           }
+          break;
+        }
+        case "telemetry": {
+          const t = msg.telemetry;
+          if (!t) break;
+          turnTelemetry.hidden = false;
+          turnTelemetry.textContent = [
+            t.phase,
+            `local ${t.localGenerations} \xB7 ${(Number(t.localGenerationMs ?? 0) / 1e3).toFixed(1)}s`,
+            `explore ${t.explorationCalls}`,
+            `judge ${(Number(t.judgeMs ?? 0) / 1e3).toFixed(1)}s`,
+            `synth ${(Number(t.synthesisMs ?? 0) / 1e3).toFixed(1)}s`,
+            `tokens ${t.tokensIn}/${t.tokensOut}`,
+            `retries ${t.truncationRetries}`,
+            `${Math.ceil(Number(t.deadlineRemainingMs ?? 0) / 1e3)}s left`
+          ].join("  \u2022  ");
           break;
         }
         case "multitask-list": {
@@ -2376,6 +2402,10 @@
           break;
         }
         case "reasoning": {
+          if (msg.discard) {
+            discardLiveReasoning();
+            break;
+          }
           if (typeof msg.chunk === "string" && msg.chunk) appendLiveReasoning(msg.chunk);
           if (msg.done) {
             if (typeof msg.text === "string" && msg.text.trim()) {

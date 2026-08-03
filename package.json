@@ -2,7 +2,7 @@
   "name": "trie-ide",
   "displayName": "Trie Coding Agent",
   "description": "Coding agent: local GGUF via embedded trie-daemon, or any LLM API (Ollama, LM Studio, OpenAI, Kimi, and other cloud endpoints). Hybrid mode adds sparing frontier-model guidance.",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "publisher": "Trie",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -317,11 +317,11 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/agent/verificationPolicy.test.ts src/agent/tools.test.ts src/agent/editMatcher.test.ts src/agent/webSearchIntent.test.ts src/agent/multitaskBus.test.ts src/agent/worktrees.test.ts src/agent/hybridDecompose.test.ts src/agent/taskIntent.test.ts src/agent/recommendationAnswer.test.ts src/agent/recommendationBudget.test.ts src/agent/compaction.test.ts src/agent/permissions.test.ts src/agent/hooks.test.ts src/agent/thoughtStream.test.ts src/agent/diffPreview.test.ts src/agent/shellExec.test.ts src/agent/planSession.test.ts src/agent/scratchpad.test.ts src/inference/modelVision.test.ts src/inference/openAiMessages.test.ts src/inference/openaiClient.test.ts src/chat/replyMarkdown.test.ts",
+    "test": "node --experimental-strip-types --test src/agent/verificationPolicy.test.ts src/agent/tools.test.ts src/agent/editMatcher.test.ts src/agent/webSearchIntent.test.ts src/agent/multitaskBus.test.ts src/agent/worktrees.test.ts src/agent/hybridDecompose.test.ts src/agent/taskIntent.test.ts src/agent/recommendationAnswer.test.ts src/agent/recommendationBudget.test.ts src/agent/loopPolicies.integration.test.ts src/agent/compaction.test.ts src/agent/permissions.test.ts src/agent/hooks.test.ts src/agent/thoughtStream.test.ts src/agent/diffPreview.test.ts src/agent/shellExec.test.ts src/agent/planSession.test.ts src/agent/scratchpad.test.ts src/inference/modelVision.test.ts src/inference/openAiMessages.test.ts src/inference/openaiClient.test.ts src/chat/replyMarkdown.test.ts",
     "package": "npm run typecheck && npm run build && vsce package --no-dependencies",
     "package:platform": "node scripts/package-platform.mjs",
     "package:marketplace": "node scripts/package-marketplace.mjs",
-    "publish:marketplace": "node scripts/package-marketplace.mjs && vsce publish --packagePath trie-ide-0.5.3.vsix"
+    "publish:marketplace": "node scripts/package-marketplace.mjs && vsce publish --packagePath trie-ide-0.5.4.vsix"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

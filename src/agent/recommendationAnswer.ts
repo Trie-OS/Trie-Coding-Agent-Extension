@@ -29,6 +29,8 @@ export interface RecommendationJudgment {
     reason: string
     evidenceIds: string[]
   }>
+  tokensIn?: number
+  tokensOut?: number
 }
 
 export interface RecommendationFinishOptions {
@@ -40,6 +42,8 @@ export interface RecommendationFinishOptions {
     phase: 'judge' | 'synthesis',
     durationMs: number,
     truncationRetries: number,
+    tokensIn: number,
+    tokensOut: number,
   ) => void
 }
 
@@ -174,6 +178,8 @@ export async function judgeRecommendationAnswer(
         })
       : null
     let text = frontierResult?.truncated ? '' : (frontierResult?.text ?? '')
+    let tokensIn = frontierResult?.tokensIn ?? 0
+    let tokensOut = frontierResult?.tokensOut ?? 0
     if (!text && !useFrontier) {
       if (budget && !budget.claimLocalGeneration()) {
         return {
@@ -190,6 +196,8 @@ export async function judgeRecommendationAnswer(
           phaseSignal,
         )
       text = localResult.truncated ? '' : localResult.text
+      tokensIn += localResult.tokensIn
+      tokensOut += localResult.tokensOut
     }
     const parsed = extractJsonObject(text)
     if (
@@ -203,6 +211,8 @@ export async function judgeRecommendationAnswer(
         factuallyGrounded: false,
         feedback: 'Judge output was incomplete; rewrite conservatively from the labeled evidence.',
         rejectedClaims: [],
+        tokensIn,
+        tokensOut,
       }
     }
     const factuallyGrounded = parsed.factuallyGrounded
@@ -222,6 +232,8 @@ export async function judgeRecommendationAnswer(
       feedback:
         typeof parsed.feedback === 'string' ? parsed.feedback.trim().slice(0, 500) : '',
       rejectedClaims,
+      tokensIn,
+      tokensOut,
     }
   } catch {
     return {
@@ -246,6 +258,7 @@ export async function rewriteRecommendationAnswer(
   evidence = '',
   budget?: TurnBudget,
   onTruncationRetry?: () => void,
+  onUsage?: (tokensIn: number, tokensOut: number) => void,
 ): Promise<string | null> {
   if (!taskAsksForRecommendations(task)) return null
   const harness = taskAsksForHarnessImprovement(task)
@@ -304,6 +317,7 @@ export async function rewriteRecommendationAnswer(
         timeoutMs: budget?.remainingMs(),
       })
       raw = result?.text ?? ''
+      if (result) onUsage?.(result.tokensIn ?? 0, result.tokensOut ?? 0)
       let chunks = 1
       while (result?.truncated && chunks < FINAL_SYNTHESIS_MAX_CHUNKS) {
         onTruncationRetry?.()
@@ -317,6 +331,9 @@ export async function rewriteRecommendationAnswer(
             timeoutMs: budget?.remainingMs(),
           },
         )
+        if (continuation) {
+          onUsage?.(continuation.tokensIn ?? 0, continuation.tokensOut ?? 0)
+        }
         if (!continuation) return null
         result = continuation
         raw = stitchSynthesisContinuation(raw, result.text)
@@ -341,6 +358,7 @@ export async function rewriteRecommendationAnswer(
         budget?.signal(signal) ?? signal,
       )
       raw = result.text
+      onUsage?.(result.tokensIn, result.tokensOut)
       let chunks = 1
       while (result.truncated && chunks < FINAL_SYNTHESIS_MAX_CHUNKS) {
         onTruncationRetry?.()
@@ -362,6 +380,7 @@ export async function rewriteRecommendationAnswer(
           () => {},
           budget?.signal(signal) ?? signal,
         )
+        onUsage?.(result.tokensIn, result.tokensOut)
         raw = stitchSynthesisContinuation(raw, result.text)
         chunks += 1
       }
@@ -402,7 +421,13 @@ export async function finishRecommendationAnswer(
       options.evidence,
       options.budget,
     )
-    options.onPhase?.('judge', Date.now() - judgeStartedAt, 0)
+    options.onPhase?.(
+      'judge',
+      Date.now() - judgeStartedAt,
+      0,
+      judgment.tokensIn ?? 0,
+      judgment.tokensOut ?? 0,
+    )
     const claimFeedback = judgment.rejectedClaims.length
       ? `\nRejected claims:\n${judgment.rejectedClaims
           .map(
@@ -414,6 +439,8 @@ export async function finishRecommendationAnswer(
           .join('\n')}`
       : ''
     let truncationRetries = 0
+    let synthesisTokensIn = 0
+    let synthesisTokensOut = 0
     const synthesisStartedAt = Date.now()
     const rewritten = await rewriteRecommendationAnswer(
       client,
@@ -431,11 +458,17 @@ export async function finishRecommendationAnswer(
       () => {
         truncationRetries += 1
       },
+      (tokensIn, tokensOut) => {
+        synthesisTokensIn += tokensIn
+        synthesisTokensOut += tokensOut
+      },
     )
     options.onPhase?.(
       'synthesis',
       Date.now() - synthesisStartedAt,
       truncationRetries,
+      synthesisTokensIn,
+      synthesisTokensOut,
     )
     if (rewritten) return rewritten
   } else {
@@ -450,7 +483,13 @@ export async function finishRecommendationAnswer(
       options.evidence,
       options.budget,
     )
-    options.onPhase?.('judge', Date.now() - judgeStartedAt, 0)
+    options.onPhase?.(
+      'judge',
+      Date.now() - judgeStartedAt,
+      0,
+      judgment.tokensIn ?? 0,
+      judgment.tokensOut ?? 0,
+    )
     const claimFeedback = judgment.rejectedClaims.length
       ? `\nRejected claims:\n${judgment.rejectedClaims
           .map(
@@ -462,6 +501,8 @@ export async function finishRecommendationAnswer(
           .join('\n')}`
       : ''
     let truncationRetries = 0
+    let synthesisTokensIn = 0
+    let synthesisTokensOut = 0
     const synthesisStartedAt = Date.now()
     const rewritten = await rewriteRecommendationAnswer(
       client,
@@ -478,11 +519,17 @@ export async function finishRecommendationAnswer(
       () => {
         truncationRetries += 1
       },
+      (tokensIn, tokensOut) => {
+        synthesisTokensIn += tokensIn
+        synthesisTokensOut += tokensOut
+      },
     )
     options.onPhase?.(
       'synthesis',
       Date.now() - synthesisStartedAt,
       truncationRetries,
+      synthesisTokensIn,
+      synthesisTokensOut,
     )
     if (rewritten) return rewritten
   }

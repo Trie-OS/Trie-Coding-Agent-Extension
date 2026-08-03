@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.4
+
+- **Shared turn budgets:** every mode has an end-to-end deadline and local-generation cap; recommendation exploration, judging, synthesis, continuation, and shell execution consume the same deadline.
+- **Responsive Hybrid cancellation:** Stop aborts frontier judge/rewrite requests, and failed Hybrid calls no longer fall back to the slow local model.
+- **Visible diagnostics:** the chat shows the running extension version and live phase telemetry for generations, exploration, judge/synthesis duration, tokens, retries, and deadline remaining.
+- **Evidence-chain validation:** recommendation evidence distinguishes discovery from exact reads; absence claims require a discovered path followed by an exact read. Judge output includes structured rejected claims and evidence IDs.
+- **Cleaner thoughts and stronger tests:** orphan reasoning is discarded unless parsing yields a valid tool/final event. Fake-clock/fake-model integration tests cover exploration limits, deadline propagation, local-fallback prevention, cancellation, and truncation safety.
+
 ## 0.5.3
 
 - **No restart on synthesis truncation:** final synthesis starts with a 4,096-token ceiling (providers stop naturally when complete). If the provider still reaches its limit, the harness retains the partial answer and requests only the continuation.
