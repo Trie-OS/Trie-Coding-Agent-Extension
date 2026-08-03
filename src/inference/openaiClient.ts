@@ -5,6 +5,7 @@
  */
 import { readSse } from './sse'
 import { buildOpenAiMessages } from './openAiMessages'
+import { isOutputTruncatedFinishReason } from './truncation'
 import type { ChatTurn, GenerateResult, GenerationParams, InferenceClient } from './types'
 
 interface ToolCallDelta {
@@ -90,6 +91,7 @@ export class OpenAiCompatibleClient implements InferenceClient {
     let text = ''
     let tokensIn = 0
     let tokensOut = 0
+    let finishReason: string | null = null
     const toolCallState = new Map<number, { name: string; arguments: string }>()
     await readSse(
       response,
@@ -101,6 +103,7 @@ export class OpenAiCompatibleClient implements InferenceClient {
               content?: string | null
               tool_calls?: ToolCallDelta[]
             }
+            finish_reason?: string | null
           }>
           usage?: { prompt_tokens?: number; completion_tokens?: number } | null
         }
@@ -110,6 +113,8 @@ export class OpenAiCompatibleClient implements InferenceClient {
           return
         }
         const delta = chunk.choices?.[0]?.delta
+        const reason = chunk.choices?.[0]?.finish_reason
+        if (typeof reason === 'string') finishReason = reason
         if (typeof delta?.content === 'string' && delta.content.length > 0) {
           text += delta.content
           onToken(delta.content)
@@ -135,6 +140,11 @@ export class OpenAiCompatibleClient implements InferenceClient {
       onToken(text)
     }
 
-    return { text, tokensIn, tokensOut }
+    return {
+      text,
+      tokensIn,
+      tokensOut,
+      truncated: isOutputTruncatedFinishReason(finishReason),
+    }
   }
 }

@@ -1,4 +1,5 @@
 import { ArrowRight, Bot, createElement, ListChecks, MessageCircleQuestion } from 'lucide'
+import { normalizeReplyMarkdownStructure } from '../../src/chat/replyMarkdown.ts'
 
 declare function acquireVsCodeApi(): { postMessage(msg: unknown): void }
 
@@ -24,6 +25,8 @@ const MODE_ICONS = {
   const composerPlusMenu = document.getElementById('composer-plus-menu') as HTMLElement
   const composerChips = document.getElementById('composer-chips') as HTMLElement
   const backendChip = document.getElementById('backend-chip') as HTMLElement
+  const versionLabel = document.getElementById('version-label') as HTMLElement
+  const turnTelemetry = document.getElementById('turn-telemetry') as HTMLElement
   const hybridChip = document.getElementById('hybrid-chip') as HTMLButtonElement | null
   const hybridMenu = document.getElementById('hybrid-menu') as HTMLElement | null
   const hybridMenuEnabled = document.getElementById('hybrid-menu-enabled') as HTMLInputElement | null
@@ -171,6 +174,7 @@ const MODE_ICONS = {
   let turnSession: TurnSession | null = null
   let liveReasoningEl: HTMLElement | null = null
   let liveReasoningBodyEl: HTMLElement | null = null
+  let hadLiveReasoningThisStep = false
 
   function ensureLiveReasoning(): HTMLElement {
     if (liveReasoningEl && liveReasoningBodyEl) return liveReasoningBodyEl
@@ -192,19 +196,43 @@ const MODE_ICONS = {
 
   function appendLiveReasoning(chunk: string): void {
     if (!chunk) return
+    hadLiveReasoningThisStep = true
     const body = ensureLiveReasoning()
     body.textContent = (body.textContent ?? '') + chunk
     scrollDown()
   }
 
-  function settleLiveReasoning(): void {
+  function settleLiveReasoning(finalText?: string): void {
     if (!liveReasoningEl) return
+    const text = (finalText ?? liveReasoningBodyEl?.textContent ?? '').trim()
+    if (!text) {
+      liveReasoningEl.remove()
+      liveReasoningEl = null
+      liveReasoningBodyEl = null
+      return
+    }
+    if (liveReasoningBodyEl) liveReasoningBodyEl.textContent = text
     liveReasoningEl.classList.remove('live')
     liveReasoningEl.open = false
     const summary = liveReasoningEl.querySelector('.acc-thought-summary') as HTMLElement | null
     if (summary) summary.textContent = 'Thought'
     liveReasoningEl = null
     liveReasoningBodyEl = null
+  }
+
+  function discardLiveReasoning(): void {
+    liveReasoningEl?.remove()
+    liveReasoningEl = null
+    liveReasoningBodyEl = null
+    hadLiveReasoningThisStep = false
+  }
+
+  function renderPersistedThought(text: string): void {
+    if (!text.trim()) return
+    const session = ensureTurnSession()
+    const group =
+      session.activeGroup ?? ensureAccordionGroup('explore', 'Explored')
+    addThoughtRow(group, text, 0)
   }
 
   /**
@@ -370,8 +398,9 @@ const MODE_ICONS = {
     sinceMs: number,
     argsPreview?: string,
     toolName?: string,
+    showThought = true,
   ): HTMLElement {
-    addThoughtRow(group, thought, sinceMs)
+    if (showThought) addThoughtRow(group, thought, sinceMs)
     const row = document.createElement('div')
     row.className = 'acc-row tool running'
     row.dataset.id = String(id)
@@ -468,6 +497,7 @@ const MODE_ICONS = {
     groupKey?: string
     linesAdded?: number
     linesDeleted?: number
+    suppressThought?: boolean
   }): HTMLElement {
     const session = ensureTurnSession()
     const sinceMs = Date.now() - session.lastEventAt
@@ -497,7 +527,9 @@ const MODE_ICONS = {
     }
 
     refreshTurnSummary()
-    return addToolRow(group, msg.id, msg.rowLabel, msg.thought, sinceMs, msg.args, msg.tool)
+    const showThought = !msg.suppressThought && !hadLiveReasoningThisStep
+    hadLiveReasoningThisStep = false
+    return addToolRow(group, msg.id, msg.rowLabel, msg.thought, sinceMs, msg.args, msg.tool, showThought)
   }
 
   /** Inline task list — one card per turn, updated in place (Cursor-style). */
@@ -1101,24 +1133,36 @@ const MODE_ICONS = {
     card: HTMLElement,
     answers: { question: string; answer: string; isOther?: boolean }[],
   ): void {
-    card.querySelectorAll('.question-options, .question-other, .question-actions, .question-error').forEach(
-      (el) => el.remove(),
-    )
-    const summary = document.createElement('div')
-    summary.className = 'question-answers'
-    for (const answer of answers) {
-      const row = document.createElement('div')
-      row.className = 'question-answer-row'
-      const q = document.createElement('div')
-      q.className = 'question-answer-q'
-      q.textContent = answer.question
-      const a = document.createElement('div')
-      a.className = 'question-answer-a'
-      a.textContent = answer.answer
-      row.append(q, a)
-      summary.appendChild(row)
+    card.querySelectorAll(
+      '.question-options, .question-other, .question-actions, .question-error, .question-answers, .question-block',
+    ).forEach((el) => el.remove())
+
+    if (answers.length === 1) {
+      const only = answers[0]!
+      const title = document.createElement('div')
+      title.className = 'question-title'
+      title.textContent = only.question
+      const ans = document.createElement('div')
+      ans.className = 'question-answer-a single'
+      ans.textContent = only.answer
+      card.append(title, ans)
+    } else {
+      const summary = document.createElement('div')
+      summary.className = 'question-answers'
+      for (const answer of answers) {
+        const row = document.createElement('div')
+        row.className = 'question-answer-row'
+        const q = document.createElement('div')
+        q.className = 'question-answer-q'
+        q.textContent = answer.question
+        const a = document.createElement('div')
+        a.className = 'question-answer-a'
+        a.textContent = answer.answer
+        row.append(q, a)
+        summary.appendChild(row)
+      }
+      card.appendChild(summary)
     }
-    card.appendChild(summary)
     card.classList.add('resolved')
   }
 
@@ -1129,17 +1173,8 @@ const MODE_ICONS = {
   ): void {
     if (resolvedAnswers?.length) {
       const card = document.createElement('div')
-      card.className = 'question-card resolved'
+      card.className = 'question-card'
       card.dataset.requestId = requestId
-      for (const q of questions) {
-        const block = document.createElement('div')
-        block.className = 'question-block'
-        const title = document.createElement('div')
-        title.className = 'question-title'
-        title.textContent = q.question
-        block.appendChild(title)
-        card.appendChild(block)
-      }
       showQuestionAnswers(card, resolvedAnswers)
       messagesEl.appendChild(card)
       scrollDown()
@@ -1443,8 +1478,25 @@ const MODE_ICONS = {
 
   function formatReplyMarkdown(text: string): DocumentFragment {
     const fragment = document.createDocumentFragment()
-    const lines = text.replace(/\r\n/g, '\n').split('\n')
+    const lines = normalizeReplyMarkdownStructure(text).split('\n')
     let i = 0
+
+    function isTableRow(line: string): boolean {
+      const t = line.trim()
+      return t.startsWith('|') && t.endsWith('|') && t.includes('|', 1)
+    }
+
+    function isTableSeparator(line: string): boolean {
+      return /^\|[\s:|-]+\|$/.test(line.trim())
+    }
+
+    function parseTableCells(line: string): string[] {
+      return line
+        .trim()
+        .slice(1, -1)
+        .split('|')
+        .map((c) => c.trim())
+    }
 
     const appendNestedBullets = (li: HTMLLIElement, start: number): number => {
       let j = start
@@ -1466,6 +1518,38 @@ const MODE_ICONS = {
       const line = lines[i]!
       if (!line.trim()) {
         i++
+        continue
+      }
+
+      if (isTableRow(line)) {
+        const table = document.createElement('table')
+        table.className = 'reply-table'
+        const tbody = document.createElement('tbody')
+        let headerRow: HTMLTableRowElement | null = null
+        while (i < lines.length && isTableRow(lines[i]!)) {
+          if (isTableSeparator(lines[i]!)) {
+            i++
+            continue
+          }
+          const cells = parseTableCells(lines[i]!)
+          const tr = document.createElement('tr')
+          for (const cell of cells) {
+            const el = document.createElement(headerRow ? 'td' : 'th')
+            formatInlineMarkdownInto(el, cell)
+            tr.appendChild(el)
+          }
+          if (!headerRow) {
+            headerRow = tr
+            const thead = document.createElement('thead')
+            thead.appendChild(tr)
+            table.appendChild(thead)
+          } else {
+            tbody.appendChild(tr)
+          }
+          i++
+        }
+        if (tbody.childNodes.length > 0) table.appendChild(tbody)
+        fragment.appendChild(table)
         continue
       }
 
@@ -1514,6 +1598,7 @@ const MODE_ICONS = {
         const l = lines[i]!
         if (!l.trim()) break
         if (/^#{1,6}\s/.test(l)) break
+        if (isTableRow(l)) break
         if (/^\d+\.\s/.test(l)) break
         if (/^[-*]\s/.test(l)) break
         paraLines.push(l)
@@ -2606,6 +2691,7 @@ const MODE_ICONS = {
     clearHybridGroups()
     liveReasoningEl = null
     liveReasoningBodyEl = null
+    hadLiveReasoningThisStep = false
     hideSpinner()
     backgroundWorkEl = null
   }
@@ -2615,6 +2701,8 @@ const MODE_ICONS = {
     switch (msg.type) {
       case 'state': {
         applyTheme(msg.theme)
+        versionLabel.textContent = `v${msg.extensionVersion ?? '?'}`
+        versionLabel.title = `Running Trie IDE extension ${msg.extensionVersion ?? 'unknown'}`
         backendChip.hidden = !msg.model
         backendChip.textContent = msg.model
         backendChip.title = msg.backend
@@ -2649,6 +2737,22 @@ const MODE_ICONS = {
           hideWelcome()
           showSpinner()
         }
+        break
+      }
+      case 'telemetry': {
+        const t = msg.telemetry
+        if (!t) break
+        turnTelemetry.hidden = false
+        turnTelemetry.textContent = [
+          t.phase,
+          `local ${t.localGenerations} · ${(Number(t.localGenerationMs ?? 0) / 1000).toFixed(1)}s`,
+          `explore ${t.explorationCalls}`,
+          `judge ${(Number(t.judgeMs ?? 0) / 1000).toFixed(1)}s`,
+          `synth ${(Number(t.synthesisMs ?? 0) / 1000).toFixed(1)}s`,
+          `tokens ${t.tokensIn}/${t.tokensOut}`,
+          `retries ${t.truncationRetries}`,
+          `${Math.ceil(Number(t.deadlineRemainingMs ?? 0) / 1000)}s left`,
+        ].join('  •  ')
         break
       }
       case 'multitask-list': {
@@ -2715,8 +2819,19 @@ const MODE_ICONS = {
         break
       }
       case 'reasoning': {
+        if (msg.discard) {
+          discardLiveReasoning()
+          break
+        }
         if (typeof msg.chunk === 'string' && msg.chunk) appendLiveReasoning(msg.chunk)
-        if (msg.done) settleLiveReasoning()
+        if (msg.done) {
+          if (typeof msg.text === 'string' && msg.text.trim()) {
+            if (liveReasoningEl) settleLiveReasoning(msg.text)
+            else renderPersistedThought(msg.text)
+          } else {
+            settleLiveReasoning()
+          }
+        }
         break
       }
       case 'todos': {
@@ -2776,6 +2891,7 @@ const MODE_ICONS = {
         const existing = messagesEl.querySelector(
           `.question-card[data-request-id="${msg.requestId}"]`,
         ) as HTMLElement | null
+        if (existing?.classList.contains('resolved')) break
         if (existing) {
           showQuestionAnswers(existing, msg.answers ?? [])
         } else {
@@ -2896,7 +3012,22 @@ const MODE_ICONS = {
         hideWelcome()
         for (const entry of msg.transcript) {
           if (entry.role === 'activity' && entry.message) {
-            window.dispatchEvent(new MessageEvent('message', { data: entry.message }))
+            let activity = entry.message as { type?: string; [key: string]: unknown }
+            if (activity.type === 'reasoning' && activity.done && activity.text) {
+              window.dispatchEvent(new MessageEvent('message', { data: activity }))
+              continue
+            }
+            if (activity.type === 'tool-call' && activity.thought) {
+              const prev = msg.transcript[msg.transcript.indexOf(entry) - 1]
+              if (
+                prev?.role === 'activity' &&
+                prev.message?.type === 'reasoning' &&
+                prev.message?.text === activity.thought
+              ) {
+                activity = { ...activity, suppressThought: true }
+              }
+            }
+            window.dispatchEvent(new MessageEvent('message', { data: activity }))
           } else if (entry.role === 'user') {
             finishTurnSession()
             hideSpinner()

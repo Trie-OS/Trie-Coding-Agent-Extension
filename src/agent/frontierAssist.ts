@@ -27,6 +27,18 @@ export interface ConsultContext {
   uncertainty?: number
 }
 
+export interface FrontierCompletionOptions {
+  maxTokens: number
+  temperature: number
+  signal?: AbortSignal
+  timeoutMs?: number
+}
+
+export interface FrontierCompletionResult {
+  text: string
+  truncated: boolean
+}
+
 const MAX_CALLS_PER_TURN = 6
 const RATE_LIMIT_COOLDOWN_MS = 3 * 60 * 1000
 const MAX_CONTEXT_CHARS = 8000
@@ -69,15 +81,12 @@ export class FrontierAssist {
   }
 
   /** Returns null (silently) when disabled, rate-limited, or over budget — hybrid must never block local work. */
-  async consult(checkpoint: Checkpoint, ctx: ConsultContext): Promise<GuideNote | null> {
-    const fa = this.getConfig()
-    if (!this.enabled()) return null
-    const cfg = getActiveFrontierConfig(fa)
-    if (!cfg) return null
-    if (Date.now() < this.cooldownUntil) return null
-    if (this.callsThisTurn >= MAX_CALLS_PER_TURN) return null
-    this.callsThisTurn++
-
+  async consult(
+    checkpoint: Checkpoint,
+    ctx: ConsultContext,
+    signal?: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<GuideNote | null> {
     const clipped =
       ctx.transcript.length > MAX_CONTEXT_CHARS
         ? `…${ctx.transcript.slice(-MAX_CONTEXT_CHARS)}`
@@ -95,20 +104,59 @@ export class FrontierAssist {
     parts.push('', 'Transcript:', clipped)
     const userContent = parts.join('\n')
 
+    const raw = await this.complete(SYSTEM, userContent, {
+      maxTokens: 400,
+      temperature: 0.2,
+      signal,
+      timeoutMs,
+    })
+    return raw === null ? null : this.parseGuideNote(checkpoint, raw)
+  }
+
+  /**
+   * Short frontier completion for high-leverage read-only work (judge/rewrite).
+   * Shares the same per-turn budget, cooldown, and timeout as advisory consults.
+   */
+  async complete(
+    system: string,
+    userContent: string,
+    options: FrontierCompletionOptions,
+  ): Promise<string | null> {
+    return (await this.completeResult(system, userContent, options))?.text ?? null
+  }
+
+  async completeResult(
+    system: string,
+    userContent: string,
+    options: FrontierCompletionOptions,
+  ): Promise<FrontierCompletionResult | null> {
+    const fa = this.getConfig()
+    if (!this.enabled()) return null
+    const cfg = getActiveFrontierConfig(fa)
+    if (!cfg) return null
+    if (Date.now() < this.cooldownUntil) return null
+    if (this.callsThisTurn >= MAX_CALLS_PER_TURN) return null
+    this.callsThisTurn++
+
     try {
-      const raw =
-        cfg.provider === 'anthropic'
-          ? await this.callAnthropic(cfg.apiKey, cfg.model, userContent)
+      return cfg.provider === 'anthropic'
+          ? await this.callAnthropic(
+              cfg.apiKey,
+              cfg.model,
+              system,
+              userContent,
+              options,
+            )
           : await this.callOpenAiCompatible(
               cfg.provider === 'moonshot'
                 ? 'https://api.moonshot.ai/v1/chat/completions'
                 : 'https://api.openai.com/v1/chat/completions',
               cfg.apiKey,
               cfg.model,
+              system,
               userContent,
+              options,
             )
-      if (raw === null) return null
-      return this.parseGuideNote(checkpoint, raw)
     } catch {
       return null // advisory only — a failed cloud call must never break the loop
     }
@@ -118,32 +166,63 @@ export class FrontierAssist {
     url: string,
     apiKey: string,
     model: string,
+    system: string,
     content: string,
-  ): Promise<string | null> {
+    options: FrontierCompletionOptions,
+  ): Promise<FrontierCompletionResult | null> {
+    const timeout = AbortSignal.timeout(
+      Math.max(1, Math.min(REQUEST_TIMEOUT_MS, options.timeoutMs ?? REQUEST_TIMEOUT_MS)),
+    )
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, timeout])
+      : timeout
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model,
         messages: [
-          { role: 'system', content: SYSTEM },
+          { role: 'system', content: system },
           { role: 'user', content },
         ],
-        max_tokens: 400,
-        temperature: 0.2,
+        max_tokens: options.maxTokens,
+        temperature: options.temperature,
       }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal,
     })
     if (response.status === 429) {
       this.cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS
       return null
     }
     if (!response.ok) return null
-    const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> }
-    return data.choices?.[0]?.message?.content ?? null
+    const data = (await response.json()) as {
+      choices?: Array<{
+        message?: { content?: string }
+        finish_reason?: string | null
+      }>
+    }
+    const choice = data.choices?.[0]
+    const text = choice?.message?.content
+    if (typeof text !== 'string') return null
+    return {
+      text,
+      truncated: choice?.finish_reason === 'length' || choice?.finish_reason === 'max_tokens',
+    }
   }
 
-  private async callAnthropic(apiKey: string, model: string, content: string): Promise<string | null> {
+  private async callAnthropic(
+    apiKey: string,
+    model: string,
+    system: string,
+    content: string,
+    options: FrontierCompletionOptions,
+  ): Promise<FrontierCompletionResult | null> {
+    const timeout = AbortSignal.timeout(
+      Math.max(1, Math.min(REQUEST_TIMEOUT_MS, options.timeoutMs ?? REQUEST_TIMEOUT_MS)),
+    )
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, timeout])
+      : timeout
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -153,19 +232,28 @@ export class FrontierAssist {
       },
       body: JSON.stringify({
         model,
-        system: SYSTEM,
+        system,
         messages: [{ role: 'user', content }],
-        max_tokens: 400,
+        max_tokens: options.maxTokens,
+        temperature: options.temperature,
       }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal,
     })
     if (response.status === 429) {
       this.cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS
       return null
     }
     if (!response.ok) return null
-    const data = (await response.json()) as { content?: Array<{ type: string; text?: string }> }
-    return data.content?.find((b) => b.type === 'text')?.text ?? null
+    const data = (await response.json()) as {
+      content?: Array<{ type: string; text?: string }>
+      stop_reason?: string | null
+    }
+    const text = data.content?.find((b) => b.type === 'text')?.text
+    if (typeof text !== 'string') return null
+    return {
+      text,
+      truncated: data.stop_reason === 'max_tokens',
+    }
   }
 
   private parseGuideNote(checkpoint: Checkpoint, raw: string): GuideNote | null {

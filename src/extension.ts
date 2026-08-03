@@ -19,9 +19,15 @@ export function activate(context: vscode.ExtensionContext): void {
 
   daemonHost = new DaemonHost(context)
 
-  const provider = new ChatViewProvider(context.extensionUri, context.globalStorageUri, (label) => {
-    statusBar.text = `$(sparkle) Trie Coding: ${label}`
-  })
+  const provider = new ChatViewProvider(
+    context.extensionUri,
+    context.globalStorageUri,
+    (label) => {
+      statusBar.text = `$(sparkle) Trie Coding: ${label}`
+    },
+    undefined,
+    String(context.extension.packageJSON.version ?? 'unknown'),
+  )
 
   // Codebase indexing: build on activate when enabled + onStartup (default on).
   const warmUpIndexIfConfigured = (): void => {

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.5.3
+
+- **No restart on synthesis truncation:** final synthesis starts with a 4,096-token ceiling (providers stop naturally when complete). If the provider still reaches its limit, the harness retains the partial answer and requests only the continuation.
+- **Safe continuation stitching:** up to two 2,048-token continuation chunks are overlap-deduplicated and appended. A failed or repeatedly truncated continuation returns an explicit failure—never a silently partial answer.
+
+## 0.5.2
+
+- **Separate final synthesis budget:** the 768-token recommendation cap applies only to local tool-loop JSON/drafts. Final recommendation prose always runs through a separate synthesis call (1,800 tokens for Hybrid, configured budget or larger locally).
+- **Truncation detection across backends:** daemon `max-tokens`, OpenAI-compatible `finish_reason: length/max_tokens`, and Hybrid provider stop reasons propagate as `truncated`.
+- **Complete-answer safety:** truncated final synthesis is detected rather than silently returned.
+- **No partial tool envelopes:** truncated loop JSON is discarded and retried concisely; after two truncations the turn stops with a clear message. Recommendation truncation goes directly to evidence-grounded final synthesis.
+
+## 0.5.1
+
+- **Evidence-grounded recommendation judge:** successful exploration results are labeled (`[E1]`, `[E2]`, …) with source tool/path and supplied to both judge and rewrite.
+- **Factual rejection:** the judge must return `factuallyGrounded`; unsupported absence claims, contradictions, and uncited current-state claims force a rewrite. Malformed judge output fails closed.
+- **Frontier factual rewrite:** factually inadequate drafts route through the configured Hybrid frontier rewrite with evidence as the source of truth; rejected drafts are never returned as a fallback.
+- **Hard exploration bounds:** recommendation turns stop local exploration after 3 successful search/read calls or 90 seconds, then synthesize from gathered evidence. Per-generation timeout consumes that same wall-clock budget.
+- **Substance over formatting:** judge instructions explicitly ignore headings, list length, scorecard shape, and rhetorical polish as quality evidence.
+
+## 0.5.0
+
+- **Faster recommendation finishes:** when Hybrid is configured, semantic judging and feedback rewrites run on the selected frontier model instead of adding 70B local passes.
+- **Removed redundant self-grade:** recommendation answers no longer run a second local semantic grade after the dedicated recommendation judge.
+- **Bounded local generation:** recommendation tool-loop envelopes cap output at 768 tokens, preventing malformed JSON turns from consuming the full 2,048-token answer budget.
+- **Bounded exploration guidance:** broad harness audits target at most three high-signal files unless critical evidence is still missing.
+
+## 0.4.99
+
+- **Judge-primary recommendation finish:** removed brittle shallow/vague keyword gates from the loop; substance (robust vs one-liner advice) is scored by the LLM judge + one feedback rewrite. Deterministic guards remain only for obvious non-answers (empty, doc handoff, apologies).
+- **Carry-forward from 0.4.98:** reply list normalization (comma-separated `1., 2.` → line breaks), markdown tables in final replies, harness improvement prompt guidance, scope-narrowing question block.
+
+## 0.4.98
+
+- **Fix: reply list formatting:** comma-separated `1. …, 2. …` summaries are normalized to one item per line; markdown tables render in final replies.
+- **Fix: shallow harness recommendations:** refuse or rewrite generic one-liners per file ("add more logging", "consider exposing options"); harness asks now prompt for Priority gaps / Bottom line sections with concrete file-level fixes.
+- **Richer harness rewrite:** recommendation finish path uses structured markdown (sections, optional scorecard table) and higher token budget for agent-harness improvement asks.
+
+## 0.4.97
+
+- **Fix: vague recommendation answers:** refuse `step_complete` summaries that praise architecture or say "focus on optimizing performance" without file-grounded numbered recommendations; LLM judge rewrite path triggers on vague drafts too.
+- **Fix: harness improvement intent:** "How can I improve the agent harness" now matches recommendation routing (previously missed because `improve` preceded `harness`).
+- **Fix: scope-narrowing questions:** `ask_user_question` is refused on broad improvement asks (e.g. "What specific areas…?") — agent must answer across loop, tools, prompts, permissions, and UI.
+- **Fix: question card UI:** resolved question cards no longer duplicate the prompt or answer blocks.
+
+## 0.4.96
+
+- **Fix: streaming thoughts:** reasoning tokens are parsed from partial tool-call JSON via `ThoughtStreamParser` so the UI shows thought text instead of raw JSON; persisted thought blocks replay on chat reload.
+- **Fix: recommendation intent gaps:** harness/improvement asks like “Tell me how this agent harness could be improved” now match exploration/recommendation routing (previously required “project/codebase/repo”).
+- **Fix: doc-handoff summaries:** `step_complete` is refused when the answer mostly points at docs (“read docs/… for more”) without actionable advice synthesized from files the agent explored.
+- **Fix: empty Thought rows:** live reasoning blocks with no final text are removed instead of leaving collapsed empty “Thought” entries.
+
 ## 0.4.95
 
 - **Stall guard:** after several tool calls without progress on ambiguous Code-mode tasks, the loop nudges the model to `update_todos` or `ask_user_question` instead of continuing search loops.

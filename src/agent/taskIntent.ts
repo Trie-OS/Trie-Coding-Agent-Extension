@@ -135,6 +135,12 @@ const CODEBASE_EXPLORATION_SIGNALS = [
   /\b(improve|improvement|optimi[sz]e|audit|review)\b[^.!?\n]{0,60}\b(project|codebase|repo(?:sitory)?|app|this)\b/i,
   /\b(project|codebase|repo(?:sitory)?|this app)\b[^.!?\n]{0,60}\b(recommend|suggest|review|audit|improve)/i,
   /\bwhat (?:should|could) (?:we|I) (?:improve|change|fix|do)\b/i,
+  /\btell me how\b[^.!?\n]{0,80}\b(?:improve|better|could be improved)\b/i,
+  /\bhow\b[^.!?\n]{0,80}\b(?:could|can|should)\b[^.!?\n]{0,40}\b(?:be )?(?:improved|better)\b/i,
+  /\b(?:agent|harness|workflow|loop)\b[^.!?\n]{0,60}\b(?:improve|better|improved|improvement)\b/i,
+  /\bhow (?:can|could|should) (?:we|I|you) improve\b/i,
+  /\bhow (?:can|could|should)\b[^.!?\n]{0,40}\bimprove\b/i,
+  /\bimprove\b[^.!?\n]{0,80}\b(?:agent|harness|workflow|loop|this)\b/i,
 ]
 
 /** Recommendations / project reviews need repo reads before step_complete. */
@@ -145,20 +151,22 @@ export function taskNeedsCodebaseExploration(task: string): boolean {
   return CODEBASE_EXPLORATION_SIGNALS.some((pattern) => pattern.test(t))
 }
 
-const RECOMMENDATION_ANSWER_SIGNALS = [
-  /\brecommend(?:ation)?s?\b/i,
-  /\bsuggest(?:ion)?s?\b/i,
-  /\bimprovement(?:s)?\b/i,
-  /\bshould\b/i,
-  /\bconsider\b/i,
-  /\bnext step(?:s)?\b/i,
-  /\b(?:priority|prioritize|quick win|high[- ]impact)\b/i,
-]
-
-const ANALYSIS_ONLY_SIGNALS = [
-  /\b(?:architecture|orchestrat(?:es|ion)|responsibilit(?:y|ies)|documented and understood|no additional files|core (?:stores|logic|files))\b/i,
-  /\b(?:fully documented|now fully|interdependencies|no additional files are required)\b/i,
-]
+/** Scope-narrowing clarifiers are inappropriate for broad improvement asks. */
+export function isScopeNarrowingQuestion(args: Record<string, unknown>): boolean {
+  const raw = args['questions']
+  if (!Array.isArray(raw)) return false
+  return raw.some((item) => {
+    if (typeof item !== 'object' || item === null) return false
+    const text = typeof (item as Record<string, unknown>)['question'] === 'string'
+      ? ((item as Record<string, unknown>)['question'] as string)
+      : ''
+    if (!text.trim()) return false
+    return (
+      /\b(?:which|what specific|narrow|scope|area|aspect|part of)\b/i.test(text) &&
+      /\b(?:improve|focus|priorit|recommend|change|harness|agent)\b/i.test(text)
+    )
+  })
+}
 
 export function taskAsksForRecommendations(task: string): boolean {
   return (
@@ -177,29 +185,50 @@ export function recommendationTaskNote(task: string, mode: 'code' | 'plan' | 'as
     mode !== 'code'
       ? 'Read-only mode: put the answer in step_complete.summary; do not edit files.'
       : 'Only edit files if the user also asked you to implement changes.'
+  if (taskAsksForHarnessImprovement(task)) {
+    return [
+      'Note: the user wants a robust harness improvement analysis grounded in this codebase.',
+      'Use targeted search, then inspect at most 3 high-signal files unless critical evidence is still missing; synthesize instead of touring the repository.',
+      'Prioritize loop.ts, tools.ts, prompts.ts, permissions, ChatViewProvider, or verification policy based on what the search reveals.',
+      'Write markdown in step_complete.summary with sections: opening thesis (1–2 sentences), ### Priority gaps (numbered; each names area + current behavior + gap + concrete file-level fix), optional ### Already strong, ### Bottom line (highest-ROI next steps).',
+      'Put each numbered list item on its own line. No comma-separated lists. No generic tips like "add more logging" or "consider exposing options".',
+      'Do not call ask_user_question to narrow scope.',
+      readOnly,
+    ].join(' ')
+  }
   return [
     'Note: the user wants recommendations / improvement advice grounded in this codebase.',
-    'Explore what you need, then answer with concrete actionable advice in step_complete.summary — not only an architecture tour.',
+    'Explore loop.ts, tools.ts, prompts.ts, permissions, and chat UI as needed.',
+    'Answer with numbered, file-grounded recommendations — each item names a module/file and a concrete harness change. No generic "optimize performance" or "maintain clean structure" platitudes.',
+    'Do not call ask_user_question to narrow scope when the user asked broadly; cover the main harness areas in one answer.',
     'Do not end with step_failed apologies.',
     readOnly,
   ].join(' ')
 }
 
-/**
- * Recommendation asks sometimes get a long architecture dump with zero advice.
- * Bullet lists of file responsibilities are not recommendations — require
- * advice language (should / recommend / improve / …).
- */
+export function taskAsksForHarnessImprovement(task: string): boolean {
+  return taskAsksForRecommendations(task) && /\b(?:agent|harness|workflow|tool loop)\b/i.test(task)
+}
+
+/** Summaries that punt to docs instead of answering after exploration. */
+export function summaryDeflectsToDocs(summary: string): boolean {
+  const s = summary.trim()
+  if (!/\bread\b[^.!?\n]{0,60}\b(?:docs\/|documentation|\.\/)?\S+\.(?:md|txt|html)\b/i.test(s)) {
+    return false
+  }
+  const hasStructuredAdvice = /(?:^|\n)\s*(?:\d+[.)]|[-*•])\s+\S/m.test(s)
+  if (hasStructuredAdvice) return false
+  if (/\bfor more (?:information|details|context)\b/i.test(s) && s.length < 500) return true
+  return s.length < 320
+}
+
 export function summaryMissesRecommendationAsk(task: string, summary: string): boolean {
   if (!taskAsksForRecommendations(task)) return false
 
   const s = summary.trim()
   if (s.length < 80) return true
-  const hasAdvice = RECOMMENDATION_ANSWER_SIGNALS.some((re) => re.test(s))
-  if (hasAdvice) return false
-  if (ANALYSIS_ONLY_SIGNALS.some((re) => re.test(s))) return true
-  // Long answer with no advice verbs for a recommendation ask.
-  return s.length > 280
+  if (summaryDeflectsToDocs(s)) return true
+  return false
 }
 
 /**

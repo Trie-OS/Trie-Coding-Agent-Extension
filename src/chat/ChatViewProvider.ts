@@ -4,7 +4,7 @@ import * as vscode from 'vscode'
 import { readConfig, setFrontierSelection, setHybridEnabled, hybridActiveLabel, isHybridConfigured, listHybridModelOptions } from '../config'
 import { ShadowRepo, type ChangedFileStat } from '../agent/checkpoints'
 import { FrontierAssist, type GuideNote } from '../agent/frontierAssist'
-import { AgentSession } from '../agent/loop'
+import { AgentSession, type TurnTelemetry } from '../agent/loop'
 import type { PermissionChoice, PermissionRequest } from '../agent/permissionBroker'
 import type { QuestionAnswer, UserQuestionPayload } from '../agent/questionBroker'
 import { MultitaskBus } from '../agent/multitaskBus'
@@ -39,15 +39,17 @@ type ToWebview =
       workElsewhere: number
       imageSupport: ImageAttachmentSupport
       theme: WebviewTheme
+      extensionVersion: string
     }
   | { type: 'tool-call'; id: number; tool: string; args: string; rowLabel: string; thought: string; groupKey?: string; linesAdded?: number; linesDeleted?: number }
-  | { type: 'reasoning'; chunk?: string; done?: boolean }
+  | { type: 'reasoning'; chunk?: string; done?: boolean; text?: string; discard?: boolean }
   | { type: 'tool-result'; id: number; ok: boolean; summary: string; viaTrie?: boolean; trieMs?: number; scanMs?: number; detail?: string; userSkipped?: boolean }
   | { type: 'todos'; todo: string[]; done: string[] }
   | { type: 'hybrid-check'; active: boolean; checkpoint?: string }
   | { type: 'hybrid-plan'; subtasks: string[]; rationale?: string }
   | { type: 'guide'; checkpoint: string; verdict: string; text: string }
   | { type: 'context'; used: number; limit: number }
+  | { type: 'telemetry'; telemetry: TurnTelemetry }
   | { type: 'compaction'; active: boolean; saved?: number; keptTurns?: number }
   | { type: 'final'; ok: boolean; text: string; checkpoint?: string }
   | { type: 'review'; checkpoint: string; files: ChangedFileStat[] }
@@ -200,6 +202,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     storageUri: vscode.Uri,
     private readonly onStatusChanged: (label: string) => void,
     private readonly getDaemonClient?: () => DaemonClient,
+    private readonly extensionVersion = 'unknown',
   ) {
     this.store = new ChatStore(storageUri)
     // Read-only "file as it was at the checkpoint" documents, the left side
@@ -291,6 +294,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     switch (message.type) {
       case 'tool-call':
       case 'tool-result':
+      case 'reasoning':
       case 'todos':
       case 'hybrid-check':
       case 'hybrid-plan':
@@ -378,6 +382,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       workElsewhere,
       imageSupport,
       theme: webviewTheme(),
+      extensionVersion: this.extensionVersion,
     })
     this.onStatusChanged(model)
   }
@@ -1060,6 +1065,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    let pendingReasoning: string | undefined
     try {
       session.questionBroker.setHandler((requestId, questions) =>
         this.requestQuestion(runtime, requestId, questions),
@@ -1082,11 +1088,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           },
           onReasoningChunk: (text) => {
             if (request.internal) return
-            this.postFor(runtime, { type: 'reasoning', chunk: text })
+            this.post({ type: 'reasoning', chunk: text })
           },
-          onReasoningDone: () => {
+          onReasoningDone: (text) => {
             if (request.internal) return
-            this.postFor(runtime, { type: 'reasoning', done: true })
+            pendingReasoning = text?.trim() || undefined
+          },
+          onReasoningOutcome: (accepted) => {
+            if (request.internal) return
+            if (accepted && pendingReasoning) {
+              this.postFor(runtime, {
+                type: 'reasoning',
+                done: true,
+                text: pendingReasoning,
+              })
+            } else {
+              this.post({ type: 'reasoning', done: true, discard: true })
+            }
+            pendingReasoning = undefined
           },
           onToolCall: (id: number, call: ToolCall, argsSummary: string) => {
             const delta = toolLineDelta(call)
@@ -1138,6 +1157,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           onHybridPlan: (subtasks, rationale) =>
             this.postFor(runtime, { type: 'hybrid-plan', subtasks, rationale }),
           onContext: (used, limit) => this.postFor(runtime, { type: 'context', used, limit }),
+          onTelemetry: (telemetry) =>
+            this.post({ type: 'telemetry', telemetry }),
           onCompaction: (active, saved, keptTurns) =>
             this.postFor(runtime, { type: 'compaction', active, saved, keptTurns }),
           onGuideNote: (note: GuideNote) =>
@@ -1524,6 +1545,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <body>
   <header id="header">
     <div id="status">
+      <span id="version-label" class="version-label"></span>
       <span id="backend-chip" class="chip" hidden></span>
       <div class="hybrid-anchor">
         <button id="hybrid-chip" class="chip hybrid" type="button" hidden aria-haspopup="true" aria-expanded="false">
@@ -1576,6 +1598,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </button>
     </div>
   </header>
+  <div id="turn-telemetry" class="turn-telemetry" hidden></div>
   <section id="history-view" hidden>
     <div class="hist-head">
       <button id="hist-back" class="ghost" title="Back to chat">←</button>

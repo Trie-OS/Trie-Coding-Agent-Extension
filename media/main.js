@@ -68,6 +68,17 @@
     ["path", { d: "M12 17h.01" }]
   ];
 
+  // src/chat/replyMarkdown.ts
+  function normalizeReplyMarkdownStructure(text) {
+    let s = text.replace(/\r\n/g, "\n").trim();
+    if (!s) return s;
+    s = s.replace(/,\s*(?=\d+\.\s+\S)/g, "\n");
+    s = s.replace(/;\s*(?=\d+\.\s+\S)/g, "\n");
+    s = s.replace(/([.!?])\s+(?=\d+\.\s+\S)/g, "$1\n");
+    s = s.replace(/([.!?])\s+(?=-\s+\S)/g, "$1\n");
+    return s;
+  }
+
   // media/src/main.ts
   var MODE_ICONS = {
     code: Bot,
@@ -182,6 +193,7 @@
     let turnSession = null;
     let liveReasoningEl = null;
     let liveReasoningBodyEl = null;
+    let hadLiveReasoningThisStep = false;
     function ensureLiveReasoning() {
       if (liveReasoningEl && liveReasoningBodyEl) return liveReasoningBodyEl;
       const details = document.createElement("details");
@@ -201,18 +213,33 @@
     }
     function appendLiveReasoning(chunk) {
       if (!chunk) return;
+      hadLiveReasoningThisStep = true;
       const body = ensureLiveReasoning();
       body.textContent = (body.textContent ?? "") + chunk;
       scrollDown();
     }
-    function settleLiveReasoning() {
+    function settleLiveReasoning(finalText) {
       if (!liveReasoningEl) return;
+      const text = (finalText ?? liveReasoningBodyEl?.textContent ?? "").trim();
+      if (!text) {
+        liveReasoningEl.remove();
+        liveReasoningEl = null;
+        liveReasoningBodyEl = null;
+        return;
+      }
+      if (liveReasoningBodyEl) liveReasoningBodyEl.textContent = text;
       liveReasoningEl.classList.remove("live");
       liveReasoningEl.open = false;
       const summary = liveReasoningEl.querySelector(".acc-thought-summary");
       if (summary) summary.textContent = "Thought";
       liveReasoningEl = null;
       liveReasoningBodyEl = null;
+    }
+    function renderPersistedThought(text) {
+      if (!text.trim()) return;
+      const session = ensureTurnSession();
+      const group = session.activeGroup ?? ensureAccordionGroup("explore", "Explored");
+      addThoughtRow(group, text, 0);
     }
     function turnSummaryText(session, finished) {
       const parts = [];
@@ -342,8 +369,8 @@
       details.append(summary, body);
       group.body.appendChild(details);
     }
-    function addToolRow(group, id, rowLabel, thought, sinceMs, argsPreview, toolName) {
-      addThoughtRow(group, thought, sinceMs);
+    function addToolRow(group, id, rowLabel, thought, sinceMs, argsPreview, toolName, showThought = true) {
+      if (showThought) addThoughtRow(group, thought, sinceMs);
       const row = document.createElement("div");
       row.className = "acc-row tool running";
       row.dataset.id = String(id);
@@ -450,7 +477,9 @@
         group = ensureAccordionGroup("edit", msg.tool);
       }
       refreshTurnSummary();
-      return addToolRow(group, msg.id, msg.rowLabel, msg.thought, sinceMs, msg.args, msg.tool);
+      const showThought = !msg.suppressThought && !hadLiveReasoningThisStep;
+      hadLiveReasoningThisStep = false;
+      return addToolRow(group, msg.id, msg.rowLabel, msg.thought, sinceMs, msg.args, msg.tool, showThought);
     }
     let todoCard = null;
     let todoCardSeen = false;
@@ -951,40 +980,42 @@
       }, 400);
     }
     function showQuestionAnswers(card, answers) {
-      card.querySelectorAll(".question-options, .question-other, .question-actions, .question-error").forEach(
-        (el) => el.remove()
-      );
-      const summary = document.createElement("div");
-      summary.className = "question-answers";
-      for (const answer of answers) {
-        const row = document.createElement("div");
-        row.className = "question-answer-row";
-        const q = document.createElement("div");
-        q.className = "question-answer-q";
-        q.textContent = answer.question;
-        const a = document.createElement("div");
-        a.className = "question-answer-a";
-        a.textContent = answer.answer;
-        row.append(q, a);
-        summary.appendChild(row);
+      card.querySelectorAll(
+        ".question-options, .question-other, .question-actions, .question-error, .question-answers, .question-block"
+      ).forEach((el) => el.remove());
+      if (answers.length === 1) {
+        const only = answers[0];
+        const title = document.createElement("div");
+        title.className = "question-title";
+        title.textContent = only.question;
+        const ans = document.createElement("div");
+        ans.className = "question-answer-a single";
+        ans.textContent = only.answer;
+        card.append(title, ans);
+      } else {
+        const summary = document.createElement("div");
+        summary.className = "question-answers";
+        for (const answer of answers) {
+          const row = document.createElement("div");
+          row.className = "question-answer-row";
+          const q = document.createElement("div");
+          q.className = "question-answer-q";
+          q.textContent = answer.question;
+          const a = document.createElement("div");
+          a.className = "question-answer-a";
+          a.textContent = answer.answer;
+          row.append(q, a);
+          summary.appendChild(row);
+        }
+        card.appendChild(summary);
       }
-      card.appendChild(summary);
       card.classList.add("resolved");
     }
     function renderQuestionCard(requestId, questions, resolvedAnswers) {
       if (resolvedAnswers?.length) {
         const card2 = document.createElement("div");
-        card2.className = "question-card resolved";
+        card2.className = "question-card";
         card2.dataset.requestId = requestId;
-        for (const q of questions) {
-          const block = document.createElement("div");
-          block.className = "question-block";
-          const title = document.createElement("div");
-          title.className = "question-title";
-          title.textContent = q.question;
-          block.appendChild(title);
-          card2.appendChild(block);
-        }
         showQuestionAnswers(card2, resolvedAnswers);
         messagesEl.appendChild(card2);
         scrollDown();
@@ -1257,8 +1288,18 @@
     }
     function formatReplyMarkdown(text) {
       const fragment = document.createDocumentFragment();
-      const lines = text.replace(/\r\n/g, "\n").split("\n");
+      const lines = normalizeReplyMarkdownStructure(text).split("\n");
       let i = 0;
+      function isTableRow(line) {
+        const t = line.trim();
+        return t.startsWith("|") && t.endsWith("|") && t.includes("|", 1);
+      }
+      function isTableSeparator(line) {
+        return /^\|[\s:|-]+\|$/.test(line.trim());
+      }
+      function parseTableCells(line) {
+        return line.trim().slice(1, -1).split("|").map((c) => c.trim());
+      }
       const appendNestedBullets = (li, start) => {
         let j = start;
         if (j >= lines.length || !/^\s+[-*]\s/.test(lines[j])) return j;
@@ -1278,6 +1319,37 @@
         const line = lines[i];
         if (!line.trim()) {
           i++;
+          continue;
+        }
+        if (isTableRow(line)) {
+          const table = document.createElement("table");
+          table.className = "reply-table";
+          const tbody = document.createElement("tbody");
+          let headerRow = null;
+          while (i < lines.length && isTableRow(lines[i])) {
+            if (isTableSeparator(lines[i])) {
+              i++;
+              continue;
+            }
+            const cells = parseTableCells(lines[i]);
+            const tr = document.createElement("tr");
+            for (const cell of cells) {
+              const el = document.createElement(headerRow ? "td" : "th");
+              formatInlineMarkdownInto(el, cell);
+              tr.appendChild(el);
+            }
+            if (!headerRow) {
+              headerRow = tr;
+              const thead = document.createElement("thead");
+              thead.appendChild(tr);
+              table.appendChild(thead);
+            } else {
+              tbody.appendChild(tr);
+            }
+            i++;
+          }
+          if (tbody.childNodes.length > 0) table.appendChild(tbody);
+          fragment.appendChild(table);
           continue;
         }
         const headerMatch = line.match(/^(#{1,6})\s+(.+)$/);
@@ -1322,6 +1394,7 @@
           const l = lines[i];
           if (!l.trim()) break;
           if (/^#{1,6}\s/.test(l)) break;
+          if (isTableRow(l)) break;
           if (/^\d+\.\s/.test(l)) break;
           if (/^[-*]\s/.test(l)) break;
           paraLines.push(l);
@@ -2203,6 +2276,7 @@
       clearHybridGroups();
       liveReasoningEl = null;
       liveReasoningBodyEl = null;
+      hadLiveReasoningThisStep = false;
       hideSpinner();
       backgroundWorkEl = null;
     }
@@ -2303,7 +2377,14 @@
         }
         case "reasoning": {
           if (typeof msg.chunk === "string" && msg.chunk) appendLiveReasoning(msg.chunk);
-          if (msg.done) settleLiveReasoning();
+          if (msg.done) {
+            if (typeof msg.text === "string" && msg.text.trim()) {
+              if (liveReasoningEl) settleLiveReasoning(msg.text);
+              else renderPersistedThought(msg.text);
+            } else {
+              settleLiveReasoning();
+            }
+          }
           break;
         }
         case "todos": {
@@ -2362,6 +2443,7 @@
           const existing = messagesEl.querySelector(
             `.question-card[data-request-id="${msg.requestId}"]`
           );
+          if (existing?.classList.contains("resolved")) break;
           if (existing) {
             showQuestionAnswers(existing, msg.answers ?? []);
           } else {
@@ -2474,7 +2556,18 @@
           hideWelcome();
           for (const entry of msg.transcript) {
             if (entry.role === "activity" && entry.message) {
-              window.dispatchEvent(new MessageEvent("message", { data: entry.message }));
+              let activity = entry.message;
+              if (activity.type === "reasoning" && activity.done && activity.text) {
+                window.dispatchEvent(new MessageEvent("message", { data: activity }));
+                continue;
+              }
+              if (activity.type === "tool-call" && activity.thought) {
+                const prev = msg.transcript[msg.transcript.indexOf(entry) - 1];
+                if (prev?.role === "activity" && prev.message?.type === "reasoning" && prev.message?.text === activity.thought) {
+                  activity = { ...activity, suppressThought: true };
+                }
+              }
+              window.dispatchEvent(new MessageEvent("message", { data: activity }));
             } else if (entry.role === "user") {
               finishTurnSession();
               hideSpinner();

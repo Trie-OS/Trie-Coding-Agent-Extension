@@ -3,7 +3,9 @@ import test from 'node:test'
 import {
   isAbandonedRecommendationFailure,
   isLazyStepCompleteSummary,
+  isScopeNarrowingQuestion,
   recommendationTaskNote,
+  summaryDeflectsToDocs,
   summaryMissesRecommendationAsk,
   taskNeedsCodebaseExploration,
 } from './taskIntent.ts'
@@ -11,8 +13,59 @@ import {
 test('taskNeedsCodebaseExploration detects recommendation requests', () => {
   assert.equal(taskNeedsCodebaseExploration('Make some recommendations for this project'), true)
   assert.equal(taskNeedsCodebaseExploration('Suggest improvements for the codebase'), true)
+  assert.equal(
+    taskNeedsCodebaseExploration('Tell me how this agent harness could be improved'),
+    true,
+  )
+  assert.equal(taskNeedsCodebaseExploration('How can I improve the agent harness'), true)
   assert.equal(taskNeedsCodebaseExploration('Fix the login bug'), false)
   assert.equal(taskNeedsCodebaseExploration('hi'), false)
+})
+
+test('summaryDeflectsToDocs catches doc handoffs without actionable advice', () => {
+  const bad =
+    'Agent harness improvement areas: planning mode, inference process, and chat loop. Read docs/HYBRID-ASSIST.md and docs/GETTING-STARTED.md for more information'
+  assert.equal(summaryDeflectsToDocs(bad), true)
+  assert.equal(
+    summaryDeflectsToDocs(
+      [
+        '1. Gate step_complete on recommendation asks so architecture dumps are refused.',
+        '2. Stream thought tokens through ThoughtStreamParser instead of raw JSON.',
+        'See docs/ARCHITECTURE.md for background.',
+      ].join('\n'),
+    ),
+    false,
+  )
+})
+
+test('summaryMissesRecommendationAsk only blocks obvious non-answers before finish', () => {
+  const task = 'Tell me how this agent harness could be improved'
+  const bad =
+    'Agent harness improvement areas: planning mode. Read docs/HYBRID-ASSIST.md for more information'
+  assert.equal(summaryMissesRecommendationAsk(task, bad), true)
+
+  const shallow =
+    '1. **loop.ts:** Add more logging, 2. **tools.ts:** Consider exposing more tool options, 3. **prompts.ts:** Implement handlers.'
+  assert.equal(summaryMissesRecommendationAsk(task, shallow), false)
+
+  const robust =
+    '### Priority gaps\n1. **permissions.ts** — session-only allow; gap: no permanent rules. Fix: persist to `.trie-ide/permissions.json`.'
+  assert.equal(summaryMissesRecommendationAsk(task, robust), false)
+})
+
+test('isScopeNarrowingQuestion detects inappropriate clarifiers', () => {
+  assert.equal(
+    isScopeNarrowingQuestion({
+      questions: [{ question: 'What specific areas of the agent harness would you like to improve?', options: ['Everything', 'Loop'] }],
+    }),
+    true,
+  )
+  assert.equal(
+    isScopeNarrowingQuestion({
+      questions: [{ question: 'Which database should we use for auth?', options: ['Postgres', 'SQLite'] }],
+    }),
+    false,
+  )
 })
 
 test('isLazyStepCompleteSummary detects placeholder summaries', () => {
@@ -28,34 +81,9 @@ test('isLazyStepCompleteSummary detects placeholder summaries', () => {
   )
 })
 
-test('summaryMissesRecommendationAsk catches architecture dumps without advice', () => {
-  const task = 'Recommend improvements to the agent harness we have here.'
-  const dump = [
-    '### Analysis',
-    'chat.ts Orchestrates single-agent runs and the agent lifecycle.',
-    'subagents.ts Handles multi-agent workflows.',
-    'plan.ts Manages planning-mode state.',
-    'All the core logic and interdependencies are now fully documented and understood.',
-    'No additional files are required for this analysis.',
-  ].join(' ')
-  assert.equal(summaryMissesRecommendationAsk(task, dump), true)
-  assert.equal(
-    summaryMissesRecommendationAsk(
-      task,
-      [
-        '### Recommendations',
-        '1. Make edit_file line-anchored by default — reduces search drift failures.',
-        '2. Gate step_complete on recommendation asks so architecture dumps are refused.',
-        '3. Consider verifying harness contracts with focused loop tests.',
-      ].join('\n'),
-    ),
-    false,
-  )
-})
-
 test('recommendationTaskNote lightly routes without a fixed format', () => {
   const note = recommendationTaskNote('Recommend ways to improve this agent harness', 'ask')
-  assert.match(note, /recommendations/i)
+  assert.match(note, /improvement|Priority gaps/i)
   assert.doesNotMatch(note, /4–7|4-7/)
   assert.equal(recommendationTaskNote('Fix the login bug', 'code'), '')
 })

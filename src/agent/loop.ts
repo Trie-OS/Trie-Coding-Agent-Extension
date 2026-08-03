@@ -64,11 +64,20 @@ import {
   taskExpectsCodeChanges,
   taskNeedsCodebaseExploration,
   summaryClaimsFileChanges,
+  summaryDeflectsToDocs,
+  summaryMissesRecommendationAsk,
+  isScopeNarrowingQuestion,
 } from './taskIntent'
 import {
   finishRecommendationAnswer,
   isObviouslyFailedRecommendationDraft,
 } from './recommendationAnswer'
+import {
+  recommendationBudgetReached,
+  recommendationGenerationTimeout,
+} from './recommendationBudget'
+import { TurnBudget } from './turnBudget'
+import { ThoughtStreamParser } from './thoughtStream'
 import { VerificationTracker, verificationPolicy } from './verificationPolicy'
 import type { MultitaskBus } from './multitaskBus'
 import {
@@ -94,7 +103,8 @@ export interface MultitaskSessionOptions {
 export interface LoopEvents {
   onGenerating(active: boolean): void
   onReasoningChunk?(text: string): void
-  onReasoningDone?(): void
+  onReasoningDone?(text?: string): void
+  onReasoningOutcome?(accepted: boolean): void
   onToolCall(id: number, call: ToolCall, argsSummary: string): void
   onToolResult(
     id: number,
@@ -114,10 +124,24 @@ export interface LoopEvents {
   onHybridPlan?(subtasks: string[], rationale: string): void
   /** Context usage after each generation — real token counts from the backend. */
   onContext?(usedTokens: number, limitTokens: number): void
+  onTelemetry?(telemetry: TurnTelemetry): void
   /** Memory compaction started/finished; `savedTokens` on finish. */
   onCompaction?(active: boolean, savedTokens?: number, keptTurns?: number): void
   /** Plan mode handoff — user approves switching to Code. */
   onPlanHandoff?(payload: { path: string; content: string }): Promise<'execute' | 'stay'>
+}
+
+export interface TurnTelemetry {
+  phase: string
+  localGenerations: number
+  localGenerationMs: number
+  explorationCalls: number
+  judgeMs: number
+  synthesisMs: number
+  tokensIn: number
+  tokensOut: number
+  truncationRetries: number
+  deadlineRemainingMs: number
 }
 
 export interface PlanExecutePayload {
@@ -159,6 +183,64 @@ const GENERATION_TIMEOUT_MS = 3 * 60 * 1000
 const COMPACT_THRESHOLD = 0.75
 const STALL_GUARD_CALLS = 6
 const STALL_GUARD_MAX_NUDGES = 2
+const RECOMMENDATION_EVIDENCE_MAX_CHARS = 12_000
+
+interface RecommendationEvidence {
+  source: string
+  text: string
+  quality: 'discovery' | 'exact-read'
+  discoveredBeforeRead?: boolean
+}
+
+function recommendationEvidenceSource(call: ToolCall): string {
+  const args = call.args
+  switch (call.tool) {
+    case 'read_file':
+      return `read_file ${String(args['path'] ?? '')}${
+        args['startLine'] || args['endLine']
+          ? ` L${String(args['startLine'] ?? 1)}-${String(args['endLine'] ?? 'end')}`
+          : ''
+      }`
+    case 'grep':
+      return `grep /${String(args['pattern'] ?? '')}/ ${String(args['glob'] ?? '')}`.trim()
+    case 'search_symbols':
+      return `search_symbols ${String(args['query'] ?? '')}`
+    case 'glob':
+      return `glob ${String(args['pattern'] ?? '')}`
+    case 'list_dir':
+      return `list_dir ${String(args['path'] ?? '.')}`
+    case 'web_search':
+      return `web_search ${String(args['query'] ?? '')}`
+    default:
+      return call.tool
+  }
+}
+
+function formatRecommendationEvidence(items: RecommendationEvidence[]): string {
+  let remaining = RECOMMENDATION_EVIDENCE_MAX_CHARS
+  const sections: string[] = []
+  for (const [index, item] of items.entries()) {
+    if (remaining <= 0) break
+    const quality =
+      item.quality === 'exact-read'
+        ? `exact-read discovered-before-read=${item.discoveredBeforeRead === true ? 'yes' : 'no'}`
+        : 'discovery'
+    const header = `[E${index + 1}] ${item.source} (${quality})`
+    const text = item.text.trim().slice(0, Math.min(4000, remaining))
+    sections.push(`${header}\n${text}`)
+    remaining -= header.length + text.length + 2
+  }
+  return sections.join('\n\n')
+}
+
+function extractDiscoveredPaths(text: string): string[] {
+  const matches = text.match(
+    /(?:^|\n)([A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|py|rs|go|java|md|json|css|html))(?::\d+)?/g,
+  )
+  return (
+    matches?.map((match) => match.trim().replace(/:\d+$/, '').replaceAll('\\', '/')) ?? []
+  )
+}
 
 /** Context window we budget against: daemon knows its length; API backends assume 32k. */
 function contextLimit(): number {
@@ -306,6 +388,8 @@ export class AgentSession {
     turnImages?: ChatTurnImage[],
   ): Promise<LoopResult> {
     this.frontier.resetTurn()
+    const recommendationTurn = taskAsksForRecommendations(task)
+    const budget = new TurnBudget(mode, recommendationTurn)
     ensureScratchpad(this.root, this.sessionId)
     const tools = new WorkspaceTools(
       this.root,
@@ -343,6 +427,11 @@ export class AgentSession {
     // handles the ask correctly on the first pass — not via post-hoc correction.
     const taskNotes = buildTaskNotes(task, mode)
     const promptOptions = { multitask: !!this.multitask }
+    // Tool-loop envelopes are short. A lower cap prevents malformed local
+    // recommendation turns from spending the full 2k-token answer budget.
+    const loopParams = taskAsksForRecommendations(task)
+      ? { ...params, maxTokens: Math.min(params.maxTokens, 768) }
+      : params
 
     if (!this.started) {
       const workspaceContext = buildWorkspaceContext(this.root, this.workspaceName)
@@ -353,7 +442,14 @@ export class AgentSession {
         ...(turnImages?.length ? { images: turnImages } : {}),
       })
       this.started = true
-      await this.maybeDecompose(task, workspaceContext, mode, events, hybridStats, signal)
+      await this.maybeDecompose(
+        task,
+        workspaceContext,
+        mode,
+        events,
+        hybridStats,
+        budget.signal(signal, 30_000),
+      )
     } else {
       this.turns[0] = { role: 'system', content: agentSystemPrompt(mode, promptOptions) }
       const userTurn: ChatTurn = {
@@ -384,37 +480,144 @@ export class AgentSession {
     this.mutatedThisTurn = false
     const mutatedFiles: ChangedFileStat[] = []
     const verification = new VerificationTracker()
+    let recommendationExplorationCalls = 0
+    let truncatedGenerations = 0
+    const recommendationEvidence: RecommendationEvidence[] = []
+    const discoveredPaths = new Set<string>()
+    const telemetry: TurnTelemetry = {
+      phase: 'starting',
+      localGenerations: 0,
+      localGenerationMs: 0,
+      explorationCalls: 0,
+      judgeMs: 0,
+      synthesisMs: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      truncationRetries: 0,
+      deadlineRemainingMs: budget.remainingMs(),
+    }
+    const emitTelemetry = (phase: string): void => {
+      telemetry.phase = phase
+      telemetry.localGenerations = budget.localGenerations
+      telemetry.deadlineRemainingMs = budget.remainingMs()
+      events.onTelemetry?.({ ...telemetry })
+    }
+    emitTelemetry('starting')
+
+    const finishRecommendation = async (
+      draft: string,
+      forceRewrite: boolean,
+    ): Promise<LoopResult> => {
+      events.onGenerating(true)
+      try {
+        const summary = await finishRecommendationAnswer(
+          client,
+          task,
+          draft,
+          this.transcriptTail(),
+          params,
+          signal,
+          {
+            forceRewrite,
+            frontier: this.frontier.enabled() ? this.frontier : undefined,
+            evidence: formatRecommendationEvidence(recommendationEvidence),
+            budget,
+            onPhase: (phase, durationMs, truncationRetries) => {
+              if (phase === 'judge') telemetry.judgeMs += durationMs
+              else telemetry.synthesisMs += durationMs
+              telemetry.truncationRetries += truncationRetries
+              emitTelemetry(phase)
+            },
+          },
+        )
+        return {
+          ok: true,
+          summary,
+          mutatedFiles: mutatedFiles.length > 0 ? mutatedFiles : undefined,
+          hybridStats,
+        }
+      } finally {
+        events.onGenerating(false)
+      }
+    }
 
     for (let i = 0; i < maxCalls; i++) {
       if (signal.aborted) return { ok: false, summary: 'Stopped.', hybridStats }
+      if (budget.expired()) {
+        return {
+          ok: false,
+          summary: 'Stopped: the end-to-end turn deadline was reached.',
+          hybridStats,
+        }
+      }
 
-      await this.compactIfNeeded(client, params, events, signal)
+      const recommendationElapsed = budget.elapsedMs()
+      if (
+        recommendationTurn &&
+        recommendationBudgetReached(
+          recommendationExplorationCalls,
+          recommendationElapsed,
+        )
+      ) {
+        return await finishRecommendation('', true)
+      }
+
+      await this.compactIfNeeded(client, params, events, budget.signal(signal), budget)
+
+      if (!budget.claimLocalGeneration()) {
+        if (recommendationTurn) return await finishRecommendation('', true)
+        return {
+          ok: false,
+          summary: `Stopped: the ${mode} mode local-generation budget (${budget.maxLocalGenerations}) was reached.`,
+          hybridStats,
+        }
+      }
 
       events.onGenerating(true)
+      emitTelemetry('local generation')
+      const localGenerationStartedAt = Date.now()
       let raw = ''
       let genResult: Awaited<ReturnType<InferenceClient['generate']>> | undefined
       let generationError: unknown
+      const thoughtStream = new ThoughtStreamParser()
       try {
         genResult = await generateWithTimeout(
           client,
           this.windowedTurns(),
-          params,
+          loopParams,
           (token) => {
             if (!token) return
-            events.onReasoningChunk?.(token)
+            const delta = thoughtStream.push(token)
+            if (delta) events.onReasoningChunk?.(delta)
           },
-          signal,
+          budget.signal(signal),
+          recommendationTurn
+            ? Math.max(
+                1000,
+                Math.min(
+                  GENERATION_TIMEOUT_MS,
+                  recommendationGenerationTimeout(recommendationElapsed),
+                ),
+              )
+            : GENERATION_TIMEOUT_MS,
         )
         raw = genResult.text
       } catch (error) {
         generationError = error
       } finally {
+        telemetry.localGenerationMs += Date.now() - localGenerationStartedAt
         events.onGenerating(false)
-        events.onReasoningDone?.()
+        const finalThought = thoughtStream.finalThought().trim()
+        events.onReasoningDone?.(finalThought || undefined)
+        thoughtStream.reset()
       }
       if (generationError !== undefined) {
+        events.onReasoningOutcome?.(false)
         const message =
           generationError instanceof Error ? generationError.message : String(generationError)
+        if (recommendationTurn && message.startsWith('Generation timed out')) {
+          return await finishRecommendation('', true)
+        }
         if (
           message.startsWith('Generation timed out') &&
           await this.maybeStuckRecovery('generation_timeout', events, hybridStats)
@@ -427,6 +630,38 @@ export class AgentSession {
       if (genResult.tokensIn > 0) {
         this.lastReportedTokens = genResult.tokensIn + genResult.tokensOut
         events.onContext?.(this.lastReportedTokens, contextLimit())
+      }
+      telemetry.tokensIn += genResult.tokensIn
+      telemetry.tokensOut += genResult.tokensOut
+      emitTelemetry('local generation')
+      if (genResult.truncated) {
+        events.onReasoningOutcome?.(false)
+        if (recommendationTurn) {
+          // The capped loop output is only a draft/tool envelope. Never expose
+          // it as a final answer; synthesize afresh with the larger budget.
+          return await finishRecommendation('', true)
+        }
+        truncatedGenerations += 1
+        telemetry.truncationRetries += 1
+        emitTelemetry('truncation retry')
+        if (truncatedGenerations >= 2) {
+          return {
+            ok: false,
+            summary:
+              'Stopped after two output-limit truncations. No partial answer was returned; increase the max-token setting or narrow the request.',
+            hybridStats,
+          }
+        }
+        const assistantTurn: ChatTurn = { role: 'assistant', content: raw.slice(0, 2000) }
+        const retryTurn: ChatTurn = {
+          role: 'user',
+          content:
+            'Your previous JSON envelope hit the output limit and was discarded. Retry concisely with one complete tool call. Do not continue the partial text.',
+        }
+        this.turns.push(assistantTurn, retryTurn)
+        this.cachedTokenEstimate +=
+          Math.ceil((assistantTurn.content.length + retryTurn.content.length) / 4) + 16
+        continue
       }
 
       const parsed = parseToolCall(raw)
@@ -455,6 +690,7 @@ export class AgentSession {
       }
 
       if ('error' in parsed) {
+        events.onReasoningOutcome?.(false)
         consecutiveFailures++
         if (consecutiveFailures >= 3) {
           return {
@@ -473,6 +709,7 @@ export class AgentSession {
         continue
       }
 
+      events.onReasoningOutcome?.(true)
       let call = parsed
       uncertainty.noteToolCall(call)
       this.turns.push({ role: 'assistant', content: JSON.stringify(call) })
@@ -583,6 +820,39 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
         }
         summary = postAgent.summary
 
+        if (
+          call.tool === 'step_complete' &&
+          taskAsksForRecommendations(task) &&
+          summaryMissesRecommendationAsk(task, summary)
+        ) {
+          const userTurn: ChatTurn = {
+            role: 'user',
+            content: toolResultTurn(
+              'step_complete',
+              false,
+              'Refused: empty answer or doc handoff — put substantive improvement advice in summary (the harness will judge depth at finish).',
+            ),
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+          consecutiveFailures++
+          continue
+        }
+        if (call.tool === 'step_complete' && taskNeedsCodebaseExploration(task) && summaryDeflectsToDocs(summary)) {
+          const userTurn: ChatTurn = {
+            role: 'user',
+            content: toolResultTurn(
+              'step_complete',
+              false,
+              'Refused: do not punt to documentation links. Synthesize actionable advice from the files you explored directly in summary.',
+            ),
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+          consecutiveFailures++
+          continue
+        }
+
         // Recommendation asks: LLM-as-judge on the draft; rewrite once if needed.
         // No fixed "4–7 bullets" template — the judge scores substance.
         if (taskAsksForRecommendations(task)) {
@@ -600,38 +870,12 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
             consecutiveFailures++
             continue
           }
-          const notes = this.transcriptTail()
-          events.onGenerating(true)
-          try {
-            summary = await finishRecommendationAnswer(
-              client,
-              task,
-              summary,
-              notes,
-              params,
-              signal,
-              {
-                forceRewrite:
-                  call.tool === 'step_failed' || isObviouslyFailedRecommendationDraft(summary),
-              },
-            )
-          } finally {
-            events.onGenerating(false)
-          }
-          await this.finishWithHybridReview(
-            client,
-            params,
-            signal,
-            events,
-            hybridStats,
-            hybridCtx,
-          )
-          return {
-            ok: true,
+          // The recommendation judge already performs the semantic completion
+          // check. Running localSelfGrade here would add a redundant 70B pass.
+          return await finishRecommendation(
             summary,
-            mutatedFiles: mutatedFiles.length > 0 ? mutatedFiles : undefined,
-            hybridStats,
-          }
+            call.tool === 'step_failed' || isObviouslyFailedRecommendationDraft(summary),
+          )
         }
 
         if (call.tool === 'step_complete' && isLazyStepCompleteSummary(summary)) {
@@ -710,6 +954,7 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
             events,
             hybridStats,
             hybridCtx,
+            budget,
           )
         }
         return { ok, summary, mutatedFiles: mutatedFiles.length > 0 ? mutatedFiles : undefined, hybridStats }
@@ -759,6 +1004,23 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
             hybridStats,
           }
         }
+        continue
+      }
+
+      if (
+        call.tool === 'ask_user_question' &&
+        taskAsksForRecommendations(task) &&
+        isScopeNarrowingQuestion(call.args)
+      ) {
+        this.turns.push({
+          role: 'user',
+          content: toolResultTurn(
+            'ask_user_question',
+            false,
+            'Refused: user asked for broad harness improvement advice. Explore the codebase and step_complete with numbered file-grounded recommendations — do not ask them to narrow scope.',
+          ),
+        })
+        consecutiveFailures++
         continue
       }
 
@@ -814,6 +1076,27 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
         outcome.userSkipped,
       )
       this.turns.push({ role: 'user', content: toolResultTurn(call.tool, outcome.ok, outcome.result) })
+      if (recommendationTurn && outcome.ok && explorationTools.has(call.tool)) {
+        recommendationExplorationCalls += 1
+        const isRead = call.tool === 'read_file'
+        const readPath = String(call.args['path'] ?? '').replaceAll('\\', '/')
+        if (!isRead) {
+          for (const path of extractDiscoveredPaths(outcome.result)) discoveredPaths.add(path)
+        }
+        telemetry.explorationCalls = recommendationExplorationCalls
+        recommendationEvidence.push({
+          source: recommendationEvidenceSource(call),
+          text: outcome.result,
+          quality: isRead ? 'exact-read' : 'discovery',
+          discoveredBeforeRead: isRead
+            ? discoveredPaths.has(readPath) ||
+              [...discoveredPaths].some(
+                (path) => path.endsWith(`/${readPath}`) || readPath.endsWith(`/${path}`),
+              )
+            : undefined,
+        })
+        emitTelemetry('exploration')
+      }
 
       const progressTool =
         call.tool === 'edit_file' ||
@@ -912,9 +1195,11 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     params: GenerationParams,
     events: CompactionEvents,
     signal: AbortSignal,
+    budget?: TurnBudget,
   ): Promise<void> {
     const used = this.estimatedContextTokens()
     if (used < contextLimit() * COMPACT_THRESHOLD) return
+    if (budget && !budget.claimLocalGeneration()) return
     await this.compactNow(client, params, events, signal)
   }
 
@@ -1066,17 +1351,31 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     events: LoopEvents,
     stats: HybridTurnStats,
     hybridCtx?: HybridTurnContext,
+    budget?: TurnBudget,
   ): Promise<void> {
     if (!this.hybridEligibleThisTurn || !this.frontier.enabled()) return
+    if (budget && !budget.claimLocalGeneration()) return
 
-    const grade = await localSelfGrade(client, this.windowedTurns(), params, signal)
+    const grade = await localSelfGrade(
+      client,
+      this.windowedTurns(),
+      params,
+      budget?.signal(signal) ?? signal,
+    )
     if (grade) {
       stats.selfGradeConfidence = grade.confidence
       if (grade.confidence < SELF_GRADE_THRESHOLD) {
         if (this.mutatedThisTurn) {
-          await this.maybeFinalReview(events, stats, hybridCtx)
+          await this.maybeFinalReview(events, stats, hybridCtx, signal, budget)
         } else {
-          await this.consultFrontier('self_grade', events, stats, { selfGrade: grade })
+          await this.consultFrontier(
+            'self_grade',
+            events,
+            stats,
+            { selfGrade: grade },
+            signal,
+            budget,
+          )
         }
       }
       return
@@ -1084,7 +1383,9 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
 
     // If the local model could not produce a grade, only escalate completed
     // workspace changes. Plain answers do not justify a speculative cloud call.
-    if (this.mutatedThisTurn) await this.maybeFinalReview(events, stats, hybridCtx)
+    if (this.mutatedThisTurn) {
+      await this.maybeFinalReview(events, stats, hybridCtx, signal, budget)
+    }
   }
 
   private windowedTurns(): ChatTurn[] {
@@ -1108,6 +1409,8 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
       selfGrade?: { confidence: number; concerns: string }
       uncertainty?: number
     } = {},
+    signal?: AbortSignal,
+    budget?: TurnBudget,
   ): Promise<boolean> {
     events.onHybridChecking(true, checkpoint)
     let note: GuideNote | null = null
@@ -1115,7 +1418,7 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
       note = await this.frontier.consult(checkpoint, {
         transcript: this.transcriptTail(),
         ...extra,
-      })
+      }, signal, budget?.remainingMs())
       if (note) stats.frontierCalls++
     } finally {
       events.onHybridChecking(false, checkpoint)
@@ -1166,6 +1469,8 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     events: LoopEvents,
     stats: HybridTurnStats,
     hybridCtx?: HybridTurnContext,
+    signal?: AbortSignal,
+    budget?: TurnBudget,
   ): Promise<void> {
     if (!this.frontier.enabled()) return
 
@@ -1181,6 +1486,13 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
       }
     }
 
-    await this.consultFrontier('final_review', events, stats, { evidence: evidenceBlock })
+    await this.consultFrontier(
+      'final_review',
+      events,
+      stats,
+      { evidence: evidenceBlock },
+      signal,
+      budget,
+    )
   }
 }
