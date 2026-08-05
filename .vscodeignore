@@ -2,6 +2,7 @@
 .gitignore
 src/**
 scripts/**
+bench/**
 esbuild.mjs
 tsconfig.json
 *.vsix

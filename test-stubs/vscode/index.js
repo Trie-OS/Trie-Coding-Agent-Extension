@@ -34,6 +34,13 @@ export class CancellationTokenSource {
   dispose() {}
 }
 
+export class RelativePattern {
+  constructor(base, pattern) {
+    this.base = base
+    this.pattern = pattern
+  }
+}
+
 export const Uri = {
   file: (fsPath) => ({ fsPath }),
   joinPath: (...parts) => ({ fsPath: String(parts[parts.length - 1]) }),

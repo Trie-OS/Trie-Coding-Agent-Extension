@@ -10,8 +10,10 @@
  * disabled/no-key → silent null, split consult/completion budgets per turn,
  * 3-minute cooldown after a 429.
  */
-import { getActiveFrontierConfig, type FrontierAssistConfig } from '../config'
-import { readAgentBudgets } from './agentBudgets'
+import { getActiveFrontierConfig, type FrontierAssistConfig } from '../config.ts'
+import { readSse } from '../inference/sse.ts'
+import { isOutputTruncatedFinishReason } from '../inference/truncation.ts'
+import { readAgentBudgets } from './agentBudgets.ts'
 
 export type Checkpoint = 'stuck_hint' | 'final_review' | 'uncertainty' | 'self_grade'
 
@@ -33,6 +35,8 @@ export interface FrontierCompletionOptions {
   temperature: number
   signal?: AbortSignal
   timeoutMs?: number
+  /** When set, OpenAI-compatible providers stream answer tokens to the UI. */
+  onToken?: (text: string) => void
 }
 
 export interface FrontierCompletionResult {
@@ -45,6 +49,48 @@ export interface FrontierCompletionResult {
 const RATE_LIMIT_COOLDOWN_MS = 3 * 60 * 1000
 const MAX_CONTEXT_CHARS = 8000
 const REQUEST_TIMEOUT_MS = 30_000
+
+type OpenAiCompatibleFrontierProvider = 'openai' | 'moonshot'
+
+function usesDefaultTemperature(model: string): boolean {
+  return /^(?:gpt-5(?:[.-]|$)|o[134](?:[.-]|$))/i.test(model.trim())
+}
+
+export function buildFrontierChatPayload(
+  provider: OpenAiCompatibleFrontierProvider,
+  model: string,
+  system: string,
+  content: string,
+  options: Pick<FrontierCompletionOptions, 'maxTokens' | 'temperature'>,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    model,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content },
+    ],
+  }
+  if (provider === 'openai') {
+    payload.max_completion_tokens = options.maxTokens
+    if (!usesDefaultTemperature(model)) payload.temperature = options.temperature
+  } else {
+    payload.max_tokens = options.maxTokens
+    payload.temperature = options.temperature
+  }
+  return payload
+}
+
+export function frontierHttpErrorDetail(raw: string): string {
+  let detail = raw
+  try {
+    const parsed = JSON.parse(raw) as { error?: { message?: unknown }; message?: unknown }
+    const candidate = parsed.error?.message ?? parsed.message
+    if (typeof candidate === 'string') detail = candidate
+  } catch {
+    // Plain-text API error; use it as-is.
+  }
+  return detail.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 240)
+}
 
 const SYSTEM = [
   'You are a senior engineer reviewing the work of a smaller local coding model.',
@@ -71,8 +117,11 @@ export class FrontierAssist {
   private completionCallsThisTurn = 0
   private cooldownUntil = 0
   private lastSkipReason: string | undefined
+  private readonly getConfig: () => FrontierAssistConfig
 
-  constructor(private readonly getConfig: () => FrontierAssistConfig) {}
+  constructor(getConfig: () => FrontierAssistConfig) {
+    this.getConfig = getConfig
+  }
 
   resetTurn(): void {
     this.consultCallsThisTurn = 0
@@ -186,6 +235,7 @@ export class FrontierAssist {
       return cfg.provider === 'anthropic'
         ? await this.callAnthropic(cfg.apiKey, cfg.model, system, userContent, options)
         : await this.callOpenAiCompatible(
+            cfg.provider,
             cfg.provider === 'moonshot'
               ? 'https://api.moonshot.ai/v1/chat/completions'
               : 'https://api.openai.com/v1/chat/completions',
@@ -202,6 +252,7 @@ export class FrontierAssist {
   }
 
   private async callOpenAiCompatible(
+    provider: OpenAiCompatibleFrontierProvider,
     url: string,
     apiKey: string,
     model: string,
@@ -215,18 +266,71 @@ export class FrontierAssist {
     const signal = options.signal
       ? AbortSignal.any([options.signal, timeout])
       : timeout
+    const payload = buildFrontierChatPayload(provider, model, system, content, options)
+    if (options.onToken) {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ ...payload, stream: true }),
+        signal,
+      })
+      if (response.status === 429) {
+        this.cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS
+        this.lastSkipReason = 'rate_limited'
+        return null
+      }
+      if (!response.ok) {
+        const detail = frontierHttpErrorDetail(await response.text().catch(() => ''))
+        this.lastSkipReason = `frontier_http_${response.status}${detail ? ` (${detail})` : ''}`
+        return null
+      }
+      let text = ''
+      let finishReason: string | null = null
+      let tokensIn = 0
+      let tokensOut = 0
+      await readSse(
+        response,
+        (data) => {
+          if (data.trim() === '[DONE]') return
+          let chunk: {
+            choices?: Array<{
+              delta?: { content?: string | null }
+              finish_reason?: string | null
+            }>
+            usage?: { prompt_tokens?: number; completion_tokens?: number; output_tokens?: number }
+          }
+          try {
+            chunk = JSON.parse(data)
+          } catch {
+            return
+          }
+          const reason = chunk.choices?.[0]?.finish_reason
+          if (typeof reason === 'string') finishReason = reason
+          const delta = chunk.choices?.[0]?.delta?.content
+          if (typeof delta === 'string' && delta.length > 0) {
+            text += delta
+            options.onToken!(delta)
+          }
+          if (chunk.usage) {
+            tokensIn = chunk.usage.prompt_tokens ?? tokensIn
+            tokensOut = chunk.usage.completion_tokens ?? chunk.usage.output_tokens ?? tokensOut
+          }
+        },
+        signal,
+      )
+      if (!text.trim()) return null
+      return {
+        text,
+        truncated: isOutputTruncatedFinishReason(finishReason),
+        tokensIn,
+        tokensOut,
+      }
+    }
+
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content },
-        ],
-        max_tokens: options.maxTokens,
-        temperature: options.temperature,
-      }),
+      body: JSON.stringify(payload),
       signal,
     })
     if (response.status === 429) {
@@ -234,7 +338,11 @@ export class FrontierAssist {
       this.lastSkipReason = 'rate_limited'
       return null
     }
-    if (!response.ok) return null
+    if (!response.ok) {
+      const detail = frontierHttpErrorDetail(await response.text().catch(() => ''))
+      this.lastSkipReason = `frontier_http_${response.status}${detail ? ` (${detail})` : ''}`
+      return null
+    }
     const data = (await response.json()) as {
       choices?: Array<{
         message?: { content?: string }
@@ -247,7 +355,7 @@ export class FrontierAssist {
     if (typeof text !== 'string') return null
     return {
       text,
-      truncated: choice?.finish_reason === 'length' || choice?.finish_reason === 'max_tokens',
+      truncated: isOutputTruncatedFinishReason(choice?.finish_reason),
       tokensIn: data.usage?.prompt_tokens ?? 0,
       tokensOut: data.usage?.completion_tokens ?? data.usage?.output_tokens ?? 0,
     }
@@ -287,7 +395,10 @@ export class FrontierAssist {
       this.lastSkipReason = 'rate_limited'
       return null
     }
-    if (!response.ok) return null
+    if (!response.ok) {
+      this.lastSkipReason = `frontier_http_${response.status}`
+      return null
+    }
     const data = (await response.json()) as {
       content?: Array<{ type: string; text?: string }>
       stop_reason?: string | null
@@ -295,6 +406,7 @@ export class FrontierAssist {
     }
     const text = data.content?.find((b) => b.type === 'text')?.text
     if (typeof text !== 'string') return null
+    if (options.onToken && text.length > 0) options.onToken(text)
     return {
       text,
       truncated: data.stop_reason === 'max_tokens',

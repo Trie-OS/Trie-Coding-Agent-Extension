@@ -1,6 +1,6 @@
 import * as vscode from 'vscode'
 import { ChatViewProvider } from './chat/ChatViewProvider'
-import { readConfig } from './config'
+import { migrateLegacyAgentBudgetDefaults, readConfig } from './config'
 import { DaemonHost } from './daemon/daemonHost'
 import { runConnectFlow } from './daemon/connectFlow'
 import { runHybridSetup, runWebSearchSetup } from './daemon/hybridSetup'
@@ -11,6 +11,7 @@ import { warmUpSymbolIndex, disposeSymbolIndex } from './agent/symbolIndex'
 let daemonHost: DaemonHost | null = null
 
 export function activate(context: vscode.ExtensionContext): void {
+  void migrateLegacyAgentBudgetDefaults()
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90)
   statusBar.command = 'trie-ide.openChat'
   statusBar.text = '$(sparkle) Trie Coding'

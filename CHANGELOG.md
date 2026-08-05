@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.5.17
+
+- **Question reply styling:** Ask/Plan and recommendation answers no longer render in destructive red when they cite file paths without editing anything; the fake-edit guard now applies only to Code-mode implementation turns.
+
+## 0.5.16
+
+- **Strict API tool errors:** OpenAI-compatible backends that reject native tools now fail immediately with the endpoint error instead of silently retrying with prompt-only JSON envelopes.
+- **Hybrid GPT-5 fix:** frontier OpenAI requests use `max_completion_tokens`, omit unsupported custom temperatures for GPT-5/o-series models, and surface bounded API error text instead of only `frontier_http_400`.
+
+## 0.5.15
+
+- **Native API tool calling:** OpenAI-compatible backends now receive typed native function definitions generated from the same schema as daemon GBNF. Endpoints that reject tools now surface the API error without silently falling back; `/v1` base URLs are normalized without duplication.
+- **Automatic verification and repair:** Code mode automatically selects a safe package check for changed source, runs it through the existing permission boundary, and gives the model exactly one repair attempt before failing loudly.
+- **Reasoning-model action profile:** reasoning-tuned models get shorter-thought instructions, earlier explore/stall nudges, and bounded visible reasoning traces without changing coder-model behavior.
+- **GPT-5 Hybrid compatibility:** OpenAI frontier requests use `max_completion_tokens`, omit unsupported custom temperatures for GPT-5/o-series models, and expose bounded API error details instead of only `frontier_http_400`.
+- **Extension coding smoke:** `npm run bench:coding-smoke` exercises the real extension loop for read/edit and file-creation flows with automatic verification. It is explicitly a deterministic harness smoke suite, not a model-quality benchmark.
+
+## 0.5.14
+
+- **Verification pass:** fixed malformed tool-loop transcript updates left by a partial agent edit; added regression coverage that Code mode stays generation-unlimited regardless of persisted settings.
+
+## 0.5.13
+
+- **No Code generation cap:** Code mode no longer has a local-generation budget at all — only the turn deadline stops a run. The obsolete `modeGenerationsCode` setting is removed on activate.
+
+## 0.5.12
+
+- **Legacy budget migration:** persisted Code generation limits of 16 and tool-call caps of 24 are automatically migrated to unlimited (`0`) on extension activate, and are treated as unlimited at read time until migration runs.
+- **Settings:** Code generations / turn is now editable in Trie Settings (`0` = unlimited).
+- **Clearer stop reasons:** the agent now distinguishes turn deadline expiry from generation budget exhaustion.
+
+## 0.5.11
+
+- **Faster local tool calls:** the daemon now receives mode-aware per-tool GBNF, constraining tool names and typed arguments instead of accepting any JSON object.
+- **Batched exploration:** new `read_files` reads up to eight related files in one model round-trip while preserving a bounded shared result budget.
+- **Cheaper context management:** old tool results compact locally first; LLM-based Vibe compaction remains the fallback and has a separate budget.
+- **Explore-to-edit bias:** Code mode prompts the model to implement once it has enough context, retries premature ambiguity-based failures, and nudges excessive exploration toward a concrete edit.
+- **Unblocked Code turns:** `0` now means unlimited Code generations and tool calls, while the end-to-end deadline remains the safety bound.
+- **Non-blocking Hybrid recovery:** slow stuck hints overlap local generation and are inserted at the next safe loop boundary.
+
+## 0.5.10
+
+- **Reliable file creation:** `write_file` no longer fails with `ENOENT` on new paths; missing nested directories resolve to the correct target instead of collapsing to the workspace root.
+- **Clearer edit errors:** `edit_file` on a missing file tells the model to use `write_file` or confirm the path first.
+- **Thought accordion:** reasoning streams live with a thought icon and preview text; duplicate consecutive thoughts are suppressed.
+- **Mode chip colors:** Ask chip is green; Plan chip is yellow.
+
+## 0.5.9
+
+- **Streaming final answers:** synthesis and rewrite tokens stream into the chat as they arrive instead of appearing all at once when the turn finishes.
+- **Composer mode picker:** Plan, Ask, and Multitask toggle off on re-select; checkmarks update immediately while the menu stays open.
+- **Plan/Ask chips:** selecting Plan or Ask shows a dismissible chip beside the + button (× returns to Code mode), matching Multitask.
+
+## 0.5.8
+
+- **Fixed empty answers:** terminal `step_complete` summaries wrapped in provider tool JSON are unwrapped before display; internal envelopes are refused instead of rendering as blank replies.
+- **Errors over fallbacks:** recommendation synthesis failures throw explicit errors; empty successful replies are flagged failed; the webview shows error text instead of generic “try again” placeholders.
+- **Safer error surfacing:** shared `sanitizeUserError` redacts credentials/tokens in user-facing messages; compaction, checkpoint, restore, and missing-backend failures post to chat; question timeouts are distinct from user cancel; Hybrid HTTP failures record status for synthesis diagnostics.
+
+## 0.5.7
+
+- **No raw tool JSON in chat:** streaming no longer leaks `{ "thought", "tool", "args" }` envelopes into the thought panel or final reply; internal monologue is never promoted to the answer.
+- **Removed live telemetry bar:** the synthesis/local/judge status strip is gone from the chat header.
+- **Better recommendation failures:** Hybrid provider errors fall back to evidence-grounded local synthesis instead of dead-end error text.
+
+## 0.5.6
+
+- **Theme-aware diagnostics:** version and live turn telemetry now use VS Code theme foreground tokens with contrast-safe fallbacks.
+- **Resilient Hybrid recommendations:** a failed or truncated frontier synthesis now falls back to an evidence-grounded local synthesis, except after an explicit cancellation, deadline expiry, or exhausted local-generation budget.
+
 ## 0.5.5
 
 - **Trust boundaries:** workspace paths are canonicalized before I/O; repo-owned permission/hook files are restrictive-only; user grants persist outside the repository; broad wildcard approvals are rejected; `run_verification` requires explicit approval and confirmed skip reasons.

@@ -2,6 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   collectPreviousUserTasks,
+  compactOldToolResults,
   dropOldestRound,
   extractSummary,
   isUserTaskTurn,
@@ -62,5 +63,21 @@ describe('compaction helpers', () => {
     assert.match(text, /Memory compacted/)
     assert.match(text, /Task: ship it/)
     assert.match(text, /Did the thing/)
+  })
+
+  it('compacts oldest tool results without a model call and keeps four recent results', () => {
+    const messages: ChatTurn[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'Task: inspect' },
+      ...Array.from({ length: 6 }, (_, index) => [
+        { role: 'assistant', content: `{"tool":"read_file","args":{"path":"${index}.ts"}}` },
+        { role: 'user', content: `Result of read_file:\n${'x'.repeat(1000)}` },
+      ]).flat() as ChatTurn[],
+    ]
+    const result = compactOldToolResults(messages, 500)
+    assert.equal(result.compactedResults, 2)
+    assert.match(result.turns[3]!.content, /old tool result compacted/)
+    assert.doesNotMatch(result.turns.at(-1)!.content, /old tool result compacted/)
+    assert.ok(result.savedTokens > 0)
   })
 })

@@ -35,9 +35,20 @@ export class QuestionBroker {
   async ask(questions: UserQuestionPayload[]): Promise<QuestionAnswer[] | null> {
     if (!this.handler) return null
     const requestId = crypto.randomUUID()
-    const timeout = new Promise<null>((resolve) => {
-      setTimeout(() => resolve(null), QUESTION_TIMEOUT_MS)
+    return new Promise<QuestionAnswer[] | null>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error('Question request timed out after 5 minutes without an answer.'))
+      }, QUESTION_TIMEOUT_MS)
+      this.handler!(requestId, questions).then(
+        (answers) => {
+          clearTimeout(timer)
+          resolve(answers)
+        },
+        (error) => {
+          clearTimeout(timer)
+          reject(error)
+        },
+      )
     })
-    return Promise.race([this.handler(requestId, questions), timeout])
   }
 }

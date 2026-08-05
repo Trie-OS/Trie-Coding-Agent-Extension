@@ -1,5 +1,9 @@
 "use strict";
 (() => {
+  var __defProp = Object.defineProperty;
+  var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+  var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+
   // node_modules/lucide/dist/esm/defaultAttributes.js
   var defaultAttributes = {
     xmlns: "http://www.w3.org/2000/svg",
@@ -52,6 +56,25 @@
     ["path", { d: "M9 13v2" }]
   ];
 
+  // node_modules/lucide/dist/esm/icons/brain.js
+  var Brain = [
+    [
+      "path",
+      { d: "M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" }
+    ],
+    [
+      "path",
+      { d: "M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" }
+    ],
+    ["path", { d: "M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" }],
+    ["path", { d: "M17.599 6.5a3 3 0 0 0 .399-1.375" }],
+    ["path", { d: "M6.003 5.125A3 3 0 0 0 6.401 6.5" }],
+    ["path", { d: "M3.477 10.896a4 4 0 0 1 .585-.396" }],
+    ["path", { d: "M19.938 10.5a4 4 0 0 1 .585.396" }],
+    ["path", { d: "M6 18a4 4 0 0 1-1.967-.516" }],
+    ["path", { d: "M19.967 17.484A4 4 0 0 1 18 18" }]
+  ];
+
   // node_modules/lucide/dist/esm/icons/list-checks.js
   var ListChecks = [
     ["path", { d: "m3 17 2 2 4-4" }],
@@ -79,6 +102,117 @@
     return s;
   }
 
+  // src/agent/thoughtStream.ts
+  var ThoughtStreamParser = class {
+    constructor() {
+      __publicField(this, "buffer", "");
+      __publicField(this, "emitted", 0);
+    }
+    push(chunk) {
+      if (!chunk) return "";
+      this.buffer += chunk;
+      const thought = extractPartialThoughtField(this.buffer);
+      if (thought.length <= this.emitted) return "";
+      const delta = thought.slice(this.emitted);
+      this.emitted = thought.length;
+      return delta;
+    }
+    finalThought() {
+      return extractPartialThoughtField(this.buffer);
+    }
+    reset() {
+      this.buffer = "";
+      this.emitted = 0;
+    }
+    /** True when buffered output looks like a JSON tool-call envelope. */
+    inToolEnvelope() {
+      const buffer = this.buffer;
+      return buffer.includes("{") || /"thought"\s*:/.test(buffer) || /"tool"\s*:/.test(buffer) || /"args"\s*:/.test(buffer);
+    }
+  };
+  function isToolCallEnvelope(text) {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("{")) return false;
+    return /"tool"\s*:/.test(trimmed) && /"args"\s*:/.test(trimmed);
+  }
+  function sanitizeThoughtDisplay(text) {
+    const trimmed = text.trim();
+    if (!trimmed) return "";
+    const fromPartial = extractPartialThoughtField(trimmed);
+    if (fromPartial.trim()) return fromPartial.trim();
+    if (isToolCallEnvelope(trimmed)) return "";
+    if (!trimmed.startsWith("{")) return trimmed;
+    const start = trimmed.indexOf("{");
+    const end = trimmed.lastIndexOf("}");
+    if (start === -1 || end <= start) return trimmed;
+    try {
+      const parsed = JSON.parse(trimmed.slice(start, end + 1));
+      if (typeof parsed["thought"] === "string" && parsed["thought"].trim()) {
+        return parsed["thought"].trim();
+      }
+    } catch {
+    }
+    return isToolCallEnvelope(trimmed) ? "" : trimmed;
+  }
+  function terminalReplyFromEnvelope(value, depth) {
+    if (depth > 3) return "";
+    const tool = typeof value["tool"] === "string" ? value["tool"] : "";
+    const args = typeof value["args"] === "object" && value["args"] !== null && !Array.isArray(value["args"]) ? value["args"] : null;
+    if (!args) return "";
+    if (tool === "step_complete" && typeof args["summary"] === "string") {
+      return sanitizeReplyText(args["summary"], depth + 1);
+    }
+    if (tool === "step_failed" && typeof args["reason"] === "string") {
+      return sanitizeReplyText(args["reason"], depth + 1);
+    }
+    if (typeof args["tool"] === "string" && typeof args["args"] === "object") {
+      return terminalReplyFromEnvelope(args, depth + 1);
+    }
+    return "";
+  }
+  function sanitizeReplyText(text, depth = 0) {
+    const trimmed = text.trim();
+    if (!trimmed) return "";
+    if (!trimmed.startsWith("{")) return trimmed;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        const envelope = parsed;
+        if (typeof envelope["tool"] === "string") {
+          return terminalReplyFromEnvelope(envelope, depth);
+        }
+      }
+    } catch {
+    }
+    if (/"tool"\s*:/.test(trimmed)) return "";
+    return trimmed;
+  }
+  function extractPartialThoughtField(text) {
+    const match = text.match(/"thought"\s*:\s*"/);
+    if (!match || match.index === void 0) return "";
+    let i = match.index + match[0].length;
+    let result = "";
+    let escaped = false;
+    while (i < text.length) {
+      const ch = text[i];
+      if (escaped) {
+        if (ch === "n") result += "\n";
+        else if (ch === "t") result += "	";
+        else if (ch === "r") result += "\r";
+        else result += ch;
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        break;
+      } else {
+        result += ch;
+      }
+      i++;
+    }
+    return result;
+  }
+
   // media/src/main.ts
   var MODE_ICONS = {
     code: Bot,
@@ -101,7 +235,6 @@
     const composerChips = document.getElementById("composer-chips");
     const backendChip = document.getElementById("backend-chip");
     const versionLabel = document.getElementById("version-label");
-    const turnTelemetry = document.getElementById("turn-telemetry");
     const hybridChip = document.getElementById("hybrid-chip");
     const hybridMenu = document.getElementById("hybrid-menu");
     const hybridMenuEnabled = document.getElementById("hybrid-menu-enabled");
@@ -125,6 +258,7 @@
     let currentMode = "code";
     const EXPLORE_TOOLS = /* @__PURE__ */ new Set([
       "read_file",
+      "read_files",
       "list_dir",
       "glob",
       "grep",
@@ -196,6 +330,36 @@
     let liveReasoningEl = null;
     let liveReasoningBodyEl = null;
     let hadLiveReasoningThisStep = false;
+    let lastThoughtFingerprint = "";
+    let reasoningStream = new ThoughtStreamParser();
+    let liveReplyEl = null;
+    let liveReplyBodyEl = null;
+    function thoughtPreview(text, max = 92) {
+      const oneLine = text.replace(/\s+/g, " ").trim();
+      if (!oneLine) return "";
+      return oneLine.length <= max ? oneLine : oneLine.slice(0, max - 1) + "\u2026";
+    }
+    function setThoughtSummary(summary, text, sinceMs, live) {
+      const preview = thoughtPreview(text);
+      const lead = live ? "Thinking" : sinceMs >= 800 ? `Thought for ${formatElapsed(sinceMs)}` : "Thought";
+      summary.replaceChildren();
+      summary.appendChild(
+        createElement(Brain, {
+          class: "acc-thought-icon",
+          width: 12,
+          height: 12,
+          "stroke-width": 1.8,
+          "aria-hidden": "true"
+        })
+      );
+      const label = document.createElement("span");
+      label.className = "acc-thought-label";
+      label.textContent = preview ? `${lead}: ${preview}` : live ? "Thinking\u2026" : lead;
+      summary.appendChild(label);
+    }
+    function resetReasoningStream() {
+      reasoningStream.reset();
+    }
     function ensureLiveReasoning() {
       if (liveReasoningEl && liveReasoningBodyEl) return liveReasoningBodyEl;
       const details = document.createElement("details");
@@ -203,7 +367,7 @@
       details.open = true;
       const summary = document.createElement("summary");
       summary.className = "acc-thought-summary";
-      summary.textContent = "Thinking\u2026";
+      setThoughtSummary(summary, "", 0, true);
       const body = document.createElement("div");
       body.className = "acc-thought live-reasoning";
       details.append(summary, body);
@@ -215,39 +379,103 @@
     }
     function appendLiveReasoning(chunk) {
       if (!chunk) return;
+      let delta = reasoningStream.push(chunk);
+      if (!delta) {
+        if (reasoningStream.inToolEnvelope()) return;
+        const trimmed = chunk.trimStart();
+        if (trimmed && !trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+          delta = chunk;
+        } else {
+          return;
+        }
+      }
       hadLiveReasoningThisStep = true;
       const body = ensureLiveReasoning();
-      body.textContent = (body.textContent ?? "") + chunk;
+      const nextText = (body.textContent ?? "") + delta;
+      body.textContent = nextText;
+      const summary = liveReasoningEl?.querySelector(".acc-thought-summary");
+      if (summary) setThoughtSummary(summary, nextText, 0, true);
       scrollDown();
     }
     function settleLiveReasoning(finalText) {
-      if (!liveReasoningEl) return;
-      const text = (finalText ?? liveReasoningBodyEl?.textContent ?? "").trim();
+      if (!liveReasoningEl) {
+        resetReasoningStream();
+        return;
+      }
+      const text = sanitizeThoughtDisplay(finalText ?? liveReasoningBodyEl?.textContent ?? "").trim();
       if (!text) {
         liveReasoningEl.remove();
         liveReasoningEl = null;
         liveReasoningBodyEl = null;
+        resetReasoningStream();
         return;
       }
       if (liveReasoningBodyEl) liveReasoningBodyEl.textContent = text;
       liveReasoningEl.classList.remove("live");
       liveReasoningEl.open = false;
       const summary = liveReasoningEl.querySelector(".acc-thought-summary");
-      if (summary) summary.textContent = "Thought";
+      if (summary) setThoughtSummary(summary, text, 0, false);
+      lastThoughtFingerprint = text.replace(/\s+/g, " ").trim();
       liveReasoningEl = null;
       liveReasoningBodyEl = null;
+      resetReasoningStream();
     }
     function discardLiveReasoning() {
       liveReasoningEl?.remove();
       liveReasoningEl = null;
       liveReasoningBodyEl = null;
       hadLiveReasoningThisStep = false;
+      resetReasoningStream();
     }
     function renderPersistedThought(text) {
-      if (!text.trim()) return;
+      const cleaned = sanitizeThoughtDisplay(text);
+      if (!cleaned.trim()) return;
       const session = ensureTurnSession();
       const group = session.activeGroup ?? ensureAccordionGroup("explore", "Explored");
-      addThoughtRow(group, text, 0);
+      addThoughtRow(group, cleaned, 0);
+    }
+    function ensureLiveReply() {
+      if (liveReplyEl && liveReplyBodyEl) return liveReplyBodyEl;
+      const el = document.createElement("div");
+      el.className = "reply live";
+      const body = document.createElement("div");
+      body.className = "reply-live-body";
+      el.appendChild(body);
+      messagesEl.appendChild(el);
+      liveReplyEl = el;
+      liveReplyBodyEl = body;
+      scrollDown();
+      return body;
+    }
+    function appendLiveReply(chunk) {
+      if (!chunk) return;
+      const body = ensureLiveReply();
+      body.textContent = (body.textContent ?? "") + chunk;
+      scrollDown();
+    }
+    function settleLiveReply(text, failed = false) {
+      const display = cleanReplyText(text).trim();
+      const emptyReplyError = "Error: the extension host returned an empty or invalid reply.";
+      const replyFailed = failed || !display;
+      const el = liveReplyEl ?? document.createElement("div");
+      if (!liveReplyEl) {
+        el.className = "reply" + (replyFailed ? " failed" : "");
+        messagesEl.appendChild(el);
+      } else {
+        el.classList.remove("live");
+        if (replyFailed) el.classList.add("failed");
+      }
+      el.replaceChildren();
+      el.appendChild(formatReplyMarkdown(display || emptyReplyError));
+      liveReplyEl = null;
+      liveReplyBodyEl = null;
+      scrollDown();
+      return el;
+    }
+    function discardLiveReply() {
+      liveReplyEl?.remove();
+      liveReplyEl = null;
+      liveReplyBodyEl = null;
     }
     function turnSummaryText(session, finished) {
       const parts = [];
@@ -366,11 +594,14 @@
     }
     function addThoughtRow(group, thought, sinceMs) {
       if (!thought || !thought.trim()) return;
+      const fingerprint = thought.replace(/\s+/g, " ").trim();
+      if (!fingerprint || fingerprint === lastThoughtFingerprint) return;
+      lastThoughtFingerprint = fingerprint;
       const details = document.createElement("details");
       details.className = "acc-thought-block";
       const summary = document.createElement("summary");
       summary.className = "acc-thought-summary";
-      summary.textContent = sinceMs >= 800 ? "Thought for " + formatElapsed(sinceMs) : "Thought";
+      setThoughtSummary(summary, thought, sinceMs, false);
       const body = document.createElement("div");
       body.className = "acc-thought";
       body.textContent = thought;
@@ -472,6 +703,11 @@
       } else if (isExploreTool(msg.tool)) {
         session.exploredActions += 1;
         if (msg.tool === "read_file" && msg.args) session.exploredFiles.add(msg.args);
+        if (msg.tool === "read_files" && msg.args) {
+          for (const file of msg.args.split(",").map((item) => item.trim()).filter(Boolean)) {
+            session.exploredFiles.add(file);
+          }
+        }
         group = ensureAccordionGroup("explore", "explore");
       } else if (msg.tool === "run_command") {
         session.commandCount += 1;
@@ -548,12 +784,14 @@
       session.el.open = false;
       if (!turnSessionHasVisibleActivity(session)) session.el.remove();
       turnSession = null;
+      lastThoughtFingerprint = "";
       todoCard = null;
       todoCardSeen = false;
       closeActiveGroup();
     }
     function resetTurnSession() {
       turnSession = null;
+      lastThoughtFingerprint = "";
       todoCard = null;
       todoCardSeen = false;
       closeActiveGroup();
@@ -1417,10 +1655,16 @@
       }
       return fragment;
     }
+    function cleanReplyText(text) {
+      return sanitizeReplyText(text);
+    }
     function addReply(text, failed = false) {
+      const display = cleanReplyText(text).trim();
+      const emptyReplyError = "Error: the extension host returned an empty or invalid reply.";
+      const replyFailed = failed || !display;
       const el = document.createElement("div");
-      el.className = "reply" + (failed ? " failed" : "");
-      el.appendChild(formatReplyMarkdown(text));
+      el.className = "reply" + (replyFailed ? " failed" : "");
+      el.appendChild(formatReplyMarkdown(display || emptyReplyError));
       messagesEl.appendChild(el);
       scrollDown();
       return el;
@@ -1575,11 +1819,6 @@
     function setMode(mode) {
       if (mode !== "code" && multitaskMode) disableMultitask();
       currentMode = mode;
-      for (const btn of modeButtons) {
-        const active = btn.dataset.mode === mode;
-        btn.classList.toggle("active", active);
-        btn.setAttribute("aria-pressed", String(active));
-      }
       renderActiveModeChip();
       renderPlusMenu();
       updateComposerPlaceholder();
@@ -1590,7 +1829,7 @@
       if (currentMode === "code") return;
       const label = currentMode === "plan" ? "Plan" : "Ask";
       const chip = document.createElement("span");
-      chip.className = "composer-mode-chip";
+      chip.className = `composer-mode-chip ${currentMode}`;
       chip.title = currentMode === "plan" ? "Read-only exploration that returns a plan" : "Ask a read-only question about the codebase";
       const icon = createElement(MODE_ICONS[currentMode], {
         width: 11,
@@ -2076,10 +2315,12 @@
           else enableMultitask();
         } else if (pick === "attach-image") {
           imageFileInputEl.click();
+          closePlusMenu();
+          return;
         } else if (pick && pick in MODE_ICONS) {
-          setMode(pick);
+          const mode = pick;
+          setMode(currentMode === mode ? "code" : mode);
         }
-        closePlusMenu();
       });
     }
     document.addEventListener("click", () => closePlusMenu());
@@ -2285,6 +2526,8 @@
       liveReasoningEl = null;
       liveReasoningBodyEl = null;
       hadLiveReasoningThisStep = false;
+      resetReasoningStream();
+      discardLiveReply();
       hideSpinner();
       backgroundWorkEl = null;
     }
@@ -2323,22 +2566,6 @@
             hideWelcome();
             showSpinner();
           }
-          break;
-        }
-        case "telemetry": {
-          const t = msg.telemetry;
-          if (!t) break;
-          turnTelemetry.hidden = false;
-          turnTelemetry.textContent = [
-            t.phase,
-            `local ${t.localGenerations} \xB7 ${(Number(t.localGenerationMs ?? 0) / 1e3).toFixed(1)}s`,
-            `explore ${t.explorationCalls}`,
-            `judge ${(Number(t.judgeMs ?? 0) / 1e3).toFixed(1)}s`,
-            `synth ${(Number(t.synthesisMs ?? 0) / 1e3).toFixed(1)}s`,
-            `tokens ${t.tokensIn}/${t.tokensOut}`,
-            `retries ${t.truncationRetries}`,
-            `${Math.ceil(Number(t.deadlineRemainingMs ?? 0) / 1e3)}s left`
-          ].join("  \u2022  ");
           break;
         }
         case "multitask-list": {
@@ -2415,6 +2642,15 @@
               settleLiveReasoning();
             }
           }
+          break;
+        }
+        case "reply": {
+          if (msg.discard) {
+            discardLiveReply();
+            break;
+          }
+          if (msg.start) ensureLiveReply();
+          if (typeof msg.chunk === "string" && msg.chunk) appendLiveReply(msg.chunk);
           break;
         }
         case "todos": {
@@ -2518,7 +2754,11 @@
           settleLiveReasoning();
           hideSpinner();
           finishTurnSession();
-          addReply(msg.text, !msg.ok);
+          if (liveReplyEl) {
+            settleLiveReply(msg.text, !msg.ok);
+          } else {
+            addReply(msg.text, !msg.ok);
+          }
           if (msg.checkpoint) setComposerUndo(msg.checkpoint);
           if (msg.checkpoint) {
             const row = document.createElement("div");
@@ -2555,6 +2795,8 @@
           break;
         }
         case "error": {
+          settleLiveReasoning();
+          discardLiveReply();
           hideSpinner();
           finishTurnSession();
           addBubble("error", msg.text);
@@ -2628,6 +2870,7 @@ lucide/dist/esm/defaultAttributes.js:
 lucide/dist/esm/createElement.js:
 lucide/dist/esm/icons/arrow-right.js:
 lucide/dist/esm/icons/bot.js:
+lucide/dist/esm/icons/brain.js:
 lucide/dist/esm/icons/list-checks.js:
 lucide/dist/esm/icons/message-circle-question.js:
 lucide/dist/esm/lucide.js:

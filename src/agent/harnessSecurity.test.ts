@@ -23,6 +23,20 @@ describe('pathContainment', () => {
       fs.rmSync(outside, { recursive: true, force: true })
     }
   })
+
+  it('allows missing in-workspace targets when allowMissing is true', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'trie-path-missing-'))
+    try {
+      const resolved = await assertContainedInWorkspace(root, 'docs/new-file.md', {
+        allowMissing: true,
+      })
+      const realRoot = await fs.promises.realpath(root).catch(() => root)
+      const rel = path.relative(realRoot, resolved).split(path.sep).join('/')
+      assert.equal(rel, 'docs/new-file.md')
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('checkpoints snapshot', () => {

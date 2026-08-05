@@ -18,6 +18,7 @@ import type { ChangedFileStat } from './checkpoints'
 import {
   collectPreviousUserTasks,
   COMPACTION_SUMMARY_PROMPT,
+  compactOldToolResults,
   dropOldestRound,
   estimateTokens,
   extractSummary,
@@ -42,6 +43,7 @@ import { QuestionBroker } from './questionBroker'
 import {
   agentSystemPrompt,
   agentUserPrompt,
+  availableToolSpecs,
   buildTaskNotes,
   isPlanAllowedMutatingTool,
   isReadOnlyMode,
@@ -49,12 +51,14 @@ import {
   toolResultTurn,
   type AgentMode,
 } from './prompts'
+import { compileOpenAiTools, compileToolGrammar } from './toolGrammar'
 import {
   buildWebSearchQuery,
   taskNeedsWebSearch,
 } from './webSearchIntent'
 import {
   isLazyStepCompleteSummary,
+  isPrematureStepFailedReason,
   isTrivialConversation,
   NewFeatureDiscoveryGuard,
   StuckRecoveryGate,
@@ -75,8 +79,19 @@ import {
   recommendationGenerationTimeout,
 } from './recommendationBudget'
 import { TurnBudget } from './turnBudget'
-import { ThoughtStreamParser } from './thoughtStream'
+import {
+  ThoughtStreamParser,
+  sanitizeReplyText,
+  sanitizeThoughtDisplay,
+} from './thoughtStream'
 import { VerificationTracker, verificationPolicy } from './verificationPolicy'
+import {
+  capReasoningChunk,
+  explorationNudgeLimit,
+  isReasoningModel,
+  stallNudgeLimit,
+} from './modelBehavior'
+import { AutomaticRepairGate, detectAutomaticVerifications } from './automaticVerification'
 import type { MultitaskBus } from './multitaskBus'
 import {
   parseToolCall,
@@ -103,6 +118,9 @@ export interface LoopEvents {
   onReasoningChunk?(text: string): void
   onReasoningDone?(text?: string): void
   onReasoningOutcome?(accepted: boolean): void
+  onReplyStart?(): void
+  onReplyChunk?(text: string): void
+  onReplyDiscard?(): void
   onToolCall(id: number, call: ToolCall, argsSummary: string): void
   onToolResult(
     id: number,
@@ -187,8 +205,8 @@ const MAX_HISTORY_TURNS = 40
 const GENERATION_TIMEOUT_MS = 3 * 60 * 1000
 /** Compact memory when the estimated context passes this share of the window. */
 const COMPACT_THRESHOLD = 0.75
-const STALL_GUARD_CALLS = 6
 const STALL_GUARD_MAX_NUDGES = 2
+const STUCK_HINT_WAIT_MS = 250
 const RECOMMENDATION_EVIDENCE_MAX_CHARS = 12_000
 
 interface RecommendationEvidence {
@@ -207,6 +225,8 @@ function recommendationEvidenceSource(call: ToolCall): string {
           ? ` L${String(args['startLine'] ?? 1)}-${String(args['endLine'] ?? 'end')}`
           : ''
       }`
+    case 'read_files':
+      return `read_files ${Array.isArray(args['paths']) ? args['paths'].join(', ') : ''}`
     case 'grep':
       return `grep /${String(args['pattern'] ?? '')}/ ${String(args['glob'] ?? '')}`.trim()
     case 'search_symbols':
@@ -435,12 +455,23 @@ export class AgentSession {
     // Route the prompt up front (web search, recommendations, …) so the model
     // handles the ask correctly on the first pass — not via post-hoc correction.
     const taskNotes = buildTaskNotes(task, mode)
-    const promptOptions = { multitask: !!this.multitask }
+    const reasoningModel = isReasoningModel(client.describe())
+    const promptOptions = { multitask: !!this.multitask, reasoningModel }
+    const codeExplorationNudgeCalls = explorationNudgeLimit(reasoningModel)
+    const stallGuardCalls = stallNudgeLimit(reasoningModel)
     // Tool-loop envelopes are short. A lower cap prevents malformed local
     // recommendation turns from spending the full 2k-token answer budget.
+    const availableTools = availableToolSpecs(mode, promptOptions)
+    const toolGrammar = compileToolGrammar(availableTools)
+    const nativeTools = compileOpenAiTools(availableTools)
     const loopParams = taskAsksForRecommendations(task)
-      ? { ...params, maxTokens: Math.min(params.maxTokens, 768) }
-      : params
+      ? {
+          ...params,
+          maxTokens: Math.min(params.maxTokens, 768),
+          grammar: toolGrammar,
+          nativeTools,
+        }
+      : { ...params, grammar: toolGrammar, nativeTools }
 
     if (!this.started) {
       const workspaceContext = buildWorkspaceContext(this.root, this.workspaceName)
@@ -476,6 +507,7 @@ export class AgentSession {
     const featureDiscovery = new NewFeatureDiscoveryGuard(task)
     const explorationTools = new Set([
       'read_file',
+      'read_files',
       'list_dir',
       'glob',
       'grep',
@@ -490,6 +522,11 @@ export class AgentSession {
     const mutatedFiles: ChangedFileStat[] = []
     const verification = new VerificationTracker()
     let recommendationExplorationCalls = 0
+    let codeExplorationCalls = 0
+    let codeExplorationNudged = false
+    let retriedPrematureStepFailure = false
+    const automaticRepair = new AutomaticRepairGate()
+    let pendingStuckHint: string | null = null
     let truncatedGenerations = 0
     let compactionGenerations = 0
     const recommendationEvidence: RecommendationEvidence[] = []
@@ -520,6 +557,9 @@ export class AgentSession {
       events.onTelemetry?.({ ...telemetry })
     }
     emitTelemetry('starting')
+    const deferStuckHint = (text: string): void => {
+      pendingStuckHint = text
+    }
 
     const finishRecommendation = async (
       draft: string,
@@ -547,6 +587,9 @@ export class AgentSession {
               telemetry.tokensOut += tokensOut
               emitTelemetry(phase)
             },
+            onReplyStart: events.onReplyStart,
+            onReplyChunk: events.onReplyChunk,
+            onReplyDiscard: events.onReplyDiscard,
           },
         )
         return {
@@ -560,7 +603,8 @@ export class AgentSession {
       }
     }
 
-    for (let i = 0; i < maxCalls; i++) {
+    const toolCallLimit = maxCalls === 0 ? Number.POSITIVE_INFINITY : Math.max(1, maxCalls)
+    for (let i = 0; i < toolCallLimit; i++) {
       if (signal.aborted) return { ok: false, summary: 'Stopped.', hybridStats }
       if (budget.expired()) {
         return {
@@ -568,6 +612,15 @@ export class AgentSession {
           summary: 'Stopped: the end-to-end turn deadline was reached.',
           hybridStats,
         }
+      }
+      if (pendingStuckHint) {
+        const guideContent = `Guide note from a senior reviewer (advisory): ${pendingStuckHint}`
+        this.turns.push({
+          role: 'user',
+          content: guideContent,
+        })
+        this.cachedTokenEstimate += Math.ceil(guideContent.length / 4) + 8
+        pendingStuckHint = null
       }
 
       const recommendationElapsed = budget.elapsedMs()
@@ -594,9 +647,20 @@ export class AgentSession {
 
       if (!budget.claimLocalGeneration()) {
         if (recommendationTurn) return await finishRecommendation('', true)
+        if (budget.expired() || mode === 'code') {
+          return {
+            ok: false,
+            summary:
+              `Stopped: the ${mode} mode turn deadline was reached (${Math.round(budget.elapsedMs() / 1000)}s). ` +
+              `Raise trie-ide.agent.budgets.modeDeadline${mode === 'code' ? 'Code' : mode === 'plan' ? 'Plan' : 'Ask'}Ms in Settings, or send a narrower follow-up.`,
+            hybridStats,
+          }
+        }
         return {
           ok: false,
-          summary: `Stopped: the ${mode} mode local-generation budget (${budget.maxLocalGenerations}) was reached.`,
+          summary:
+            `Stopped: the ${mode} mode local-generation budget (${budget.maxLocalGenerations}) was reached. ` +
+            'Each model reply in the tool loop counts as one generation. Send a narrower follow-up or switch to Code mode.',
           hybridStats,
         }
       }
@@ -608,6 +672,7 @@ export class AgentSession {
       let genResult: Awaited<ReturnType<InferenceClient['generate']>> | undefined
       let generationError: unknown
       const thoughtStream = new ThoughtStreamParser()
+      let visibleReasoningChars = 0
       try {
         genResult = await generateWithTimeout(
           client,
@@ -616,7 +681,22 @@ export class AgentSession {
           (token) => {
             if (!token) return
             const delta = thoughtStream.push(token)
-            if (delta) events.onReasoningChunk?.(delta)
+            if (delta) {
+              events.onReasoningChunk?.(delta)
+              return
+            }
+            // Reasoning traces (e.g. reasoning_content) are plain text — never stream
+            // JSON envelope syntax (`"tool":`, commas, braces) into the thought panel.
+            if (!thoughtStream.inToolEnvelope()) {
+              const trimmed = token.trimStart()
+              if (trimmed && !trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+                const visible = capReasoningChunk(token, visibleReasoningChars, reasoningModel)
+                if (visible) {
+                  visibleReasoningChars += visible.length
+                  events.onReasoningChunk?.(visible)
+                }
+              }
+            }
           },
           budget.signal(signal),
           recommendationTurn
@@ -635,7 +715,7 @@ export class AgentSession {
       } finally {
         telemetry.localGenerationMs += Date.now() - localGenerationStartedAt
         events.onGenerating(false)
-        const finalThought = thoughtStream.finalThought().trim()
+        const finalThought = sanitizeThoughtDisplay(thoughtStream.finalThought()).trim()
         events.onReasoningDone?.(finalThought || undefined)
         thoughtStream.reset()
       }
@@ -735,7 +815,12 @@ export class AgentSession {
             hybridStats,
           }
         }
-        await this.maybeStuckHint(consecutiveFailures, events, hybridStats)
+        await this.maybeStuckHint(
+          consecutiveFailures,
+          events,
+          hybridStats,
+          deferStuckHint,
+        )
         const assistantTurn: ChatTurn = { role: 'assistant', content: raw.slice(0, 2000) };
         this.turns.push(assistantTurn);
         this.cachedTokenEstimate += Math.ceil(assistantTurn.content.length / 4) + 8;
@@ -813,9 +898,9 @@ export class AgentSession {
               false,
               'Refused: this task needs web_search first. Call web_search with a focused query, then step_complete with titles and full URLs from the results.',
             ),
-          };
-this.turns.push(userTurn);
-this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
           consecutiveFailures++
           continue
         }
@@ -832,17 +917,65 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
               false,
               'Refused: this task requires file edits but edit_file/write_file has not succeeded yet. Make the changes, then call step_complete — do not claim changes in summary without a successful edit.',
             ),
-          };
-this.turns.push(userTurn);
-this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
           consecutiveFailures++
           continue
         }
         const ok = call.tool === 'step_complete'
-        let summary =
-          (typeof call.args['summary'] === 'string' && (call.args['summary'] as string)) ||
-          (typeof call.args['reason'] === 'string' && (call.args['reason'] as string)) ||
-          (ok ? 'Done.' : 'Failed.')
+        const resultKey = ok ? 'summary' : 'reason'
+        const resultValue = call.args[resultKey]
+        if (typeof resultValue !== 'string' || !resultValue.trim()) {
+          const userTurn: ChatTurn = {
+            role: 'user',
+            content: toolResultTurn(
+              call.tool,
+              false,
+              `Refused: ${call.tool}.${resultKey} is required and must contain the user-facing ${ok ? 'answer' : 'error reason'}.`,
+            ),
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+          consecutiveFailures++
+          continue
+        }
+        const rawSummary = resultValue
+        if (
+          call.tool === 'step_failed' &&
+          mode === 'code' &&
+          !retriedPrematureStepFailure &&
+          isPrematureStepFailedReason(rawSummary)
+        ) {
+          retriedPrematureStepFailure = true
+          const retry =
+            'Do not call step_failed. The request is implementable: use reasonable defaults that match existing codebase patterns and implement now. Call step_complete when done.'
+          this.turns.push({
+            role: 'user',
+            content: toolResultTurn('step_failed', false, retry),
+          })
+          this.cachedTokenEstimate += Math.ceil(retry.length / 4) + 8
+          consecutiveFailures = 0
+          continue
+        }
+        // Some compatible providers nest a complete step_complete envelope
+        // inside the summary string. Recover its answer before policy checks.
+        const sanitizedSummary = sanitizeReplyText(rawSummary)
+        if (call.tool === 'step_complete' && rawSummary.trim() && !sanitizedSummary) {
+          const userTurn: ChatTurn = {
+            role: 'user',
+            content: toolResultTurn(
+              'step_complete',
+              false,
+              'Refused: step_complete.summary contains an internal tool-call envelope instead of a user-facing answer. Put the final answer directly in summary.',
+            ),
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+          consecutiveFailures++
+          continue
+        }
+        let summary = sanitizedSummary || rawSummary
         const postAgent = this.hooks.postAgent(call.tool, summary)
         if (postAgent.denied) {
           const userTurn: ChatTurn = {
@@ -855,6 +988,22 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
           continue
         }
         summary = postAgent.summary
+        const sanitizedPostHookSummary = sanitizeReplyText(summary)
+        if (!sanitizedPostHookSummary) {
+          const userTurn: ChatTurn = {
+            role: 'user',
+            content: toolResultTurn(
+              call.tool,
+              false,
+              `Refused: the post-agent hook produced an empty or internal result. Return a user-facing ${ok ? 'answer' : 'error reason'}.`,
+            ),
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+          consecutiveFailures++
+          continue
+        }
+        summary = sanitizedPostHookSummary
 
         if (
           call.tool === 'step_complete' &&
@@ -960,9 +1109,9 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
               false,
               'Refused: your summary claims files were changed but edit_file/write_file did not succeed this turn. Actually edit the files first, then summarize what changed.',
             ),
-          };
-          this.turns.push(userTurn);
-          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
+          }
+          this.turns.push(userTurn)
+          this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
           consecutiveFailures++
           continue
         }
@@ -971,18 +1120,100 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
             task,
             mutatedFiles.map((file) => file.path),
           )
-          const reminder = verification.takeCompletionNudge(policy)
-          if (reminder) {
-            const userTurn: ChatTurn = {
-              role: 'user',
-              content: toolResultTurn('step_complete', false, `Refused once: ${reminder}`),
+          if (policy.needed && !verification.hasCurrentEvidence()) {
+            const automaticChecks = detectAutomaticVerifications(
+              this.root,
+              mutatedFiles.map((file) => file.path),
+              policy.useVisualHarness,
+            )
+            let automaticFailure: ToolOutcome | null = null
+            let automaticFailureLabel = ''
+            let verificationSkipped = false
+            for (const check of automaticChecks) {
+              const verifyCall: ToolCall = {
+                thought: 'Automatically verify the completed edit batch.',
+                tool: 'run_verification',
+                args: { packagePath: check.packagePath, script: check.script },
+              }
+              const verifyId = ++this.callId
+              events.onToolCall(verifyId, verifyCall, summarizeArgs(verifyCall))
+              const verifyOutcome = await tools.execute(verifyCall)
+              events.onToolResult(
+                verifyId,
+                verifyOutcome.ok,
+                verifyOutcome.uiSummary,
+                verifyOutcome.viaTrie,
+                verifyOutcome.trieMs,
+                verifyOutcome.scanMs,
+                verifyOutcome.uiDetail ?? toolUiDetail(verifyOutcome.result),
+                verifyOutcome.userSkipped,
+              )
+              const denied = verifyOutcome.userSkipped || /verification denied/i.test(verifyOutcome.result)
+              verifyResults.push({
+                command: `${check.packagePath}: ${check.script}`,
+                ok: verifyOutcome.ok,
+                output: verifyOutcome.result.slice(0, 2000),
+              })
+              if (denied) {
+                verificationSkipped = true
+                break
+              }
+              if (!verifyOutcome.ok) {
+                automaticFailure = verifyOutcome
+                automaticFailureLabel = `${check.packagePath}: ${check.script}`
+                break
+              }
             }
-            this.turns.push(userTurn)
-            this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
-            continue
+
+            if (verificationSkipped) {
+              verification.noteVerification(true)
+            } else if (automaticChecks.length > 0 && !automaticFailure) {
+              verification.noteVerification()
+            } else if (automaticFailure) {
+              if (automaticRepair.onFailure() === 'stop') {
+                const failureSummary =
+                  `Automatic verification still fails after one repair attempt (${automaticFailureLabel}).\n\n` +
+                  automaticFailure.result
+                return {
+                  ok: false,
+                  summary: failureSummary,
+                  mutatedFiles: mutatedFiles.length > 0 ? mutatedFiles : undefined,
+                  hybridStats,
+                }
+              }
+              const repairTurn: ChatTurn = {
+                role: 'user',
+                content: toolResultTurn(
+                  'run_verification',
+                  false,
+                  `${automaticFailure.result}\n\nYou have exactly one repair attempt. Fix the reported failure with the smallest edit, then call step_complete; verification will run again automatically.`,
+                ),
+              }
+              this.turns.push(repairTurn)
+              this.cachedTokenEstimate += Math.ceil(repairTurn.content.length / 4) + 8
+              consecutiveFailures = 0
+              continue
+            }
+
+            if (automaticChecks.length === 0) {
+              const reminder = verification.takeCompletionNudge(policy)
+              if (reminder) {
+                const userTurn: ChatTurn = {
+                  role: 'user',
+                  content: toolResultTurn('step_complete', false, `Refused once: ${reminder}`),
+                }
+                this.turns.push(userTurn)
+                this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8
+                continue
+              }
+            }
           }
         }
         if (ok) {
+          if (!taskAsksForRecommendations(task) && summary.trim()) {
+            events.onReplyStart?.()
+            events.onReplyChunk?.(summary)
+          }
           await this.finishWithHybridReview(
             events,
             hybridStats,
@@ -1117,8 +1348,13 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
       this.turns.push({ role: 'user', content: toolResultTurn(call.tool, outcome.ok, outcome.result) })
       if (recommendationTurn && outcome.ok && explorationTools.has(call.tool)) {
         recommendationExplorationCalls += 1
-        const isRead = call.tool === 'read_file'
-        const readPath = String(call.args['path'] ?? '').replaceAll('\\', '/')
+        const isRead = call.tool === 'read_file' || call.tool === 'read_files'
+        const readPaths =
+          call.tool === 'read_files' && Array.isArray(call.args['paths'])
+            ? call.args['paths']
+                .filter((item): item is string => typeof item === 'string')
+                .map((item) => item.replaceAll('\\', '/'))
+            : [String(call.args['path'] ?? '').replaceAll('\\', '/')]
         if (!isRead) {
           for (const path of extractDiscoveredPaths(outcome.result)) discoveredPaths.add(path)
         }
@@ -1128,13 +1364,39 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
           text: outcome.result,
           quality: isRead ? 'exact-read' : 'discovery',
           discoveredBeforeRead: isRead
-            ? discoveredPaths.has(readPath) ||
-              [...discoveredPaths].some(
-                (path) => path.endsWith(`/${readPath}`) || readPath.endsWith(`/${path}`),
+            ? readPaths.every(
+                (readPath) =>
+                  discoveredPaths.has(readPath) ||
+                  [...discoveredPaths].some(
+                    (path) => path.endsWith(`/${readPath}`) || readPath.endsWith(`/${path}`),
+                  ),
               )
             : undefined,
         })
         emitTelemetry('exploration')
+      }
+
+      if (
+        mode === 'code' &&
+        taskExpectsCodeChanges(task) &&
+        !this.mutatedThisTurn &&
+        outcome.ok &&
+        explorationTools.has(call.tool)
+      ) {
+        codeExplorationCalls += 1
+        if (codeExplorationCalls >= codeExplorationNudgeCalls && !codeExplorationNudged) {
+          codeExplorationNudged = true
+          const guard: ChatTurn = {
+            role: 'user',
+            content: toolResultTurn(
+              call.tool,
+              false,
+              'Exploration cap: stop reading/searching and apply the smallest edit_file or write_file change now based on what you already know, then step_complete with what changed.',
+            ),
+          }
+          this.turns.push(guard)
+          this.cachedTokenEstimate += Math.ceil(guard.content.length / 4) + 8
+        }
       }
 
       const progressTool =
@@ -1152,14 +1414,16 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
       if (
         mode === 'code' &&
         stallNudges < STALL_GUARD_MAX_NUDGES &&
-        callsSinceProgress >= STALL_GUARD_CALLS
+        callsSinceProgress >= stallGuardCalls
       ) {
         const guard: ChatTurn = {
           role: 'user',
           content: toolResultTurn(
             call.tool,
             false,
-            'Stall guard: progress is unclear after several tool calls. Narrow scope now: update_todos with 2-5 concrete steps OR ask_user_question to resolve ambiguity, then execute one step end-to-end.',
+            taskExpectsCodeChanges(task)
+              ? 'Stall guard: you have explored enough without editing. Make one concrete edit_file or write_file change for the highest-priority item, then step_complete.'
+              : 'Stall guard: progress is unclear after several tool calls. Narrow scope now: update_todos with 2-5 concrete steps OR ask_user_question to resolve ambiguity, then execute one step end-to-end.',
           ),
         }
         this.turns.push(guard)
@@ -1173,9 +1437,19 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
         repeatedFeatureSearch !== null ||
         /Feature-existence discovery is complete/i.test(outcome.result)
       ) {
-        await this.maybeStuckRecovery('feature_discovery', events, hybridStats)
+        await this.maybeStuckRecovery(
+          'feature_discovery',
+          events,
+          hybridStats,
+          deferStuckHint,
+        )
       } else if (call.tool === 'web_search' && !webSearchAllowedThisTurn) {
-        await this.maybeStuckRecovery('web_search_denied', events, hybridStats)
+        await this.maybeStuckRecovery(
+          'web_search_denied',
+          events,
+          hybridStats,
+          deferStuckHint,
+        )
       }
 
       if (
@@ -1218,7 +1492,14 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
         consecutiveFailures = 0
       } else {
         consecutiveFailures++
-        if (consecutiveFailures >= 2) await this.maybeStuckHint(consecutiveFailures, events, hybridStats)
+        if (consecutiveFailures >= 2) {
+          await this.maybeStuckHint(
+            consecutiveFailures,
+            events,
+            hybridStats,
+            deferStuckHint,
+          )
+        }
         if (consecutiveFailures >= 4) {
           return {
             ok: false,
@@ -1231,7 +1512,7 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
 
     return {
       ok: false,
-      summary: `Stopped: the agent used all ${maxCalls} tool calls without finishing. You can raise trie-ide.agent.maxToolCalls or continue with a follow-up message.`,
+      summary: `Stopped: the agent used all ${toolCallLimit} tool calls without finishing. You can raise trie-ide.agent.maxToolCalls or set it to 0 for unlimited calls.`,
       mutatedFiles: mutatedFiles.length > 0 ? mutatedFiles : undefined,
       hybridStats,
     }
@@ -1253,6 +1534,28 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     const used = this.estimatedContextTokens()
     const overTurnLimit = this.turns.length > MAX_HISTORY_TURNS + KEEP_RECENT_TURNS
     if (used < contextLimit() * COMPACT_THRESHOLD && !overTurnLimit) return
+    const lazy = compactOldToolResults(
+      this.turns,
+      Math.floor(contextLimit() * COMPACT_THRESHOLD),
+    )
+    if (lazy.compactedResults > 0) {
+      this.turns = lazy.turns
+      this.lastReportedTokens = 0
+      this.cachedTokenEstimate = estimateTokens(this.turns)
+      events.onCompaction?.(
+        false,
+        lazy.savedTokens,
+        Math.min(KEEP_RECENT_TURNS, this.turns.length),
+      )
+      events.onContext?.(this.cachedTokenEstimate, contextLimit())
+      onCompacted?.()
+      if (
+        this.cachedTokenEstimate < contextLimit() * COMPACT_THRESHOLD &&
+        !overTurnLimit
+      ) {
+        return
+      }
+    }
     if (budget && !budget.claimCompactionGeneration()) return
     const compacted = await this.compactNow(client, params, events, signal)
     if (compacted) onCompacted?.()
@@ -1427,6 +1730,36 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     signal?: AbortSignal,
     budget?: TurnBudget,
   ): Promise<boolean> {
+    const note = await this.fetchFrontierNote(
+      checkpoint,
+      events,
+      stats,
+      extra,
+      signal,
+      budget,
+    )
+    if (!note) return false
+    if (note.text.trim()) {
+      this.turns.push({
+        role: 'user',
+        content: `Guide note from a senior reviewer (advisory): ${note.text}`,
+      })
+    }
+    return true
+  }
+
+  private async fetchFrontierNote(
+    checkpoint: GuideNote['checkpoint'],
+    events: LoopEvents,
+    stats: HybridTurnStats,
+    extra: {
+      evidence?: string
+      selfGrade?: { confidence: number; concerns: string }
+      uncertainty?: number
+    } = {},
+    signal?: AbortSignal,
+    budget?: TurnBudget,
+  ): Promise<GuideNote | null> {
     events.onHybridChecking(true, checkpoint)
     let note: GuideNote | null = null
     try {
@@ -1438,37 +1771,38 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     } finally {
       events.onHybridChecking(false, checkpoint)
     }
-    if (!note) return false
+    if (!note) return null
     events.onGuideNote(note)
-    // An empty note (e.g. "looks_good" with nothing to add) is shown in the
-    // UI but injecting a blank advisory into the conversation helps nobody.
-    if (note.text.trim()) {
-      this.turns.push({
-        role: 'user',
-        content: `Guide note from a senior reviewer (advisory): ${note.text}`,
-      })
-    }
-    return true
+    return note
   }
 
   private async maybeStuckRecovery(
     reason: 'feature_discovery' | 'web_search_denied' | 'generation_timeout',
     events: LoopEvents,
     stats: HybridTurnStats,
+    onLateHint?: (text: string) => void,
   ): Promise<boolean> {
     if (
       !this.hybridEligibleThisTurn ||
       !this.stuckRecovery.claim(this.frontier.enabled())
     ) return false
-    return this.consultFrontier('stuck_hint', events, stats, {
+    const extra = {
       evidence: `Recovery trigger: ${reason.replaceAll('_', ' ')}. Give a concrete repository-local next step that moves this task toward implementation.`,
-    })
+    }
+    if (reason === 'generation_timeout') {
+      return this.consultFrontier('stuck_hint', events, stats, extra)
+    }
+    return this.waitBrieflyForHint(
+      this.fetchFrontierNote('stuck_hint', events, stats, extra),
+      onLateHint,
+    )
   }
 
   private async maybeStuckHint(
     consecutiveFailures: number,
     events: LoopEvents,
     stats: HybridTurnStats,
+    onLateHint?: (text: string) => void,
   ): Promise<void> {
     if (consecutiveFailures < 2) return
     if (
@@ -1477,7 +1811,44 @@ this.cachedTokenEstimate += Math.ceil(userTurn.content.length / 4) + 8;
     ) {
       return
     }
-    await this.consultFrontier('stuck_hint', events, stats)
+    await this.waitBrieflyForHint(
+      this.fetchFrontierNote('stuck_hint', events, stats),
+      onLateHint,
+    )
+  }
+
+  /**
+   * Let cached/fast hints land immediately, but overlap slow frontier requests
+   * with the next local generation. Late notes are queued by the caller and
+   * inserted at the next safe loop boundary, never mid-generation.
+   */
+  private async waitBrieflyForHint(
+    request: Promise<GuideNote | null>,
+    onLateHint?: (text: string) => void,
+  ): Promise<boolean> {
+    const safeRequest = request.catch(() => null)
+    const late = Symbol('late')
+    const result = await new Promise<GuideNote | null | typeof late>((resolve) => {
+      const timer = setTimeout(() => resolve(late), STUCK_HINT_WAIT_MS)
+      void safeRequest.then((note) => {
+        clearTimeout(timer)
+        resolve(note)
+      })
+    })
+    if (result === late) {
+      void safeRequest.then((note) => {
+        if (note?.text.trim()) onLateHint?.(note.text.trim())
+      })
+      return false
+    }
+    if (!result) return false
+    if (result.text.trim()) {
+      this.turns.push({
+        role: 'user',
+        content: `Guide note from a senior reviewer (advisory): ${result.text}`,
+      })
+    }
+    return true
   }
 
   private async maybeFinalReview(

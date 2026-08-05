@@ -3,8 +3,11 @@ import test from 'node:test'
 import {
   isAbandonedRecommendationFailure,
   isLazyStepCompleteSummary,
+  isPrematureStepFailedReason,
   isScopeNarrowingQuestion,
   recommendationTaskNote,
+  shouldFlagUngroundedFileChangeSummary,
+  summaryClaimsFileChanges,
   summaryDeflectsToDocs,
   summaryMissesRecommendationAsk,
   taskNeedsCodebaseExploration,
@@ -72,11 +75,23 @@ test('isLazyStepCompleteSummary detects placeholder summaries', () => {
   assert.equal(isLazyStepCompleteSummary('Here are   ...'), true)
   assert.equal(isLazyStepCompleteSummary('Here are my recommendations...'), true)
   assert.equal(isLazyStepCompleteSummary("I'll look into that…"), true)
-  assert.equal(isLazyStepCompleteSummary('Done.'), false)
+  assert.equal(isLazyStepCompleteSummary('Done.'), true)
+  assert.equal(isLazyStepCompleteSummary('Failed.'), true)
   assert.equal(
     isLazyStepCompleteSummary(
       '1. **Architecture** — split daemon and extension concerns.\n2. **Tests** — add coverage for tool parsing.',
     ),
+    false,
+  )
+})
+
+test('isPrematureStepFailedReason distinguishes ambiguity from real blockers', () => {
+  assert.equal(
+    isPrematureStepFailedReason('The requirement is unclear and I need clarification.'),
+    true,
+  )
+  assert.equal(
+    isPrematureStepFailedReason('The required API key is missing and permission was denied.'),
     false,
   )
 })
@@ -86,6 +101,28 @@ test('recommendationTaskNote lightly routes without a fixed format', () => {
   assert.match(note, /improvement|Priority gaps/i)
   assert.doesNotMatch(note, /4–7|4-7/)
   assert.equal(recommendationTaskNote('Fix the login bug', 'code'), '')
+})
+
+test('recommendation answers citing file paths are not flagged as fake edits', () => {
+  const task = 'how can i improve this agent harness'
+  const summary = [
+    'The biggest harness gaps are around approval state.',
+    '### Priority gaps',
+    '1. Verification persistence — concrete fix should scope rememberedVerify in src/agent/tools.ts.',
+    '2. Permission durability — add explicit once/session/always rules in src/agent/permissions.ts.',
+  ].join('\n')
+  assert.equal(summaryClaimsFileChanges(summary), false)
+  assert.equal(shouldFlagUngroundedFileChangeSummary('code', task, summary, false), false)
+  assert.equal(shouldFlagUngroundedFileChangeSummary('ask', task, summary, false), false)
+  assert.equal(
+    shouldFlagUngroundedFileChangeSummary(
+      'code',
+      'Fix the login bug in auth.ts',
+      'Updated auth.ts and fixed the session handler.',
+      false,
+    ),
+    true,
+  )
 })
 
 test('isAbandonedRecommendationFailure catches meta-apology step_failed reasons', () => {

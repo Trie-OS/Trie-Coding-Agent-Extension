@@ -17,8 +17,8 @@
   --secondary: #f5f5f5;
   --secondary-foreground: #262626;
   --muted: #f5f5f5;
-  --muted-foreground: #737373;
-  --border: #e5e5e5;
+  --muted-foreground: var(--vscode-descriptionForeground, #616161);
+  --border: var(--vscode-panel-border, var(--vscode-widget-border, #e5e5e5));
   --input-border: #d4d4d4;
   --ring: #a3a3a3;
   --destructive: #dc2626;
@@ -44,8 +44,8 @@
   --secondary: #262626;
   --secondary-foreground: #fafafa;
   --muted: #262626;
-  --muted-foreground: #a3a3a3;
-  --border: #262626;
+  --muted-foreground: var(--vscode-descriptionForeground, #a3a3a3);
+  --border: var(--vscode-panel-border, var(--vscode-widget-border, #262626));
   --input-border: #404040;
   --ring: #737373;
   --destructive: #ef4444;
@@ -102,19 +102,9 @@ body {
 }
 
 .version-label {
-  color: var(--muted);
+  color: var(--vscode-descriptionForeground, var(--muted-foreground, #616161));
   font-size: 10px;
   font-variant-numeric: tabular-nums;
-}
-
-.turn-telemetry {
-  padding: 5px 12px;
-  border-bottom: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 10px;
-  line-height: 1.35;
-  font-variant-numeric: tabular-nums;
-  white-space: normal;
 }
 
 .chip {
@@ -469,6 +459,14 @@ button.ghost:hover {
   line-height: 1.55;
   font-size: 13px;
   color: var(--foreground);
+}
+
+.reply.live {
+  opacity: 0.92;
+}
+
+.reply-live-body {
+  white-space: pre-wrap;
 }
 
 .reply-p {
@@ -1647,12 +1645,24 @@ button.multitask-steer[hidden] {
 }
 
 .acc-thought-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   cursor: pointer;
   font-size: 11px;
   font-style: italic;
   color: var(--muted-foreground);
   list-style: none;
   user-select: none;
+}
+
+.acc-thought-icon {
+  flex: none;
+  opacity: 0.9;
+}
+
+.acc-thought-label {
+  min-width: 0;
 }
 
 .acc-thought-summary::-webkit-details-marker {
@@ -2168,6 +2178,22 @@ button.multitask-steer[hidden] {
   font-weight: 600;
   line-height: 1.2;
   white-space: nowrap;
+}
+
+.composer-mode-chip.plan {
+  border-color: color-mix(in srgb, #eab308 46%, transparent);
+  background: color-mix(in srgb, #eab308 12%, var(--secondary));
+  color: #a16207;
+}
+
+[data-theme='dark'] .composer-mode-chip.plan {
+  color: #facc15;
+}
+
+.composer-mode-chip.ask {
+  border-color: color-mix(in srgb, var(--success) 50%, transparent);
+  background: color-mix(in srgb, var(--success) 14%, var(--secondary));
+  color: var(--success);
 }
 
 .composer-mode-chip.multitask {

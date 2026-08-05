@@ -18,6 +18,19 @@ export interface GenerationParams {
   temperature: number
   topP: number
   maxTokens: number
+  /** Optional llama.cpp grammar. API clients ignore it; the local daemon enforces it. */
+  grammar?: { label: string; gbnf: string }
+  /** Native function definitions for OpenAI-compatible APIs. Local daemon ignores these. */
+  nativeTools?: OpenAiToolDefinition[]
+}
+
+export interface OpenAiToolDefinition {
+  type: 'function'
+  function: {
+    name: string
+    description: string
+    parameters: Record<string, unknown>
+  }
 }
 
 export interface GenerateResult {

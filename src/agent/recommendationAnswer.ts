@@ -13,9 +13,8 @@ import {
 } from './taskIntent.ts'
 import type { FrontierAssist } from './frontierAssist.ts'
 import type { TurnBudget } from './turnBudget.ts'
-import { parseToolCall } from './toolParse.ts'
+import { sanitizeReplyText } from './thoughtStream.ts'
 
-const TOOL_NAMES = new Set(['step_complete', 'step_failed', 'read_file', 'grep', 'search_symbols'])
 const FINAL_SYNTHESIS_MAX_TOKENS = 4096
 const FINAL_SYNTHESIS_MAX_CHUNKS = 3
 const CONTINUATION_MAX_TOKENS = 2048
@@ -38,6 +37,9 @@ export interface RecommendationFinishOptions {
   frontier?: FrontierAssist
   evidence?: string
   budget?: TurnBudget
+  onReplyStart?: () => void
+  onReplyChunk?: (chunk: string) => void
+  onReplyDiscard?: () => void
   onPhase?: (
     phase: 'judge' | 'synthesis',
     durationMs: number,
@@ -51,17 +53,18 @@ function extractAnswerText(raw: string): string {
   const trimmed = raw.trim()
   if (!trimmed) return ''
 
-  const parsed = parseToolCall(trimmed, TOOL_NAMES)
-  if (!('error' in parsed)) {
-    const summary = parsed.args['summary']
-    const reason = parsed.args['reason']
-    if (typeof summary === 'string' && summary.trim()) return summary.trim()
-    if (typeof reason === 'string' && reason.trim()) return reason.trim()
-  }
-
   const fence = trimmed.match(/^```(?:markdown|md)?\s*([\s\S]*?)```$/i)
-  if (fence?.[1]) return fence[1].trim()
-  return trimmed
+  const answer = sanitizeReplyText(fence?.[1] ?? trimmed)
+  if (!answer.startsWith('{')) return answer
+  try {
+    const parsed = JSON.parse(answer) as unknown
+    // Recommendation synthesis is explicitly markdown-only. A bare JSON
+    // object here is control/judge output, not a user-facing final answer.
+    if (typeof parsed === 'object' && parsed !== null) return ''
+  } catch {
+    // Keep prose that merely begins with a brace.
+  }
+  return answer
 }
 
 function extractJsonObject(raw: string): Record<string, unknown> | null {
@@ -99,6 +102,28 @@ function continuationRequest(originalRequest: string, partial: string): string {
     'PARTIAL ANSWER:',
     partial.slice(-16_000),
   ].join('\n')
+}
+
+function createReplyStreamer(
+  onReplyStart?: () => void,
+  onReplyChunk?: (chunk: string) => void,
+  onReplyDiscard?: () => void,
+) {
+  let started = false
+  const push = (chunk: string) => {
+    if (!chunk) return
+    if (!started) {
+      started = true
+      onReplyStart?.()
+    }
+    onReplyChunk?.(chunk)
+  }
+  const reset = () => {
+    if (!started) return
+    started = false
+    onReplyDiscard?.()
+  }
+  return { push, reset }
 }
 
 /** Obvious non-answers — skip the judge call and go straight to rewrite. */
@@ -259,9 +284,16 @@ export async function rewriteRecommendationAnswer(
   budget?: TurnBudget,
   onTruncationRetry?: () => void,
   onUsage?: (tokensIn: number, tokensOut: number) => void,
+  stream?: Pick<RecommendationFinishOptions, 'onReplyStart' | 'onReplyChunk' | 'onReplyDiscard'>,
 ): Promise<string | null> {
   if (!taskAsksForRecommendations(task)) return null
   const harness = taskAsksForHarnessImprovement(task)
+  const replyStream = createReplyStreamer(
+    stream?.onReplyStart,
+    stream?.onReplyChunk,
+    stream?.onReplyDiscard,
+  )
+  const emitReplyChunk = replyStream.push
   try {
     const turns: ChatTurn[] = [
       {
@@ -310,41 +342,55 @@ export async function rewriteRecommendationAnswer(
     const maxTokens = FINAL_SYNTHESIS_MAX_TOKENS
     let raw = ''
     if (frontier?.enabled()) {
-      let result = await frontier.completeResult(turns[0]!.content, turns[1]!.content, {
-        maxTokens,
-        temperature: 0.35,
-        signal: budget?.signal(signal, 30_000) ?? signal,
-        timeoutMs: budget?.remainingMs(),
-      })
-      raw = result?.text ?? ''
-      if (result) onUsage?.(result.tokensIn ?? 0, result.tokensOut ?? 0)
-      let chunks = 1
-      while (result?.truncated && chunks < FINAL_SYNTHESIS_MAX_CHUNKS) {
-        onTruncationRetry?.()
-        const continuation = await frontier.completeResult(
-          turns[0]!.content,
-          continuationRequest(turns[1]!.content, raw),
-          {
-            maxTokens: CONTINUATION_MAX_TOKENS,
-            temperature: 0.25,
-            signal: budget?.signal(signal, 30_000) ?? signal,
-            timeoutMs: budget?.remainingMs(),
-          },
-        )
-        if (continuation) {
+      try {
+        let result = await frontier.completeResult(turns[0]!.content, turns[1]!.content, {
+          maxTokens,
+          temperature: 0.35,
+          signal: budget?.signal(signal, 30_000) ?? signal,
+          timeoutMs: budget?.remainingMs(),
+          onToken: emitReplyChunk,
+        })
+        raw = result?.text ?? ''
+        if (result) onUsage?.(result.tokensIn ?? 0, result.tokensOut ?? 0)
+        let chunks = 1
+        while (result?.truncated && chunks < FINAL_SYNTHESIS_MAX_CHUNKS) {
+          onTruncationRetry?.()
+          const continuation = await frontier.completeResult(
+            turns[0]!.content,
+            continuationRequest(turns[1]!.content, raw),
+            {
+              maxTokens: CONTINUATION_MAX_TOKENS,
+              temperature: 0.25,
+              signal: budget?.signal(signal, 30_000) ?? signal,
+              timeoutMs: budget?.remainingMs(),
+              onToken: emitReplyChunk,
+            },
+          )
+          if (!continuation) {
+            raw = ''
+            break
+          }
           onUsage?.(continuation.tokensIn ?? 0, continuation.tokensOut ?? 0)
+          result = continuation
+          raw = stitchSynthesisContinuation(raw, result.text)
+          chunks += 1
         }
-        if (!continuation) return null
-        result = continuation
-        raw = stitchSynthesisContinuation(raw, result.text)
-        chunks += 1
+        // A truncated frontier answer is never user-facing. Use a fresh local
+        // synthesis below rather than exposing its potentially incomplete text.
+        if (result?.truncated) {
+          raw = ''
+          replyStream.reset()
+        }
+      } catch {
+        raw = ''
       }
-      if (result?.truncated) return null
-      if (!raw) return null
     }
 
     if (!raw) {
-      if (frontier?.enabled()) return null
+      // Hybrid is an assist, not a single point of failure. When its provider
+      // fails or truncates, the local model still gets the same evidence-grounded
+      // synthesis prompt. Never continue after an explicit stop or deadline.
+      if (signal.aborted || budget?.expired()) return null
       if (budget && !budget.claimLocalGeneration()) return null
       const localMaxTokens = Math.max(params.maxTokens, FINAL_SYNTHESIS_MAX_TOKENS)
       let result = await client.generate(
@@ -354,7 +400,7 @@ export async function rewriteRecommendationAnswer(
           temperature: 0.35,
           maxTokens: localMaxTokens,
         },
-        () => {},
+        emitReplyChunk,
         budget?.signal(signal) ?? signal,
       )
       raw = result.text
@@ -377,7 +423,7 @@ export async function rewriteRecommendationAnswer(
             temperature: 0.25,
             maxTokens: CONTINUATION_MAX_TOKENS,
           },
-          () => {},
+          emitReplyChunk,
           budget?.signal(signal) ?? signal,
         )
         onUsage?.(result.tokensIn, result.tokensOut)
@@ -395,6 +441,54 @@ export async function rewriteRecommendationAnswer(
   }
 }
 
+async function recommendationFallbackAnswer(
+  client: InferenceClient,
+  task: string,
+  draft: string,
+  notes: string,
+  params: GenerationParams,
+  signal: AbortSignal,
+  options: RecommendationFinishOptions,
+): Promise<string> {
+  const initial = sanitizeReplyText(draft)
+  if (signal.aborted) throw new Error('Recommendation synthesis was cancelled.')
+  if (options.budget?.expired()) {
+    throw new Error('Recommendation synthesis failed: the turn deadline expired before a final answer was produced.')
+  }
+  const emergency = await rewriteRecommendationAnswer(
+    client,
+    task,
+    notes,
+    initial,
+    'Write actionable recommendations grounded in the labeled exploration evidence. Use ### Priority gaps with repository paths and concrete file-level changes.',
+    params,
+    signal,
+    undefined,
+    options.evidence,
+    options.budget,
+    undefined,
+    undefined,
+    {
+      onReplyStart: options.onReplyStart,
+      onReplyChunk: options.onReplyChunk,
+      onReplyDiscard: options.onReplyDiscard,
+    },
+  )
+  if (emergency) return emergency
+  const getSkipReason = options.frontier?.getSkipReason
+  const hybridReason =
+    typeof getSkipReason === 'function' ? getSkipReason.call(options.frontier) : undefined
+  const hybridDetail = hybridReason ? ` Hybrid status: ${hybridReason}.` : ''
+  if (options.evidence?.trim()) {
+    throw new Error(
+      `Recommendation synthesis failed after Hybrid and local attempts. Repository evidence was gathered, but no valid final answer was produced.${hybridDetail}`,
+    )
+  }
+  throw new Error(
+    `Recommendation synthesis failed: no repository evidence or valid final answer was produced.${hybridDetail}`,
+  )
+}
+
 /**
  * Finish a recommendation ask: judge the draft; rewrite once if needed.
  * Always returns a user-facing answer string (never an apology-only failure).
@@ -408,7 +502,7 @@ export async function finishRecommendationAnswer(
   signal: AbortSignal,
   options: RecommendationFinishOptions = {},
 ): Promise<string> {
-  const initial = draft.trim()
+  const initial = sanitizeReplyText(draft)
   if (!options.forceRewrite) {
     const judgeStartedAt = Date.now()
     const judgment = await judgeRecommendationAnswer(
@@ -429,6 +523,7 @@ export async function finishRecommendationAnswer(
       judgment.tokensOut ?? 0,
     )
     if (judgment.adequate && judgment.factuallyGrounded && initial.length >= 40) {
+      createReplyStreamer(options.onReplyStart, options.onReplyChunk).push(initial)
       return initial
     }
     const claimFeedback = judgment.rejectedClaims.length
@@ -464,6 +559,11 @@ export async function finishRecommendationAnswer(
       (tokensIn, tokensOut) => {
         synthesisTokensIn += tokensIn
         synthesisTokensOut += tokensOut
+      },
+      {
+        onReplyStart: options.onReplyStart,
+        onReplyChunk: options.onReplyChunk,
+        onReplyDiscard: options.onReplyDiscard,
       },
     )
     options.onPhase?.(
@@ -526,6 +626,11 @@ export async function finishRecommendationAnswer(
         synthesisTokensIn += tokensIn
         synthesisTokensOut += tokensOut
       },
+      {
+        onReplyStart: options.onReplyStart,
+        onReplyChunk: options.onReplyChunk,
+        onReplyDiscard: options.onReplyDiscard,
+      },
     )
     options.onPhase?.(
       'synthesis',
@@ -537,9 +642,13 @@ export async function finishRecommendationAnswer(
     if (rewritten) return rewritten
   }
 
-  // Do not return a draft that the factual judge rejected just because rewrite
-  // failed. A transparent limitation is safer than polished hallucination.
-  return options.evidence?.trim()
-    ? 'I gathered repository evidence, but the evidence-grounded rewrite failed. I am not returning the unverified draft; retry the request or check the configured Hybrid provider.'
-    : 'I could not gather enough repository evidence to make verified recommendations within the exploration budget.'
+  return recommendationFallbackAnswer(
+    client,
+    task,
+    initial,
+    notes,
+    params,
+    signal,
+    options,
+  )
 }

@@ -2,7 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { extractJsonObject, parseToolCall } from './toolParse.ts'
 
-const TOOL_NAMES = new Set(['read_file', 'grep', 'edit_file', 'write_file', 'step_complete'])
+const TOOL_NAMES = new Set(['read_file', 'read_files', 'grep', 'edit_file', 'write_file', 'step_complete'])
 
 describe('parseToolCall', () => {
   it('parses a standard envelope', () => {
@@ -34,6 +34,24 @@ describe('parseToolCall', () => {
     if ('error' in call) return
     assert.equal(call.tool, 'read_file')
     assert.equal(call.args.startLine, 1)
+  })
+
+  it('infers read_files from a paths array before read_file', () => {
+    const call = parseToolCall('{"paths": ["src/a.ts", "src/b.ts"]}', TOOL_NAMES)
+    assert.ok(!('error' in call))
+    if ('error' in call) return
+    assert.equal(call.tool, 'read_files')
+    assert.deepEqual(call.args.paths, ['src/a.ts', 'src/b.ts'])
+  })
+
+  it('parses a read_files envelope', () => {
+    const call = parseToolCall(
+      '{"thought": "batch read", "tool": "read_files", "args": {"paths": ["src/a.ts", "src/b.ts"]}}',
+      TOOL_NAMES,
+    )
+    assert.ok(!('error' in call))
+    if ('error' in call) return
+    assert.equal(call.tool, 'read_files')
   })
 
   it('infers edit_file from line-anchored replace args', () => {

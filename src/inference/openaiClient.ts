@@ -3,10 +3,11 @@
  * shape Trie IDE's ApiProvider uses, so it works against llama-server,
  * LM Studio, Ollama, or any cloud endpoint that speaks the protocol.
  */
-import { readSse } from './sse'
-import { buildOpenAiMessages } from './openAiMessages'
-import { isOutputTruncatedFinishReason } from './truncation'
-import type { ChatTurn, GenerateResult, GenerationParams, InferenceClient } from './types'
+import { readSse } from './sse.ts'
+import { buildOpenAiMessages } from './openAiMessages.ts'
+import { isOutputTruncatedFinishReason } from './truncation.ts'
+import { extractPartialThoughtField } from '../agent/thoughtStream.ts'
+import type { ChatTurn, GenerateResult, GenerationParams, InferenceClient } from './types.ts'
 
 interface ToolCallDelta {
   index?: number
@@ -43,18 +44,33 @@ function toolCallsToEnvelope(
     args = {}
   }
   return JSON.stringify({
-    thought: thought.trim() || 'Function call',
+    thought: thought.trim().slice(0, 300) || 'Function call',
     tool: call.name,
     args,
   })
 }
 
+export function resolveChatCompletionsUrl(baseUrl: string): string {
+  const normalized = baseUrl.trim().replace(/\/+$/, '')
+  if (normalized.endsWith('/chat/completions')) return normalized
+  if (normalized.endsWith('/v1')) return `${normalized}/chat/completions`
+  return `${normalized}/v1/chat/completions`
+}
+
 export class OpenAiCompatibleClient implements InferenceClient {
+  private readonly baseUrl: string
+  private readonly modelName: string
+  private readonly apiKey: string
+
   constructor(
-    private readonly baseUrl: string,
-    private readonly modelName: string,
-    private readonly apiKey: string,
-  ) {}
+    baseUrl: string,
+    modelName: string,
+    apiKey: string,
+  ) {
+    this.baseUrl = baseUrl
+    this.modelName = modelName
+    this.apiKey = apiKey
+  }
 
   describe(): string {
     return `${this.modelName || 'model'} @ ${this.baseUrl}`
@@ -69,20 +85,31 @@ export class OpenAiCompatibleClient implements InferenceClient {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`
 
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: this.modelName,
-        messages: buildOpenAiMessages(turns),
-        temperature: params.temperature,
-        top_p: params.topP,
-        max_tokens: params.maxTokens,
-        stream: true,
-        stream_options: { include_usage: true },
-      }),
-      signal,
+    const requestBody = (): Record<string, unknown> => ({
+      model: this.modelName,
+      messages: buildOpenAiMessages(turns),
+      temperature: params.temperature,
+      top_p: params.topP,
+      max_tokens: params.maxTokens,
+      stream: true,
+      stream_options: { include_usage: true },
     })
+    const post = (withNativeTools: boolean): Promise<Response> => {
+      const body = requestBody()
+      if (withNativeTools && params.nativeTools?.length) {
+        body.tools = params.nativeTools
+        body.tool_choice = 'required'
+        body.parallel_tool_calls = false
+      }
+      return fetch(resolveChatCompletionsUrl(this.baseUrl), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal,
+      })
+    }
+
+    const response = await post(Boolean(params.nativeTools?.length))
     if (!response.ok) {
       const body = await response.text().catch(() => '')
       throw new Error(`chat completion failed (${response.status}): ${body.slice(0, 300)}`)
@@ -101,6 +128,7 @@ export class OpenAiCompatibleClient implements InferenceClient {
           choices?: Array<{
             delta?: {
               content?: string | null
+              reasoning_content?: string | null
               tool_calls?: ToolCallDelta[]
             }
             finish_reason?: string | null
@@ -115,6 +143,11 @@ export class OpenAiCompatibleClient implements InferenceClient {
         const delta = chunk.choices?.[0]?.delta
         const reason = chunk.choices?.[0]?.finish_reason
         if (typeof reason === 'string') finishReason = reason
+        const reasoningContent =
+          typeof delta?.reasoning_content === 'string' ? delta.reasoning_content : ''
+        if (reasoningContent.length > 0) {
+          onToken(reasoningContent)
+        }
         if (typeof delta?.content === 'string' && delta.content.length > 0) {
           text += delta.content
           onToken(delta.content)
@@ -135,9 +168,11 @@ export class OpenAiCompatibleClient implements InferenceClient {
       .map(([, call]) => call)
       .filter((call) => call.name.length > 0)
 
-    if (finalizedCalls.length > 0 && text.trim() === '') {
-      text = toolCallsToEnvelope(finalizedCalls, text)
-      onToken(text)
+    if (finalizedCalls.length > 0) {
+      const prose = text
+      text = toolCallsToEnvelope(finalizedCalls, prose)
+      const thought = extractPartialThoughtField(text)
+      if (thought.trim()) onToken(thought)
     }
 
     return {

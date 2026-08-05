@@ -117,6 +117,13 @@ function resolveArgs(obj: Record<string, unknown>): Record<string, unknown> | nu
 }
 
 function inferToolFromArgs(args: Record<string, unknown>): string | undefined {
+  if (
+    Array.isArray(args.paths) &&
+    args.paths.length > 0 &&
+    args.paths.every((item) => typeof item === 'string')
+  ) {
+    return 'read_files'
+  }
   if (typeof args.path === 'string') {
     if (typeof args.replace === 'string') {
       if (typeof args.search === 'string') return 'edit_file'

@@ -17,6 +17,14 @@ export function taskExpectsCodeChanges(task: string): boolean {
   return CODE_CHANGE_SIGNALS.some((re) => re.test(t))
 }
 
+const PREMATURE_STEP_FAILED_PATTERN =
+  /\b(ambiguous|unclear|unspecified|not\s+specified|clarification|need\s+(more\s+)?(?:info|information|details|context)|ask\s+(?:the\s+)?user|not\s+sure|cannot\s+determine|can't\s+determine|without\s+knowing|unsure|under[- ]?specified)\b/i
+
+/** True when a Code agent declined over ordinary ambiguity instead of a real blocker. */
+export function isPrematureStepFailedReason(reason: string): boolean {
+  return PREMATURE_STEP_FAILED_PATTERN.test(reason.trim())
+}
+
 const NEW_FEATURE_SIGNALS = [
   /\b(?:add|allow|implement|build|create|introduce|support|enable)\b[^.!?\n]{0,100}\b(?:feature|support|capability|flow|integration|handling|handler|upload|attachment|drag(?:\s+and)?\s+drop)\b/i,
   /\b(?:add|allow|implement|build|create|introduce|support|enable)\b/i,
@@ -248,7 +256,7 @@ export function isAbandonedRecommendationFailure(task: string, reason: string): 
 export function isLazyStepCompleteSummary(summary: string): boolean {
   const s = summary.trim()
   if (!s) return true
-  if (s === 'Done.' || s === 'Failed.') return false
+  if (/^(?:done|failed)\.?$/i.test(s)) return true
 
   const compact = s.replace(/\*\*|__|`/g, '').replace(/\s+/g, ' ').trim()
 
@@ -268,12 +276,34 @@ export function isLazyStepCompleteSummary(summary: string): boolean {
   return false
 }
 
+function summaryLooksLikeRecommendationAnswer(summary: string): boolean {
+  const s = summary.trim()
+  if (/^#{1,3}\s*priority gaps\b/im.test(s)) return true
+  if (/\b(?:already strong|bottom line)\b/i.test(s)) return true
+  if (/\bconcrete (?:fix|change)\b/i.test(s) && /\bshould\b/i.test(s)) return true
+  return false
+}
+
 /** step_complete.summary claims files were edited — must match a real edit_file/write_file. */
 export function summaryClaimsFileChanges(summary: string): boolean {
   const s = summary.trim()
   if (s.length < 10) return false
+  if (summaryLooksLikeRecommendationAnswer(s)) return false
   if (CHANGE_VERB.test(s) && new RegExp(String.raw`\.${FILE_EXT}\b`, 'i').test(s)) return true
   if (/`[^`]+\.[a-z0-9]+`/i.test(s) && CHANGE_VERB.test(s)) return true
   if (/\bNew\s+\w+.*:/i.test(s) && new RegExp(String.raw`\.${FILE_EXT}\b`, 'i').test(s)) return true
   return false
+}
+
+/** Post-turn UI guard: only flag code-mode implementation summaries with no diff. */
+export function shouldFlagUngroundedFileChangeSummary(
+  mode: 'code' | 'plan' | 'ask',
+  task: string,
+  summary: string,
+  hasReview: boolean,
+): boolean {
+  if (hasReview) return false
+  if (mode === 'ask' || mode === 'plan') return false
+  if (taskAsksForRecommendations(task)) return false
+  return summaryClaimsFileChanges(summary)
 }

@@ -1,5 +1,6 @@
-import { ArrowRight, Bot, createElement, ListChecks, MessageCircleQuestion } from 'lucide'
+import { ArrowRight, Bot, Brain, createElement, ListChecks, MessageCircleQuestion } from 'lucide'
 import { normalizeReplyMarkdownStructure } from '../../src/chat/replyMarkdown.ts'
+import { ThoughtStreamParser, isToolCallEnvelope, sanitizeReplyText, sanitizeThoughtDisplay } from '../../src/agent/thoughtStream.ts'
 
 declare function acquireVsCodeApi(): { postMessage(msg: unknown): void }
 
@@ -26,7 +27,6 @@ const MODE_ICONS = {
   const composerChips = document.getElementById('composer-chips') as HTMLElement
   const backendChip = document.getElementById('backend-chip') as HTMLElement
   const versionLabel = document.getElementById('version-label') as HTMLElement
-  const turnTelemetry = document.getElementById('turn-telemetry') as HTMLElement
   const hybridChip = document.getElementById('hybrid-chip') as HTMLButtonElement | null
   const hybridMenu = document.getElementById('hybrid-menu') as HTMLElement | null
   const hybridMenuEnabled = document.getElementById('hybrid-menu-enabled') as HTMLInputElement | null
@@ -62,6 +62,7 @@ const MODE_ICONS = {
   /** Read-only exploration tools — nested in an "Explored" accordion. */
   const EXPLORE_TOOLS = new Set([
     'read_file',
+    'read_files',
     'list_dir',
     'glob',
     'grep',
@@ -175,6 +176,39 @@ const MODE_ICONS = {
   let liveReasoningEl: HTMLElement | null = null
   let liveReasoningBodyEl: HTMLElement | null = null
   let hadLiveReasoningThisStep = false
+  let lastThoughtFingerprint = ''
+  let reasoningStream = new ThoughtStreamParser()
+  let liveReplyEl: HTMLElement | null = null
+  let liveReplyBodyEl: HTMLElement | null = null
+
+  function thoughtPreview(text: string, max = 92): string {
+    const oneLine = text.replace(/\s+/g, ' ').trim()
+    if (!oneLine) return ''
+    return oneLine.length <= max ? oneLine : oneLine.slice(0, max - 1) + '…'
+  }
+
+  function setThoughtSummary(summary: HTMLElement, text: string, sinceMs: number, live: boolean): void {
+    const preview = thoughtPreview(text)
+    const lead = live ? 'Thinking' : sinceMs >= 800 ? `Thought for ${formatElapsed(sinceMs)}` : 'Thought'
+    summary.replaceChildren()
+    summary.appendChild(
+      createElement(Brain, {
+        class: 'acc-thought-icon',
+        width: 12,
+        height: 12,
+        'stroke-width': 1.8,
+        'aria-hidden': 'true',
+      }),
+    )
+    const label = document.createElement('span')
+    label.className = 'acc-thought-label'
+    label.textContent = preview ? `${lead}: ${preview}` : live ? 'Thinking…' : lead
+    summary.appendChild(label)
+  }
+
+  function resetReasoningStream(): void {
+    reasoningStream.reset()
+  }
 
   function ensureLiveReasoning(): HTMLElement {
     if (liveReasoningEl && liveReasoningBodyEl) return liveReasoningBodyEl
@@ -183,7 +217,7 @@ const MODE_ICONS = {
     details.open = true
     const summary = document.createElement('summary')
     summary.className = 'acc-thought-summary'
-    summary.textContent = 'Thinking…'
+    setThoughtSummary(summary, '', 0, true)
     const body = document.createElement('div')
     body.className = 'acc-thought live-reasoning'
     details.append(summary, body)
@@ -196,28 +230,48 @@ const MODE_ICONS = {
 
   function appendLiveReasoning(chunk: string): void {
     if (!chunk) return
+    let delta = reasoningStream.push(chunk)
+    if (!delta) {
+      if (reasoningStream.inToolEnvelope()) return
+      const trimmed = chunk.trimStart()
+      // Reasoning-model traces (reasoning_content) are plain text, not JSON envelopes.
+      if (trimmed && !trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+        delta = chunk
+      } else {
+        return
+      }
+    }
     hadLiveReasoningThisStep = true
     const body = ensureLiveReasoning()
-    body.textContent = (body.textContent ?? '') + chunk
+    const nextText = (body.textContent ?? '') + delta
+    body.textContent = nextText
+    const summary = liveReasoningEl?.querySelector('.acc-thought-summary') as HTMLElement | null
+    if (summary) setThoughtSummary(summary, nextText, 0, true)
     scrollDown()
   }
 
   function settleLiveReasoning(finalText?: string): void {
-    if (!liveReasoningEl) return
-    const text = (finalText ?? liveReasoningBodyEl?.textContent ?? '').trim()
+    if (!liveReasoningEl) {
+      resetReasoningStream()
+      return
+    }
+    const text = sanitizeThoughtDisplay(finalText ?? liveReasoningBodyEl?.textContent ?? '').trim()
     if (!text) {
       liveReasoningEl.remove()
       liveReasoningEl = null
       liveReasoningBodyEl = null
+      resetReasoningStream()
       return
     }
     if (liveReasoningBodyEl) liveReasoningBodyEl.textContent = text
     liveReasoningEl.classList.remove('live')
     liveReasoningEl.open = false
     const summary = liveReasoningEl.querySelector('.acc-thought-summary') as HTMLElement | null
-    if (summary) summary.textContent = 'Thought'
+    if (summary) setThoughtSummary(summary, text, 0, false)
+    lastThoughtFingerprint = text.replace(/\s+/g, ' ').trim()
     liveReasoningEl = null
     liveReasoningBodyEl = null
+    resetReasoningStream()
   }
 
   function discardLiveReasoning(): void {
@@ -225,14 +279,63 @@ const MODE_ICONS = {
     liveReasoningEl = null
     liveReasoningBodyEl = null
     hadLiveReasoningThisStep = false
+    resetReasoningStream()
   }
 
   function renderPersistedThought(text: string): void {
-    if (!text.trim()) return
+    const cleaned = sanitizeThoughtDisplay(text)
+    if (!cleaned.trim()) return
     const session = ensureTurnSession()
     const group =
       session.activeGroup ?? ensureAccordionGroup('explore', 'Explored')
-    addThoughtRow(group, text, 0)
+    addThoughtRow(group, cleaned, 0)
+  }
+
+  function ensureLiveReply(): HTMLElement {
+    if (liveReplyEl && liveReplyBodyEl) return liveReplyBodyEl
+    const el = document.createElement('div')
+    el.className = 'reply live'
+    const body = document.createElement('div')
+    body.className = 'reply-live-body'
+    el.appendChild(body)
+    messagesEl.appendChild(el)
+    liveReplyEl = el
+    liveReplyBodyEl = body
+    scrollDown()
+    return body
+  }
+
+  function appendLiveReply(chunk: string): void {
+    if (!chunk) return
+    const body = ensureLiveReply()
+    body.textContent = (body.textContent ?? '') + chunk
+    scrollDown()
+  }
+
+  function settleLiveReply(text: string, failed = false): HTMLElement {
+    const display = cleanReplyText(text).trim()
+    const emptyReplyError = 'Error: the extension host returned an empty or invalid reply.'
+    const replyFailed = failed || !display
+    const el = liveReplyEl ?? document.createElement('div')
+    if (!liveReplyEl) {
+      el.className = 'reply' + (replyFailed ? ' failed' : '')
+      messagesEl.appendChild(el)
+    } else {
+      el.classList.remove('live')
+      if (replyFailed) el.classList.add('failed')
+    }
+    el.replaceChildren()
+    el.appendChild(formatReplyMarkdown(display || emptyReplyError))
+    liveReplyEl = null
+    liveReplyBodyEl = null
+    scrollDown()
+    return el
+  }
+
+  function discardLiveReply(): void {
+    liveReplyEl?.remove()
+    liveReplyEl = null
+    liveReplyBodyEl = null
   }
 
   /**
@@ -378,11 +481,14 @@ const MODE_ICONS = {
 
   function addThoughtRow(group: AccordionGroup, thought: string | undefined, sinceMs: number): void {
     if (!thought || !thought.trim()) return
+    const fingerprint = thought.replace(/\s+/g, ' ').trim()
+    if (!fingerprint || fingerprint === lastThoughtFingerprint) return
+    lastThoughtFingerprint = fingerprint
     const details = document.createElement('details')
     details.className = 'acc-thought-block'
     const summary = document.createElement('summary')
     summary.className = 'acc-thought-summary'
-    summary.textContent = sinceMs >= 800 ? 'Thought for ' + formatElapsed(sinceMs) : 'Thought'
+    setThoughtSummary(summary, thought, sinceMs, false)
     const body = document.createElement('div')
     body.className = 'acc-thought'
     body.textContent = thought
@@ -513,6 +619,11 @@ const MODE_ICONS = {
     } else if (isExploreTool(msg.tool)) {
       session.exploredActions += 1
       if (msg.tool === 'read_file' && msg.args) session.exploredFiles.add(msg.args)
+      if (msg.tool === 'read_files' && msg.args) {
+        for (const file of msg.args.split(',').map((item) => item.trim()).filter(Boolean)) {
+          session.exploredFiles.add(file)
+        }
+      }
       group = ensureAccordionGroup('explore', 'explore')
     } else if (msg.tool === 'run_command') {
       session.commandCount += 1
@@ -603,6 +714,7 @@ const MODE_ICONS = {
     session.el.open = false
     if (!turnSessionHasVisibleActivity(session)) session.el.remove()
     turnSession = null
+    lastThoughtFingerprint = ''
     todoCard = null
     todoCardSeen = false
     closeActiveGroup()
@@ -610,6 +722,7 @@ const MODE_ICONS = {
 
   function resetTurnSession(): void {
     turnSession = null
+    lastThoughtFingerprint = ''
     todoCard = null
     todoCardSeen = false
     closeActiveGroup()
@@ -1615,10 +1728,17 @@ const MODE_ICONS = {
     return fragment
   }
 
+  function cleanReplyText(text: string): string {
+    return sanitizeReplyText(text)
+  }
+
   function addReply(text: string, failed = false): HTMLElement {
+    const display = cleanReplyText(text).trim()
+    const emptyReplyError = 'Error: the extension host returned an empty or invalid reply.'
+    const replyFailed = failed || !display
     const el = document.createElement('div')
-    el.className = 'reply' + (failed ? ' failed' : '')
-    el.appendChild(formatReplyMarkdown(text))
+    el.className = 'reply' + (replyFailed ? ' failed' : '')
+    el.appendChild(formatReplyMarkdown(display || emptyReplyError))
     messagesEl.appendChild(el)
     scrollDown()
     return el
@@ -1831,11 +1951,6 @@ const MODE_ICONS = {
   function setMode(mode: keyof typeof MODE_ICONS): void {
     if (mode !== 'code' && multitaskMode) disableMultitask()
     currentMode = mode
-    for (const btn of modeButtons) {
-      const active = btn.dataset.mode === mode
-      btn.classList.toggle('active', active)
-      btn.setAttribute('aria-pressed', String(active))
-    }
     renderActiveModeChip()
     renderPlusMenu()
     updateComposerPlaceholder()
@@ -1848,7 +1963,7 @@ const MODE_ICONS = {
 
     const label = currentMode === 'plan' ? 'Plan' : 'Ask'
     const chip = document.createElement('span')
-    chip.className = 'composer-mode-chip'
+    chip.className = `composer-mode-chip ${currentMode}`
     chip.title =
       currentMode === 'plan'
         ? 'Read-only exploration that returns a plan'
@@ -2455,10 +2570,13 @@ const MODE_ICONS = {
         else enableMultitask()
       } else if (pick === 'attach-image') {
         imageFileInputEl.click()
+        closePlusMenu()
+        return
       } else if (pick && pick in MODE_ICONS) {
-        setMode(pick as keyof typeof MODE_ICONS)
+        const mode = pick as keyof typeof MODE_ICONS
+        setMode(currentMode === mode ? 'code' : mode)
       }
-      closePlusMenu()
+      // Keep the menu open for mode toggles so checkmarks update immediately.
     })
   }
 
@@ -2692,6 +2810,8 @@ const MODE_ICONS = {
     liveReasoningEl = null
     liveReasoningBodyEl = null
     hadLiveReasoningThisStep = false
+    resetReasoningStream()
+    discardLiveReply()
     hideSpinner()
     backgroundWorkEl = null
   }
@@ -2737,22 +2857,6 @@ const MODE_ICONS = {
           hideWelcome()
           showSpinner()
         }
-        break
-      }
-      case 'telemetry': {
-        const t = msg.telemetry
-        if (!t) break
-        turnTelemetry.hidden = false
-        turnTelemetry.textContent = [
-          t.phase,
-          `local ${t.localGenerations} · ${(Number(t.localGenerationMs ?? 0) / 1000).toFixed(1)}s`,
-          `explore ${t.explorationCalls}`,
-          `judge ${(Number(t.judgeMs ?? 0) / 1000).toFixed(1)}s`,
-          `synth ${(Number(t.synthesisMs ?? 0) / 1000).toFixed(1)}s`,
-          `tokens ${t.tokensIn}/${t.tokensOut}`,
-          `retries ${t.truncationRetries}`,
-          `${Math.ceil(Number(t.deadlineRemainingMs ?? 0) / 1000)}s left`,
-        ].join('  •  ')
         break
       }
       case 'multitask-list': {
@@ -2832,6 +2936,15 @@ const MODE_ICONS = {
             settleLiveReasoning()
           }
         }
+        break
+      }
+      case 'reply': {
+        if (msg.discard) {
+          discardLiveReply()
+          break
+        }
+        if (msg.start) ensureLiveReply()
+        if (typeof msg.chunk === 'string' && msg.chunk) appendLiveReply(msg.chunk)
         break
       }
       case 'todos': {
@@ -2941,7 +3054,11 @@ const MODE_ICONS = {
         settleLiveReasoning()
         hideSpinner()
         finishTurnSession()
-        addReply(msg.text, !msg.ok)
+        if (liveReplyEl) {
+          settleLiveReply(msg.text, !msg.ok)
+        } else {
+          addReply(msg.text, !msg.ok)
+        }
         if (msg.checkpoint) setComposerUndo(msg.checkpoint)
         if (msg.checkpoint) {
           const row = document.createElement('div')
@@ -2979,6 +3096,8 @@ const MODE_ICONS = {
         break
       }
       case 'error': {
+        settleLiveReasoning()
+        discardLiveReply()
         hideSpinner()
         finishTurnSession()
         addBubble('error', msg.text)

@@ -9,9 +9,8 @@
  *   POST /v1/cancel                   → { ok }
  *   POST /v1/generate                 → SSE: {type:'token'|'end'|'error', ...}
  *
- * Generation passes a JSON-object GBNF grammar so a local model can only
- * emit the agent tool envelope, mirroring Trie IDE's grammar-constrained
- * tool loop.
+ * Agent generations pass a mode-specific per-tool GBNF grammar. Non-agent
+ * generations may fall back to a generic JSON object grammar.
  */
 import { readSse } from './sse'
 import type { ChatTurn, GenerateResult, GenerationParams, InferenceClient } from './types'
@@ -199,14 +198,15 @@ export class DaemonClient implements InferenceClient {
         'Image attachments require an LLM API backend with a vision-capable model. The embedded daemon does not support vision yet.',
       )
     }
+    const { grammar, nativeTools: _nativeTools, ...samplingParams } = params
     const response = await fetch(`${this.baseUrl}/v1/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         requestId: `vscode-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         turns,
-        params,
-        grammar: { label: 'json-object', gbnf: JSON_OBJECT_GBNF },
+        params: samplingParams,
+        grammar: grammar ?? { label: 'json-object', gbnf: JSON_OBJECT_GBNF },
       }),
       signal,
     })

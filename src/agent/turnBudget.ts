@@ -6,8 +6,10 @@ export class TurnBudget {
   readonly deadlineAt: number
   readonly maxLocalGenerations: number
   readonly maxToolLoopGenerations: number
+  readonly maxCompactionGenerations: number
   readonly reservedFinishMs: number
   private localGenerationCount = 0
+  private compactionGenerationCount = 0
   private readonly now: () => number
 
   constructor(
@@ -21,22 +23,34 @@ export class TurnBudget {
     this.deadlineAt =
       this.startedAt +
       (recommendation ? budgets.recommendationDeadlineMs : budgets.modeDeadlinesMs[mode])
-    this.maxLocalGenerations = recommendation
+    const configuredGenerationLimit = recommendation
       ? budgets.recommendationGenerationLimit
       : budgets.modeGenerationLimits[mode]
+    this.maxLocalGenerations =
+      configuredGenerationLimit === 0 ? Number.POSITIVE_INFINITY : configuredGenerationLimit
     this.maxToolLoopGenerations = this.maxLocalGenerations
+    this.maxCompactionGenerations = budgets.maxCompactionGenerations
     this.reservedFinishMs = budgets.reservedFinishMs
   }
 
+  localGenerationBudgetExhausted(): boolean {
+    return (
+      Number.isFinite(this.maxToolLoopGenerations) &&
+      this.localGenerationCount >= this.maxToolLoopGenerations
+    )
+  }
+
   claimLocalGeneration(): boolean {
-    if (this.expired() || this.localGenerationCount >= this.maxToolLoopGenerations) return false
+    if (this.expired() || this.localGenerationBudgetExhausted()) return false
     this.localGenerationCount += 1
     return true
   }
 
   claimCompactionGeneration(): boolean {
-    if (this.expired() || this.localGenerationCount >= this.maxLocalGenerations) return false
-    this.localGenerationCount += 1
+    if (this.expired() || this.compactionGenerationCount >= this.maxCompactionGenerations) {
+      return false
+    }
+    this.compactionGenerationCount += 1
     return true
   }
 

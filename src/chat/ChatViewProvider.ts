@@ -4,14 +4,15 @@ import * as vscode from 'vscode'
 import { readConfig, setFrontierSelection, setHybridEnabled, hybridActiveLabel, isHybridConfigured, listHybridModelOptions } from '../config'
 import { ShadowRepo, type ChangedFileStat } from '../agent/checkpoints'
 import { FrontierAssist, type GuideNote } from '../agent/frontierAssist'
-import { AgentSession, type TurnTelemetry } from '../agent/loop'
+import { AgentSession } from '../agent/loop'
 import type { PermissionChoice, PermissionRequest } from '../agent/permissionBroker'
 import type { QuestionAnswer, UserQuestionPayload } from '../agent/questionBroker'
 import { MultitaskBus } from '../agent/multitaskBus'
 import type { AgentMode } from '../agent/prompts'
 import type { ToolCall } from '../agent/tools'
 import { formatToolRow, toolGroupKey, toolLineDelta } from '../agent/tools'
-import { summaryClaimsFileChanges } from '../agent/taskIntent'
+import { shouldFlagUngroundedFileChangeSummary } from '../agent/taskIntent'
+import { sanitizeReplyText } from '../agent/thoughtStream'
 import { clearScratchpad } from '../agent/scratchpad'
 import { WorktreeManager } from '../agent/worktrees'
 import { DaemonClient } from '../inference/daemonClient'
@@ -23,6 +24,7 @@ import {
 import { OpenAiCompatibleClient } from '../inference/openaiClient'
 import type { ChatTurnImage, InferenceClient } from '../inference/types'
 import { ChatStore, type ChatSummary, type TranscriptEntry } from './chatStore'
+import { sanitizeUserError } from './userError'
 import { webviewTheme, type WebviewTheme } from '../theme'
 
 const MULTITASK_MAX_CONCURRENCY = 6
@@ -43,13 +45,13 @@ type ToWebview =
     }
   | { type: 'tool-call'; id: number; tool: string; args: string; rowLabel: string; thought: string; groupKey?: string; linesAdded?: number; linesDeleted?: number }
   | { type: 'reasoning'; chunk?: string; done?: boolean; text?: string; discard?: boolean }
+  | { type: 'reply'; start?: true; chunk?: string; discard?: true }
   | { type: 'tool-result'; id: number; ok: boolean; summary: string; viaTrie?: boolean; trieMs?: number; scanMs?: number; detail?: string; userSkipped?: boolean }
   | { type: 'todos'; todo: string[]; done: string[] }
   | { type: 'hybrid-check'; active: boolean; checkpoint?: string }
   | { type: 'hybrid-plan'; subtasks: string[]; rationale?: string }
   | { type: 'guide'; checkpoint: string; verdict: string; text: string }
   | { type: 'context'; used: number; limit: number }
-  | { type: 'telemetry'; telemetry: TurnTelemetry }
   | { type: 'compaction'; active: boolean; saved?: number; keptTurns?: number }
   | { type: 'final'; ok: boolean; text: string; checkpoint?: string }
   | { type: 'review'; checkpoint: string; files: ChangedFileStat[] }
@@ -548,7 +550,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       try {
         await worktrees.prepare()
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
+        const message = sanitizeUserError(error)
         this.post({ type: 'error', text: `Could not start parallel Multitask: ${message}` })
         return
       }
@@ -601,7 +603,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         parent.children.push(child)
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const message = sanitizeUserError(error)
       await worktrees?.cleanup(true).catch(() => undefined)
       this.post({ type: 'error', text: `Failed to provision Multitask worktrees: ${message}` })
       return
@@ -655,7 +657,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             child.result = [child.result?.trim(), `Diff vs base:\n${diff}`].filter(Boolean).join('\n\n')
           }
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
+          const message = sanitizeUserError(error)
           this.log(`multitask commit ${child.name} FAILED: ${message}`)
         }
       }
@@ -685,7 +687,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         text: integrate.summary,
       })
       await parent.worktrees.cleanup(integrate.ok).catch((error) => {
-        this.log(`multitask worktree cleanup FAILED: ${error instanceof Error ? error.message : String(error)}`)
+        this.log(`multitask worktree cleanup FAILED: ${sanitizeUserError(error)}`)
       })
       parent.worktrees = undefined
     }
@@ -856,7 +858,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const runtime = this.selectedRuntime()
     if (this.activeRuns.size > 0 || this.runQueue.length > 0 || !runtime) return
     const client = this.currentClient()
-    if (!client) return
+    if (!client) {
+      this.post({ type: 'error', text: 'Memory compaction failed: no model backend is configured.' })
+      return
+    }
     const cfg = readConfig()
     try {
       await runtime.session.compactNow(
@@ -870,8 +875,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         new AbortController().signal,
       )
     } catch (error) {
-      this.log(`manual compaction FAILED: ${error instanceof Error ? error.message : String(error)}`)
+      const message = sanitizeUserError(error, 'Unknown compaction error.')
+      this.log(`manual compaction FAILED: ${message}`)
       this.post({ type: 'compaction', active: false })
+      this.post({ type: 'error', text: `Memory compaction failed: ${message}` })
     }
   }
 
@@ -1027,7 +1034,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         (error) =>
           this.finishRun(key, request, {
             ok: false,
-            result: error instanceof Error ? error.message : String(error),
+            result: sanitizeUserError(error),
           }),
       )
     }
@@ -1061,9 +1068,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async executeRun(request: RunRequest): Promise<RunOutcome> {
     const { runtime, text, mode, session } = request
     const folder = vscode.workspace.workspaceFolders?.[0]
-    if (!folder) return { ok: false, result: 'No workspace folder is open.' }
+    if (!folder) {
+      const result = 'Run failed: no workspace folder is open.'
+      if (!request.internal) {
+        this.postFor(runtime, { type: 'error', text: result })
+        runtime.transcript.push({ role: 'error', text: result })
+      }
+      return { ok: false, result }
+    }
     const client = this.currentClient()
-    if (!client) return { ok: false, result: 'No model backend is configured.' }
+    if (!client) {
+      const result = 'Run failed: no model backend is configured.'
+      if (!request.internal) {
+        this.postFor(runtime, { type: 'error', text: result })
+        runtime.transcript.push({ role: 'error', text: result })
+      }
+      return { ok: false, result }
+    }
     const cfg = readConfig()
 
     // Lazy checkpoint: taken on first mutating tool via ensureCheckpoint.
@@ -1098,10 +1119,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           })
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
+        const message = sanitizeUserError(error)
         this.log(`checkpoint snapshot FAILED: ${message}`)
         this.postFor(runtime, {
-          type: 'notice',
+          type: 'error',
           text: `Checkpoint failed (${message.slice(0, 120)}) — changes this turn cannot be undone.`,
         })
       }
@@ -1149,6 +1170,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               this.postLive(runtime, { type: 'reasoning', done: true, discard: true })
             }
             pendingReasoning = undefined
+          },
+          onReplyStart: () => {
+            if (request.internal) return
+            this.postLive(runtime, { type: 'reply', start: true })
+          },
+          onReplyChunk: (chunk) => {
+            if (request.internal) return
+            this.postLive(runtime, { type: 'reply', chunk })
+          },
+          onReplyDiscard: () => {
+            if (request.internal) return
+            this.postLive(runtime, { type: 'reply', discard: true })
           },
           onToolCall: (id: number, call: ToolCall, argsSummary: string) => {
             const delta = toolLineDelta(call)
@@ -1200,7 +1233,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           onHybridPlan: (subtasks, rationale) =>
             this.postFor(runtime, { type: 'hybrid-plan', subtasks, rationale }),
           onContext: (used, limit) => this.postLive(runtime, { type: 'context', used, limit }),
-          onTelemetry: (telemetry) => this.postLive(runtime, { type: 'telemetry', telemetry }),
           onCompaction: (active, saved, keptTurns) =>
             this.postLive(runtime, { type: 'compaction', active, saved, keptTurns }),
           onGuideNote: (note: GuideNote) =>
@@ -1245,7 +1277,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             `diff vs ${checkpointState.sha.slice(0, 8)}: ${reviewFiles?.length ?? 0} changed file(s)`,
           )
         } catch (error) {
-          this.log(`diff stats FAILED: ${error instanceof Error ? error.message : String(error)}`)
+          this.log(`diff stats FAILED: ${sanitizeUserError(error)}`)
         }
       }
       if ((!reviewFiles || reviewFiles.length === 0) && result.mutatedFiles?.length) {
@@ -1254,12 +1286,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       const hasReview = !!(reviewFiles && reviewFiles.length > 0)
       const activeTask = request.multitask
-      let finalText =
+      let finalText = sanitizeReplyText(
         activeTask?.status === 'interrupted' && result.summary === 'Stopped.'
           ? 'Interrupted — context handed off to another subagent.'
-          : result.summary
+          : result.summary,
+      )
       let finalOk = result.ok
-      if (result.ok && !hasReview && summaryClaimsFileChanges(result.summary)) {
+      if (result.ok && !finalText.trim()) {
+        finalOk = false
+        finalText = result.summary.trim()
+          ? 'Final answer error: the agent produced internal control output instead of a user-facing answer.'
+          : 'Final answer error: the agent returned an empty successful response.'
+        this.log('successful loop result sanitized to an empty final reply — flagging reply')
+      }
+      if (
+        result.ok &&
+        shouldFlagUngroundedFileChangeSummary(mode, text, result.summary, hasReview)
+      ) {
         finalOk = false
         this.log('summary claims file changes but no diff — flagging reply')
         this.postFor(runtime, {
@@ -1299,7 +1342,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         return { ok: false, result: stoppedText }
       } else {
-        const message = error instanceof Error ? error.message : String(error)
+        const message = sanitizeUserError(error)
         this.log(`turn FAILED: ${message}`)
         const friendly = /fetch failed|ECONNREFUSED|ECONNRESET/i.test(message)
           ? `Could not reach the model backend (${message}). The local server may have stopped — check it, then use Connect and retry.`
@@ -1354,7 +1397,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         turns: runtime.session.exportTurns(),
       })
     } catch (error) {
-      this.log(`chat save FAILED: ${error instanceof Error ? error.message : String(error)}`)
+      this.log(`chat save FAILED: ${sanitizeUserError(error)}`)
     }
   }
 
@@ -1425,7 +1468,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch (error) {
       this.post({
         type: 'error',
-        text: `Restore failed: ${error instanceof Error ? error.message : String(error)}`,
+        text: `Restore failed: ${sanitizeUserError(error)}`,
       })
     }
   }
@@ -1590,7 +1633,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch (error) {
       this.post({
         type: 'error',
-        text: `Could not open diff for ${relPath}: ${error instanceof Error ? error.message : String(error)}`,
+        text: `Could not open diff for ${relPath}: ${sanitizeUserError(error)}`,
       })
     }
   }
@@ -1611,6 +1654,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     html[data-theme="light"], html[data-theme="light"] body { background: #ffffff; color: #171717; }
     html[data-theme="dark"], html[data-theme="dark"] body { background: #0a0a0a; color: #fafafa; }
     #header, #messages, #composer, #todos { background: inherit; }
+    .version-label {
+      color: var(--vscode-descriptionForeground, #616161);
+    }
+    html[data-theme="dark"] .version-label {
+      color: var(--vscode-descriptionForeground, #a3a3a3);
+    }
   </style>
   <link href="${styleUri}" rel="stylesheet" />
 </head>
@@ -1670,7 +1719,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </button>
     </div>
   </header>
-  <div id="turn-telemetry" class="turn-telemetry" hidden></div>
   <section id="history-view" hidden>
     <div class="hist-head">
       <button id="hist-back" class="ghost" title="Back to chat">←</button>

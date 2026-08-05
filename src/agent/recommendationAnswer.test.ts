@@ -163,6 +163,123 @@ test('passing draft returns directly without rewrite synthesis', async () => {
   assert.equal(frontierCalls, 1)
 })
 
+test('terminal envelope draft is unwrapped before judging and returning', async () => {
+  const answer =
+    '1. **src/agent/loop.ts** — Preserve terminal summaries before sanitizing provider output.'
+  const local: InferenceClient = {
+    describe: () => 'unused',
+    generate: async () => {
+      throw new Error('local generation should not run')
+    },
+  }
+  const frontier = {
+    enabled: () => true,
+    completeResult: async () => ({
+      text: '{"adequate": true, "factuallyGrounded": true, "feedback": "", "rejectedClaims": []}',
+      truncated: false,
+    }),
+  } as unknown as FrontierAssist
+
+  const result = await finishRecommendationAnswer(
+    local,
+    'How can I improve this agent harness?',
+    JSON.stringify({ thought: 'Done', tool: 'step_complete', args: { summary: answer } }),
+    'notes',
+    { temperature: 0.2, topP: 0.95, maxTokens: 2048 },
+    new AbortController().signal,
+    {
+      frontier,
+      evidence: '[E1] read_file src/agent/loop.ts\nexport class AgentSession {}',
+    },
+  )
+
+  assert.equal(result, answer)
+})
+
+test('falls back to evidence-grounded local synthesis when Hybrid fails', async () => {
+  let localCalls = 0
+  const local: InferenceClient = {
+    describe: () => 'local fallback',
+    generate: async () => {
+      localCalls++
+      return {
+        text: '### Priority gaps\n1. **src/agent/loop.ts** — Use the explored evidence to make the completion path more resilient.',
+        tokensIn: 20,
+        tokensOut: 25,
+        truncated: false,
+      }
+    },
+  }
+  const frontier = {
+    enabled: () => true,
+    completeResult: async () => null,
+  } as unknown as FrontierAssist
+
+  const answer = await finishRecommendationAnswer(
+    local,
+    'How can I improve this agent harness?',
+    'This draft is too vague to be useful.',
+    'Read src/agent/loop.ts.',
+    { temperature: 0.2, topP: 0.95, maxTokens: 2048 },
+    new AbortController().signal,
+    {
+      frontier,
+      evidence: '[E1] read_file src/agent/loop.ts\nexport class AgentSession {}',
+    },
+  )
+
+  assert.match(answer, /Priority gaps/)
+  assert.equal(localCalls, 1)
+})
+
+test('internal Hybrid tool envelope is rejected and replaced by a local answer', async () => {
+  let localCalls = 0
+  const local: InferenceClient = {
+    describe: () => 'local fallback',
+    generate: async () => {
+      localCalls++
+      return {
+        text: '### Priority gaps\n1. **src/agent/loop.ts** — Retry final synthesis when a provider emits an internal tool call.',
+        tokensIn: 20,
+        tokensOut: 25,
+        truncated: false,
+      }
+    },
+  }
+  const responses = [
+    {
+      text: JSON.stringify({
+        thought: 'Inspect another file',
+        tool: 'read_file',
+        args: { path: 'src/agent/loop.ts' },
+      }),
+      truncated: false,
+    },
+  ]
+  const frontier = {
+    enabled: () => true,
+    completeResult: async () => responses.shift() ?? null,
+  } as unknown as FrontierAssist
+
+  const answer = await finishRecommendationAnswer(
+    local,
+    'How can I improve this agent harness?',
+    '',
+    'Read src/agent/loop.ts.',
+    { temperature: 0.2, topP: 0.95, maxTokens: 2048 },
+    new AbortController().signal,
+    {
+      forceRewrite: true,
+      frontier,
+      evidence: '[E1] read_file src/agent/loop.ts\nexport class AgentSession {}',
+    },
+  )
+
+  assert.match(answer, /Priority gaps/)
+  assert.doesNotMatch(answer, /"tool":"read_file"/)
+  assert.equal(localCalls, 1)
+})
+
 test('truncated frontier synthesis continues from retained partial text', async () => {
   const local: InferenceClient = {
     describe: () => 'unused',

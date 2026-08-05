@@ -31,6 +31,7 @@ import { execFileWithSignal, shellExec } from './shellExec'
 import { ensureScratchpad, isScratchpadPath } from './scratchpad'
 import { getSymbolIndex, isIdentifierPattern } from './symbolIndex'
 import { normalizeAgentProfile, type AgentProfileName } from './agentProfiles'
+import { executeReadFilesBatch } from './readFilesBatch.ts'
 
 export interface ToolSpec {
   name: string
@@ -48,6 +49,12 @@ export const TOOL_SPECS: ToolSpec[] = [
     name: 'read_file',
     signature: '{"path": string, "startLine"?: number, "endLine"?: number}',
     description: 'Read a file (optionally a 1-based line range).',
+  },
+  {
+    name: 'read_files',
+    signature: '{"paths": string[]}',
+    description:
+      'Read up to 8 related files in one call. The files share one result budget; use read_file for a larger window of one file.',
   },
   {
     name: 'list_dir',
@@ -444,7 +451,10 @@ export class WorkspaceTools {
     if (normalized === '.trie-ide/permissions.json' || normalized === '.trie-ide/hooks.json') {
       throw new Error(`Writes to ${normalized} are blocked for security.`)
     }
-    const canonical = relativeFromRoot(this.root, await this.resolve(relPath))
+    const canonical = relativeFromRoot(
+      this.root,
+      await this.resolve(relPath, action === 'write'),
+    )
     if (!isSensitivePath(canonical)) return
     const defaultPolicy = this.permissions.toolDefault('sensitive_write', this.profile, 'ask')
     if (defaultPolicy === 'allow') return
@@ -487,6 +497,8 @@ export class WorkspaceTools {
       switch (call.tool) {
         case 'read_file':
           return await this.readFile(call.args)
+        case 'read_files':
+          return await this.readFiles(call.args)
         case 'list_dir':
           return await this.listDir(call.args)
         case 'glob':
@@ -554,6 +566,22 @@ export class WorkspaceTools {
           hint: wasRangeTruncated ? hint : undefined,
         }) + agentsExtra,
       uiSummary: `${relPath} (${from}-${to}/${lineCount} lines)`,
+    }
+  }
+
+  private async readFiles(args: Record<string, unknown>): Promise<ToolOutcome> {
+    const batch = await executeReadFilesBatch({
+      root: this.root,
+      paths: args['paths'],
+      resolvePath: (relPath) => this.resolveWithScope(relPath, 'read_files'),
+      maxResultChars: MAX_RESULT_CHARS,
+      lineWindow: DEFAULT_READ_LINE_LIMIT,
+      maxFileBytes: MAX_FILE_READ_BYTES,
+    })
+    return {
+      ok: batch.ok,
+      result: batch.text,
+      uiSummary: batch.uiSummary,
     }
   }
 
@@ -684,7 +712,22 @@ export class WorkspaceTools {
     }
     this.assertPathWritable(relPath)
     const absolute = await this.resolveWithScope(relPath, 'edit_file')
-    const content = await fs.promises.readFile(absolute, 'utf8')
+    let content: string
+    try {
+      content = await fs.promises.readFile(absolute, 'utf8')
+    } catch (error) {
+      if (
+        error &&
+        typeof error === 'object' &&
+        'code' in error &&
+        (error as { code?: unknown }).code === 'ENOENT'
+      ) {
+        throw new Error(
+          `File does not exist: ${relPath}. Use write_file to create a new file, or read_file/list_dir first to confirm the path.`,
+        )
+      }
+      throw error
+    }
 
     if (hasLineRange) {
       const match = findLineRange(content, startLine!, endLine!)
@@ -793,7 +836,7 @@ export class WorkspaceTools {
     const content = str(args, 'content')
     this.assertPathWritable(relPath)
     await this.assertWriteAllowed(relPath, 'write', { after: content })
-    const absolute = await this.resolveWithScope(relPath, 'write_file')
+    const absolute = await this.resolveWithScope(relPath, 'write_file', true)
     const scratch = isScratchpadPath(relPath, this.sessionId)
     if (scratch) ensureScratchpad(this.root, this.sessionId)
     let exists = false
@@ -1072,6 +1115,7 @@ export class WorkspaceTools {
         ok: false,
         result: 'Verification denied by a prior session decision.',
         uiSummary: `denied: ${script}`,
+        userSkipped: true,
       }
     }
     if (rememberedVerify !== 'allow') {
@@ -1310,6 +1354,10 @@ export function summarizeArgs(call: ToolCall): string {
     case 'edit_file':
     case 'write_file':
       return typeof a['path'] === 'string' ? (a['path'] as string) : ''
+    case 'read_files':
+      return Array.isArray(a['paths'])
+        ? a['paths'].filter((item): item is string => typeof item === 'string').join(', ')
+        : ''
     case 'list_dir':
       return typeof a['path'] === 'string' && a['path'] ? (a['path'] as string) : '.'
     case 'glob':
@@ -1379,6 +1427,12 @@ export function formatToolRow(call: ToolCall): string {
         return `Read ${name} L${from}${to !== from ? `-${to}` : ''}`
       }
       return `Read ${name}`
+    }
+    case 'read_files': {
+      const paths = Array.isArray(a['paths'])
+        ? a['paths'].filter((item): item is string => typeof item === 'string')
+        : []
+      return `Read ${paths.length} file${paths.length === 1 ? '' : 's'}`
     }
     case 'list_dir':
       return `List ${typeof a['path'] === 'string' && a['path'] ? basename(a['path'] as string) : '.'}`

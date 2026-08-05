@@ -37,9 +37,9 @@ export interface AgentBudgetSettings {
   modeDeadlineCodeMs: number
   modeDeadlinePlanMs: number
   modeDeadlineAskMs: number
-  modeGenerationsCode: number
   modeGenerationsPlan: number
   modeGenerationsAsk: number
+  maxCompactionGenerations: number
   recommendationDeadlineMs: number
   recommendationGenerationLimit: number
   recommendationExplorationCalls: number
@@ -238,13 +238,20 @@ const INDEX_DEFAULTS = {
   scoreThreshold: 0.4,
 } as const
 
+/** Pre-0.5.11 package.json default for tool-call cap. */
+export const LEGACY_MAX_TOOL_CALLS = 24
+
+export function normalizeMaxToolCalls(value: number): number {
+  return value === LEGACY_MAX_TOOL_CALLS ? 0 : value
+}
+
 const AGENT_BUDGET_DEFAULTS: AgentBudgetSettings = {
   modeDeadlineCodeMs: 8 * 60_000,
   modeDeadlinePlanMs: 4 * 60_000,
   modeDeadlineAskMs: 2 * 60_000,
-  modeGenerationsCode: 16,
   modeGenerationsPlan: 10,
   modeGenerationsAsk: 8,
+  maxCompactionGenerations: 2,
   recommendationDeadlineMs: 120_000,
   recommendationGenerationLimit: 6,
   recommendationExplorationCalls: 3,
@@ -268,10 +275,6 @@ function readAgentBudgetSettings(cfg: vscode.WorkspaceConfiguration): AgentBudge
       'agent.budgets.modeDeadlineAskMs',
       AGENT_BUDGET_DEFAULTS.modeDeadlineAskMs,
     ),
-    modeGenerationsCode: cfg.get<number>(
-      'agent.budgets.modeGenerationsCode',
-      AGENT_BUDGET_DEFAULTS.modeGenerationsCode,
-    ),
     modeGenerationsPlan: cfg.get<number>(
       'agent.budgets.modeGenerationsPlan',
       AGENT_BUDGET_DEFAULTS.modeGenerationsPlan,
@@ -279,6 +282,10 @@ function readAgentBudgetSettings(cfg: vscode.WorkspaceConfiguration): AgentBudge
     modeGenerationsAsk: cfg.get<number>(
       'agent.budgets.modeGenerationsAsk',
       AGENT_BUDGET_DEFAULTS.modeGenerationsAsk,
+    ),
+    maxCompactionGenerations: cfg.get<number>(
+      'agent.budgets.maxCompactionGenerations',
+      AGENT_BUDGET_DEFAULTS.maxCompactionGenerations,
     ),
     recommendationDeadlineMs: cfg.get<number>(
       'agent.budgets.recommendationDeadlineMs',
@@ -368,7 +375,7 @@ export function readConfig(): ExtensionConfig {
       apiKey: cfg.get<string>('api.apiKey', ''),
     },
     agent: {
-      maxToolCalls: cfg.get<number>('agent.maxToolCalls', 24),
+      maxToolCalls: normalizeMaxToolCalls(cfg.get<number>('agent.maxToolCalls', 0)),
       temperature: cfg.get<number>('agent.temperature', 0.2),
       maxTokens: cfg.get<number>('agent.maxTokens', 2048),
       profile: normalizeAgentProfile(cfg.get<string>('agent.profile', 'default')),
@@ -401,4 +408,34 @@ export async function setFrontierSelection(
 export async function setHybridEnabled(enabled: boolean): Promise<void> {
   const settings = vscode.workspace.getConfiguration('trie-ide')
   await settings.update('frontierAssist.enabled', enabled, vscode.ConfigurationTarget.Global)
+}
+
+/** One-time migration for users who still have pre-0.5.11 budget defaults persisted. */
+export async function migrateLegacyAgentBudgetDefaults(): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration('trie-ide')
+  const targets: Array<[unknown, vscode.ConfigurationTarget]> = [
+    [cfg.inspect<number>('agent.maxToolCalls')?.globalValue, vscode.ConfigurationTarget.Global],
+    [cfg.inspect<number>('agent.maxToolCalls')?.workspaceValue, vscode.ConfigurationTarget.Workspace],
+    [cfg.inspect<number>('agent.maxToolCalls')?.workspaceFolderValue, vscode.ConfigurationTarget.WorkspaceFolder],
+  ]
+  for (const [value, target] of targets) {
+    if (value === LEGACY_MAX_TOOL_CALLS) {
+      await cfg.update('agent.maxToolCalls', 0, target)
+    }
+  }
+  // Code mode no longer has a generation cap — drop the obsolete setting if present.
+  const legacyGenerations = cfg.inspect<number>('agent.budgets.modeGenerationsCode')
+  if (legacyGenerations?.globalValue !== undefined) {
+    await cfg.update('agent.budgets.modeGenerationsCode', undefined, vscode.ConfigurationTarget.Global)
+  }
+  if (legacyGenerations?.workspaceValue !== undefined) {
+    await cfg.update('agent.budgets.modeGenerationsCode', undefined, vscode.ConfigurationTarget.Workspace)
+  }
+  if (legacyGenerations?.workspaceFolderValue !== undefined) {
+    await cfg.update(
+      'agent.budgets.modeGenerationsCode',
+      undefined,
+      vscode.ConfigurationTarget.WorkspaceFolder,
+    )
+  }
 }

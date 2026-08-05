@@ -17,6 +17,60 @@ export function estimateTokens(turns: readonly ChatTurn[]): number {
   return total
 }
 
+export interface LazyCompactionResult {
+  turns: ChatTurn[]
+  compactedResults: number
+  savedTokens: number
+}
+
+/**
+ * Cheap first-pass compaction adapted from the desktop tool loop: replace only
+ * old tool-result bodies with one-line receipts while preserving assistant
+ * calls and the four newest results verbatim. This spends no model generation.
+ */
+export function compactOldToolResults(
+  turns: readonly ChatTurn[],
+  targetTokens: number,
+  keepRecentResults = 4,
+): LazyCompactionResult {
+  const before = estimateTokens(turns)
+  if (before <= targetTokens) {
+    return { turns: [...turns], compactedResults: 0, savedTokens: 0 }
+  }
+  const refs = turns
+    .map((turn, index) => {
+      if (turn.role !== 'user') return null
+      const match = /^(Result|FAILED result) of ([A-Za-z0-9_-]+):\n/.exec(turn.content)
+      if (!match || turn.content.startsWith('[old tool result compacted]')) return null
+      return { index, ok: match[1] === 'Result', tool: match[2]!, chars: turn.content.length }
+    })
+    .filter(
+      (
+        ref,
+      ): ref is { index: number; ok: boolean; tool: string; chars: number } => ref !== null,
+    )
+  const compactable = refs.slice(0, Math.max(0, refs.length - keepRecentResults))
+  const next = [...turns]
+  let estimated = before
+  let compactedResults = 0
+  for (const ref of compactable) {
+    if (estimated <= targetTokens) break
+    const previous = next[ref.index]!
+    const summary =
+      `[old tool result compacted] ${ref.ok ? 'Result' : 'Failure'} of ${ref.tool}: ` +
+      `${ref.chars} chars. Re-run the tool if the exact output is needed.`
+    const replacement: ChatTurn = { role: 'user', content: summary }
+    estimated -= estimateTokens([previous]) - estimateTokens([replacement])
+    next[ref.index] = replacement
+    compactedResults += 1
+  }
+  return {
+    turns: next,
+    compactedResults,
+    savedTokens: Math.max(0, before - estimateTokens(next)),
+  }
+}
+
 /** True when a user turn looks like a real task (not a tool result / injection). */
 export function isUserTaskTurn(turn: ChatTurn): boolean {
   if (turn.role !== 'user') return false

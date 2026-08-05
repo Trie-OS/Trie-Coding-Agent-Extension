@@ -302,8 +302,8 @@ export class SettingsPanel {
       <p class="section-desc">Budget and sampling for the tool loop.</p>
       <div class="grid3">
         <div class="row">
-          <label for="f-maxcalls">Max tool calls / turn</label>
-          <input id="f-maxcalls" data-key="agent.maxToolCalls" data-type="number" type="number" min="4" max="200" />
+          <label for="f-maxcalls">Max tool calls / turn (0 = unlimited)</label>
+          <input id="f-maxcalls" data-key="agent.maxToolCalls" data-type="number" type="number" min="0" max="9999" />
         </div>
         <div class="row">
           <label for="f-temp">Temperature</label>

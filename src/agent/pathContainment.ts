@@ -42,7 +42,8 @@ export async function assertContainedInWorkspace(
       try {
         const realDir = await fs.promises.realpath(dir)
         assertRelativeInside(realRoot, realDir, targetPath)
-        return path.join(realDir, path.basename(absolute))
+        const suffix = path.relative(dir, absolute)
+        return path.join(realDir, suffix)
       } catch (inner) {
         if (inner instanceof Error && inner.message.includes('escapes the workspace')) throw inner
         if (path.resolve(dir) === stop || dir === path.dirname(dir)) break

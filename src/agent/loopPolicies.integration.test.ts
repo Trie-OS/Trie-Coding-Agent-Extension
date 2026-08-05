@@ -67,11 +67,12 @@ test('frontier judge passes return grounded draft without rewrite', async () => 
   assert.equal(budget.localGenerations, 0)
 })
 
-test('frontier failure is bounded by the shared deadline', async () => {
+test('frontier failure near the shared deadline surfaces a synthesis error', async () => {
   let now = 119_500
   const budget = new TurnBudget('ask', true, () => now)
   now = 239_000
   const timeouts: number[] = []
+  let localCalls = 0
   const frontier = {
     enabled: () => true,
     async completeResult(
@@ -83,17 +84,22 @@ test('frontier failure is bounded by the shared deadline', async () => {
       return null
     },
   } as unknown as FrontierAssist
-  const result = await finishRecommendationAnswer(
-    localClient(() => assert.fail('Hybrid failure must not fall back locally')),
-    'Recommend harness improvements',
-    'Unverified draft.',
-    'Evidence notes.',
-    { temperature: 0.2, topP: 0.95, maxTokens: 256 },
-    new AbortController().signal,
-    { frontier, evidence: '[E1] src/agent/loop.ts', budget },
+  await assert.rejects(
+    finishRecommendationAnswer(
+      localClient(() => {
+        localCalls += 1
+      }),
+      'Recommend harness improvements',
+      'Unverified draft.',
+      'Evidence notes.',
+      { temperature: 0.2, topP: 0.95, maxTokens: 256 },
+      new AbortController().signal,
+      { frontier, evidence: '[E1] src/agent/loop.ts', budget },
+    ),
+    /synthesis failed/i,
   )
   assert.ok(timeouts.every((timeout) => timeout <= 500))
-  assert.match(result, /not returning the unverified draft/i)
+  assert.equal(localCalls, 2)
 })
 
 test('stop signal cancels frontier judge without local fallback', async () => {
@@ -125,12 +131,11 @@ test('stop signal cancels frontier judge without local fallback', async () => {
     { frontier, evidence: '[E1] src/agent/loop.ts', budget: new TurnBudget('ask', true) },
   )
   controller.abort()
-  const result = await pending
+  await assert.rejects(pending, /cancelled/i)
   assert.equal(localCalls, 0)
-  assert.match(result, /not returning the unverified draft/i)
 })
 
-test('repeatedly truncated synthesis never returns partial text', async () => {
+test('repeatedly truncated synthesis surfaces an error instead of partial or draft fallback', async () => {
   const responses = [
     {
       text: '{"adequate": false, "factuallyGrounded": false, "feedback": "Needs rewrite", "rejectedClaims": []}',
@@ -146,15 +151,16 @@ test('repeatedly truncated synthesis never returns partial text', async () => {
       return responses.shift() ?? null
     },
   } as unknown as FrontierAssist
-  const result = await finishRecommendationAnswer(
-    localClient(() => assert.fail('Hybrid truncation must not fall back locally')),
-    'Recommend harness improvements',
-    'A grounded repository draft with concrete implementation recommendations.',
-    'Evidence notes.',
-    { temperature: 0.2, topP: 0.95, maxTokens: 256 },
-    new AbortController().signal,
-    { frontier, evidence: '[E1] src/agent/loop.ts' },
+  await assert.rejects(
+    finishRecommendationAnswer(
+      localClient(() => {}),
+      'Recommend harness improvements',
+      'A grounded repository draft with concrete implementation recommendations.',
+      'Evidence notes.',
+      { temperature: 0.2, topP: 0.95, maxTokens: 256 },
+      new AbortController().signal,
+      { frontier, evidence: '[E1] src/agent/loop.ts' },
+    ),
+    /synthesis failed/i,
   )
-  assert.doesNotMatch(result, /PARTIAL SECRET/)
-  assert.match(result, /rewrite failed/i)
 })

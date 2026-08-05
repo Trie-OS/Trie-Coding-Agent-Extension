@@ -4,6 +4,7 @@ import { readConfig } from '../config.ts'
 export interface AgentBudgetConfig {
   modeDeadlinesMs: Record<AgentMode, number>
   modeGenerationLimits: Record<AgentMode, number>
+  maxCompactionGenerations: number
   recommendationDeadlineMs: number
   recommendationGenerationLimit: number
   recommendationExplorationCalls: number
@@ -20,10 +21,11 @@ const DEFAULTS: AgentBudgetConfig = {
     ask: 2 * 60_000,
   },
   modeGenerationLimits: {
-    code: 16,
+    code: 0,
     plan: 10,
     ask: 8,
   },
+  maxCompactionGenerations: 2,
   recommendationDeadlineMs: 2 * 60_000,
   recommendationGenerationLimit: 6,
   recommendationExplorationCalls: 3,
@@ -42,10 +44,13 @@ export function readAgentBudgets(): AgentBudgetConfig {
       ask: cfg.modeDeadlineAskMs ?? DEFAULTS.modeDeadlinesMs.ask,
     },
     modeGenerationLimits: {
-      code: cfg.modeGenerationsCode ?? DEFAULTS.modeGenerationLimits.code,
+      // Code mode is never generation-capped; only the turn deadline applies.
+      code: 0,
       plan: cfg.modeGenerationsPlan ?? DEFAULTS.modeGenerationLimits.plan,
       ask: cfg.modeGenerationsAsk ?? DEFAULTS.modeGenerationLimits.ask,
     },
+    maxCompactionGenerations:
+      cfg.maxCompactionGenerations ?? DEFAULTS.maxCompactionGenerations,
     recommendationDeadlineMs:
       cfg.recommendationDeadlineMs ?? DEFAULTS.recommendationDeadlineMs,
     recommendationGenerationLimit:
