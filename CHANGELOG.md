@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.18
+
+- **Open source release:** the extension now lives in its own public repository at [Trie-OS/Trie-Coding-Agent-Extension](https://github.com/Trie-OS/Trie-Coding-Agent-Extension) with full commit history preserved.
+
 ## 0.5.17
 
 - **Question reply styling:** Ask/Plan and recommendation answers no longer render in destructive red when they cite file paths without editing anything; the fake-edit guard now applies only to Code-mode implementation turns.

@@ -10,3 +10,5 @@ tsconfig.json
 node_modules/**
 media/src/**
 .trie-ide/**
+vendor/**/*.test.ts
+vendor/**/*.test.tsx

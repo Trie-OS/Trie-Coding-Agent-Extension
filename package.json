@@ -2,19 +2,25 @@
   "name": "trie-ide",
   "displayName": "Trie Coding Agent",
   "description": "Coding agent: local GGUF via embedded trie-daemon, or any LLM API (Ollama, LM Studio, OpenAI, Kimi, and other cloud endpoints). Hybrid mode adds sparing frontier-model guidance.",
-  "version": "0.5.17",
+  "version": "0.5.18",
   "publisher": "Trie",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Trie-OS/Trie-ide"
+    "url": "https://github.com/Trie-OS/Trie-Coding-Agent-Extension"
   },
-  "private": true,
+  "homepage": "https://github.com/Trie-OS/Trie-Coding-Agent-Extension#readme",
+  "bugs": {
+    "url": "https://github.com/Trie-OS/Trie-Coding-Agent-Extension/issues"
+  },
   "engines": {
     "vscode": "^1.96.0"
   },
-  "dependencies": {},
+  "dependencies": {
+    "node-llama-cpp": "^3.19.1",
+    "zod": "^4.4.3"
+  },
     "categories": [
     "AI",
     "Chat",
